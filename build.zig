@@ -4,6 +4,16 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const shared = b.option(bool, "shared", "Build a shared library and require all symbols to resolve") orelse false;
+
+    // Subsystems already converted to idiomatic Zig: they import only `std`,
+    // are self-contained, and are covered by `zig build test`. Everything
+    // still awaiting conversion lives in sources.zig and goes through the
+    // translation_builtins shim.
+    const converted = [_][]const u8{
+        "src/atomic/SDL_atomic.zig",
+        "src/atomic/SDL_spinlock.zig",
+    };
+
     const builtins = b.createModule(.{
         .root_source_file = b.path("src/translation_builtins.zig"),
         .target = target,
@@ -37,15 +47,6 @@ pub fn build(b: *std.Build) void {
     library.root_module.linkSystemLibrary("m", .{});
     library.root_module.linkSystemLibrary("dl", .{});
     library.root_module.linkSystemLibrary("pthread", .{});
-    const api = b.addModule("SDL3", .{
-        .root_source_file = b.path("include/SDL3/SDL.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    api.addImport("translation_builtins", builtins);
-    api.addImport("guid", guid);
-    api.linkLibrary(library);
     library.root_module.addObject(b.addObject(.{
         .name = "sdl-linux-intrinsics",
         .root_module = b.createModule(.{
@@ -74,5 +75,29 @@ pub fn build(b: *std.Build) void {
         object.root_module.addImport("calendar", calendar);
         library.root_module.addObject(object);
     }
+    for (converted) |source| {
+        library.root_module.addObject(b.addObject(.{
+            .name = b.fmt("sdl-{s}", .{std.fs.path.stem(source)}),
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(source),
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .pic = true,
+            }),
+        }));
+    }
     b.installArtifact(library);
+
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/zdl.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_tests = b.addRunArtifact(tests);
+    const test_step = b.step("test", "Run the unit tests");
+    test_step.dependOn(&run_tests.step);
 }
