@@ -14,8 +14,10 @@
 //! - The source is read through `surface.View.read`, so every pixel format works.
 //!   SDL's 8-bit/color-keyed and 32-bit-only fast paths collapse into this path.
 //! - Multiples of 90 degrees use the same exact sine/cosine sampler instead of
-//!   SDL's pointer-walk fast path. The pixel mapping matches for the default center;
-//!   non-default centers follow the rotation definition, which SDL's fast path does not.
+//!   SDL's pointer-walk fast path (with `smooth` ignored, as SDL's fast path does,
+//!   so the whole source survives). The pixel mapping matches for the default
+//!   center; non-default centers follow the rotation definition, which SDL's fast
+//!   path does not.
 //! - Integer overflow in the fixed-point increments wraps, as it does in the C
 //!   code, instead of being undefined.
 const std = @import("std");
@@ -156,6 +158,10 @@ pub fn rotate(allocator: std.mem.Allocator, source: surface.View, transform: Tra
     const src_h: i32 = @intCast(source.height);
     const last_x = src_w - 1;
     const last_y = src_h - 1;
+    // SDL rotates exact multiples of 90 degrees with a copying fast path that
+    // ignores `smooth`. Bilinear sampling would drop the last row and column
+    // (its bounds test needs a neighbour), so those angles sample nearest.
+    const smooth = options.smooth and transform.cos != 0 and transform.sin != 0;
 
     var y: usize = 0;
     while (y < out_height) : (y += 1) {
@@ -168,7 +174,7 @@ pub fn rotate(allocator: std.mem.Allocator, source: surface.View, transform: Tra
         while (x < out_width) : (x += 1) {
             var dx: i32 = sdx >> 16;
             var dy: i32 = sdy >> 16;
-            if (options.smooth) {
+            if (smooth) {
                 // Mirroring precedes the bounds test here, as in SDL's smooth sampler.
                 if (options.flip_horizontal) dx = last_x - dx;
                 if (options.flip_vertical) dy = last_y - dy;

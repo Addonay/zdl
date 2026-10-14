@@ -198,6 +198,8 @@ pub const Texture = struct {
 fn default_blend(format: pixels.Format) Blend {
     return switch (format) {
         .rgba8, .bgra8, .argb8, .abgr8 => Blend.ALPHA,
+        // SDL_ISPIXELFORMAT_ALPHA: packed formats with an alpha mask blend too.
+        .masked => |packed_format| if (packed_format.channels[3].bits != 0) Blend.ALPHA else Blend.REPLACE,
         else => Blend.REPLACE,
     };
 }

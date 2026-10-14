@@ -301,6 +301,7 @@ pub const image = struct {
 
 test {
     reference_namespaces(@This(), 4);
+    _ = @import("tests.zig");
 }
 
 /// `std.testing.refAllDecls` is not recursive, so files re-exported through
