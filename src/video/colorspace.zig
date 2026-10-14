@@ -383,28 +383,77 @@ const bt2020_full_10: YcbcrToRgb = .{ .offset = .{ 0.0, -0.500488759, -0.5004887
 /// SDL_YUV_SD_THRESHOLD: unspecified-matrix 8-bit content at or below this height is BT.601.
 pub const yuv_sd_threshold: usize = 576;
 
-/// YCbCr-to-RGB matrix for a colorspace, as SDL_GetYCbCRtoRGBConversionMatrix
-/// selects it. `height` and `bits_per_pixel` (8, 10 or 16) only matter for an
-/// unspecified matrix. Returns null for RGB or identity matrices and for
-/// unsupported pairs. 16-bit content uses the 10-bit BT.2020 tables; callers
-/// requantize (see `yuv_wide`). Limited range is used for an unknown range.
-pub fn ycbcr_matrix(colorspace: Colorspace, height: usize, bits_per_pixel: u8) ?YcbcrToRgb {
+/// Which coefficient table applies: the 8-bit BT.601 or BT.709 tables, or the
+/// 10-bit BT.2020 tables.
+const Family = enum { bt601, bt709, bt2020 };
+
+fn family(colorspace: Colorspace, height: usize, bits_per_pixel: u8) ?Family {
     if (colorspace.color_type == .rgb) return null;
-    const family: enum { bt601, bt709, bt2020 } = switch (colorspace.matrix) {
+    return switch (colorspace.matrix) {
         .bt601, .bt470bg => .bt601,
         .bt709 => .bt709,
         .bt2020_ncl => .bt2020,
         .unspecified => switch (bits_per_pixel) {
             8 => if (height <= yuv_sd_threshold) .bt601 else .bt709,
             10, 16 => .bt2020,
-            else => return null,
+            else => null,
         },
-        else => return null,
+        else => null,
     };
+}
+
+/// YCbCr-to-RGB matrix for a colorspace, as SDL_GetYCbCRtoRGBConversionMatrix
+/// selects it, using the table normalized for its own depth (8 or 10 bits).
+/// `height` and `bits_per_pixel` (8, 10 or 16) only matter for an unspecified
+/// matrix. Returns null for RGB or identity matrices and for unsupported pairs.
+/// Limited range is used for an unknown range. Use `ycbcr_matrix_for_depth` to
+/// decode samples whose depth differs from the table's.
+pub fn ycbcr_matrix(colorspace: Colorspace, height: usize, bits_per_pixel: u8) ?YcbcrToRgb {
+    const selected = family(colorspace, height, bits_per_pixel) orelse return null;
     const full = colorspace.range == .full;
-    return switch (family) {
+    return switch (selected) {
         .bt601 => if (full) bt601_full_8 else bt601_limited_8,
         .bt709 => if (full) bt709_full_8 else bt709_limited_8,
         .bt2020 => if (full) bt2020_full_10 else bt2020_limited_10,
     };
+}
+
+/// The matrix for samples of `sample_bits` depth (8, 10 or 16), normalized to
+/// [0, 1] by the full code range (2^bits - 1). The family table keeps its own
+/// depth's coefficients. Offsets are re-centred to the exact code levels of
+/// `sample_bits`: chroma centre 2^(bits-1) and limited black 16 * 2^(bits-8).
+/// For limited range, every coefficient is rescaled by
+/// (2^bits - 1) / (2^table - 1) * 2^(table - bits), the ratio of the two ranges.
+/// Full-range coefficients are depth-independent. Returns null as `ycbcr_matrix`.
+pub fn ycbcr_matrix_for_depth(colorspace: Colorspace, height: usize, sample_bits: u8) ?YcbcrToRgb {
+    if (sample_bits != 8 and sample_bits != 10 and sample_bits != 16) return null;
+    const selected = family(colorspace, height, sample_bits) orelse return null;
+    const table = ycbcr_matrix(colorspace, height, sample_bits) orelse return null;
+    const table_bits: u8 = if (selected == .bt2020) 10 else 8;
+    if (table_bits == sample_bits) return table;
+
+    const full = colorspace.range == .full;
+    const top = std.math.pow(f64, 2.0, @floatFromInt(sample_bits)) - 1.0;
+    const top_table = std.math.pow(f64, 2.0, @floatFromInt(table_bits)) - 1.0;
+    const center: f32 = @floatCast(std.math.pow(f64, 2.0, @floatFromInt(sample_bits - 1)) / top);
+    const black: f32 = if (full) 0.0 else @floatCast(16.0 * std.math.pow(f64, 2.0, @floatFromInt(sample_bits - 8)) / top);
+    var result = table;
+    result.offset = .{ -black, -center, -center };
+    if (!full) {
+        const gain: f32 = @floatCast((top / top_table) * std.math.pow(f64, 2.0, @floatFromInt(@as(i32, table_bits) - sample_bits)));
+        for (&result.m) |*row| for (row) |*coefficient| {
+            coefficient.* *= gain;
+        };
+    }
+    return result;
+}
+
+test "depth-aware YCbCr matrices reject unsupported sample depths" {
+    for ([_]u8{ 0, 1, 7, 9, 12, 17, 255 }) |bits| {
+        try std.testing.expect(ycbcr_matrix_for_depth(bt709_limited, 480, bits) == null);
+        try std.testing.expect(ycbcr_matrix_for_depth(bt709_full, 480, bits) == null);
+    }
+    for ([_]u8{ 8, 10, 16 }) |bits| {
+        try std.testing.expect(ycbcr_matrix_for_depth(bt709_limited, 480, bits) != null);
+    }
 }

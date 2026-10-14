@@ -1,12 +1,15 @@
 //! Owned raster storage and explicitly borrowed pixel views.
 //! This module has no SDL surface ABI, reference counts, global registrations or
 //! hidden palette ownership. Scalar blits/blends, sampling and BMP integration
-//! share this raster contract. Accelerated rendering, RLE surfaces, YUV/HDR and
+//! share this raster contract. Byte RGB/RGBA blits use the vector kernels in
+//! `blit_simd.zig`, validated against the scalar path. RLE surfaces, YUV/HDR and
 //! colorspace-aware blit paths remain pending.
 // Ported from video/SDL_surface.c and SDL_fillrect.c; native ownership and errors replace the C ABI.
 const std = @import("std");
 const pixels = @import("pixels.zig");
 const geometry = @import("geometry.zig");
+/// Vector row kernels for byte RGB/RGBA blits; `View.blit` uses them when eligible.
+pub const blit_simd = @import("blit_simd.zig");
 
 /// BMP slice decoding/encoding with explicitly owned surface/palette results.
 pub const bmp = @import("bmp.zig");
@@ -87,7 +90,19 @@ pub const View = struct {
     /// Overlapping storage is snapshotted before mutation; allocation failure
     /// leaves the destination unchanged. Normal non-overlapping blits allocate
     /// nothing. Color math uses eight-bit RGBA, not an implicit HDR transform.
+    /// Byte RGB/RGBA rows use the vector kernels in `blit_simd.zig`, which give
+    /// the same results as `blit_scalar`.
     pub fn blit(self: View, allocator: std.mem.Allocator, source: View, options: BlitOptions) (Error || geometry.GeometryError)!?geometry.Rect(i32) {
+        return self.blit_with(allocator, source, options, true);
+    }
+
+    /// The same operation as `blit`, always through the per-pixel scalar path.
+    /// It is the reference the vector kernels are validated against.
+    pub fn blit_scalar(self: View, allocator: std.mem.Allocator, source: View, options: BlitOptions) (Error || geometry.GeometryError)!?geometry.Rect(i32) {
+        return self.blit_with(allocator, source, options, false);
+    }
+
+    fn blit_with(self: View, allocator: std.mem.Allocator, source: View, options: BlitOptions, accelerate: bool) (Error || geometry.GeometryError)!?geometry.Rect(i32) {
         const requested = options.source_region orelse source.bounds();
         const selected = (try source.bounds().intersection(requested)) orelse return null;
         const clip = if (options.clip) |region| (try self.bounds().intersection(region)) orelse return null else self.bounds();
@@ -133,6 +148,9 @@ pub const View = struct {
         const dx: usize = @intCast(destination_x);
         const dy: usize = @intCast(destination_y);
         const count: usize = @intCast(width);
+        const vector_source = if (accelerate) blit_simd.Kind.of(input.format) else null;
+        const vector_destination = if (accelerate) blit_simd.Kind.of(self.format) else null;
+        const vector_params: blit_simd.Params = .{ .blend = options.blend, .modulation = options.modulation, .color_key = options.color_key };
         for (0..@as(usize, @intCast(height))) |row_index| {
             const source_row = try input.row(sy + row_index);
             const destination_row = try self.row(dy + row_index);
@@ -141,7 +159,11 @@ pub const View = struct {
                 @memcpy(destination_row[dx * bytes ..][0 .. count * bytes], source_row[sx * bytes ..][0 .. count * bytes]);
                 continue;
             }
-            for (0..count) |column| {
+            var first: usize = 0;
+            if (vector_source) |source_kind| if (vector_destination) |destination_kind| {
+                first = blit_simd.blit_row(source_kind, destination_kind, vector_params, source_row, sx, destination_row, dx, count);
+            };
+            for (first..count) |column| {
                 var color = try input.format.read(source_row, sx + column, input.palette);
                 if (options.color_key) |key| if (color.r == key.r and color.g == key.g and color.b == key.b) continue;
                 color = modulate(color, options.modulation);
