@@ -107,6 +107,8 @@ pub const Display = struct {
         try requested.validate();
         if (requested.profile == .es) return error.UnsupportedProfile;
         if (requested.float_buffers) return error.UnsupportedAttributes;
+        if (requested.framebuffer_srgb and !self.has_extension("GLX_ARB_framebuffer_sRGB") and
+            !self.has_extension("GLX_EXT_framebuffer_sRGB")) return error.UnsupportedAttributes;
         const drawable_bit: c_int = if (kind == .window) glx.window_bit else glx.pbuffer_bit;
         var count: c_int = 0;
         const configs = self.library.functions.glXGetFBConfigs(self.connection.display, self.connection.screen, &count) orelse return error.NoMatchingConfig;
@@ -122,6 +124,10 @@ pub const Display = struct {
             if (drawable & drawable_bit == 0) continue;
             const render = self.config_value(config, glx.render_type) orelse continue;
             if (render & glx.rgba_bit == 0) continue;
+            if (requested.framebuffer_srgb) {
+                const capable = self.config_value(config, glx.framebuffer_srgb_capable) orelse continue;
+                if (capable == 0) continue;
+            }
             const red = self.config_value(config, glx.red_size) orelse continue;
             const green = self.config_value(config, glx.green_size) orelse continue;
             const blue = self.config_value(config, glx.blue_size) orelse continue;
@@ -426,6 +432,7 @@ const glx = struct {
     const drawable_type = 0x8010;
     const render_type = 0x8011;
     const rgba_bit = 0x0001;
+    const framebuffer_srgb_capable = 0x20B2;
     const window_bit = 0x0001;
     const pbuffer_bit = 0x0004;
     const buffer_size = 2;
@@ -463,4 +470,13 @@ const glx = struct {
 
 test "GLX public declarations are type-complete" {
     std.testing.refAllDecls(@This());
+}
+
+test "GLX rejects sRGB framebuffer requests without either defining extension" {
+    var display: Display = undefined;
+    display.extensions = "GLX_ARB_create_context GLX_ARB_framebuffer_sRGB_extra";
+    // This check must happen before touching an X connection or function table.
+    try std.testing.expectError(error.UnsupportedAttributes, display.choose_config(.{ .framebuffer_srgb = true }, .window, null));
+    display.extensions = "GLX_EXT_framebuffer_sRGB";
+    try std.testing.expect(display.has_extension("GLX_EXT_framebuffer_sRGB"));
 }
