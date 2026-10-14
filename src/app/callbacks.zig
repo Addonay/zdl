@@ -54,6 +54,7 @@ const quit = @import("../events/quit.zig");
 const queue = @import("../events/queue.zig");
 const linux = @import("../platform/linux.zig");
 const timer = @import("../system/timer.zig");
+const hints_mod = @import("../core/hints.zig");
 
 /// Platform the loop drives. Re-exported so apps can name it without other imports.
 pub const Platform = linux.Platform;
@@ -67,11 +68,16 @@ pub const Result = enum {
     failure,
 };
 
+/// Process exit status SDL_EnterAppMainCallbacks returns: 1 for `failure`, else 0.
+pub fn exit_code(result: Result) u8 {
+    return if (result == .failure) 1 else 0;
+}
+
 /// Errors from the platform or from a cancelled clock sleep.
 pub const Error = linux.Error || std.Io.Cancelable;
 
 /// Name of the SDL hint that `Pacing.from_hint` reads.
-pub const main_callback_rate_hint = "SDL_MAIN_CALLBACK_RATE";
+pub const main_callback_rate_hint = hints_mod.names.main_callback_rate;
 
 /// How iterations are paced. Unlimited is SDL's default: iterate as fast as the
 /// platform allows (vsync if the app presents with it).
@@ -130,6 +136,12 @@ pub const Options = struct {
     /// once per iteration; it does not wake a blocked `wait_event`, so add `Signals.fd`
     /// to the app's own wait set if that matters.
     signals: ?*quit.Signals = null,
+    /// Hint table that supplies SDL_MAIN_CALLBACK_RATE. When set, the pacing is
+    /// read from it at start (replacing `pacing`) and again whenever the table's
+    /// `revision` changes and the rate hint's meaning differs from the last one
+    /// read, as SDL's hint callback does while the loop runs. A pacing the app
+    /// set through `Context.pacing` is only replaced by such a change.
+    hints: ?*const hints_mod.Hints = null,
 };
 
 /// State handed to every app callback. The app reads the platform and clock through
@@ -172,7 +184,7 @@ pub fn run(
     var context: Context = .{
         .platform = platform,
         .io = io,
-        .pacing = options.pacing,
+        .pacing = if (options.hints) |table| Pacing.from_hint(table.get(main_callback_rate_hint)) else options.pacing,
         .quit_on_quit_event = options.quit_on_quit_event,
     };
 
@@ -193,10 +205,14 @@ fn loop(comptime App: type, app: *App, context: *Context, options: Options) Erro
     var applied = context.pacing;
     var pacing_changed = true;
     var next_deadline_ns: u64 = 0;
+    var hint_watch = HintPacing.init(options.hints, context.pacing);
     const first_increment = applied.increment_ns();
     if (first_increment != 0) next_deadline_ns = context.now_ns() + first_increment;
 
     while (context.result == .@"continue") {
+        if (options.hints) |table| {
+            if (hint_watch.poll(table)) |changed| context.pacing = changed;
+        }
         if (!Pacing.same(applied, context.pacing)) {
             applied = context.pacing;
             pacing_changed = true;
@@ -276,6 +292,26 @@ pub fn send_app_event(comptime App: type, app: *App, context: *Context, kind: ev
     return context.result;
 }
 
+/// Detects SDL_MAIN_CALLBACK_RATE changes through `Hints.revision`.
+const HintPacing = struct {
+    revision: u64,
+    last: Pacing,
+
+    fn init(table: ?*const hints_mod.Hints, current: Pacing) HintPacing {
+        return .{ .revision = if (table) |t| t.revision else 0, .last = current };
+    }
+
+    /// The new pacing if the hint table changed in a way that alters the rate hint.
+    fn poll(self: *HintPacing, table: *const hints_mod.Hints) ?Pacing {
+        if (table.revision == self.revision) return null;
+        self.revision = table.revision;
+        const from_hint = Pacing.from_hint(table.get(main_callback_rate_hint));
+        if (Pacing.same(from_hint, self.last)) return null;
+        self.last = from_hint;
+        return from_hint;
+    }
+};
+
 /// Sleeps until the next deadline, as SDL's generic loop does: the first iteration
 /// after a rate is set is not delayed, a late iteration moves the deadline to now, and
 /// the deadline advances by one increment each step.
@@ -292,4 +328,39 @@ fn pace(context: *Context, next_deadline_ns: *u64) Error!void {
         next_deadline_ns.* = now;
     }
     next_deadline_ns.* += increment;
+}
+
+test "pacing hint parsing and increments" {
+    const testing = std.testing;
+    try testing.expect(Pacing.from_hint(null) == .unlimited);
+    try testing.expect(Pacing.from_hint("") == .unlimited);
+    try testing.expect(Pacing.from_hint("waitevent") == .wait_event);
+    try testing.expect(Pacing.from_hint("junk") == .unlimited);
+    try testing.expect(Pacing.from_hint("-5") == .unlimited);
+    try testing.expectEqual(@as(u64, 16_666_666), Pacing.from_hint("60").increment_ns());
+    try testing.expectEqual(@as(u64, 0), (@as(Pacing, .unlimited)).increment_ns());
+    try testing.expectEqual(@as(u64, 0), (Pacing{ .rate_hz = 1e12 }).increment_ns());
+}
+
+test "exit code follows SDL_EnterAppMainCallbacks" {
+    try std.testing.expectEqual(@as(u8, 1), exit_code(.failure));
+    try std.testing.expectEqual(@as(u8, 0), exit_code(.success));
+    try std.testing.expectEqual(@as(u8, 0), exit_code(.@"continue"));
+}
+
+test "rate hint changes are detected through the table revision" {
+    const testing = std.testing;
+    var hints = hints_mod.Hints.init(testing.allocator, null);
+    defer hints.deinit();
+    var watch = HintPacing.init(&hints, .unlimited);
+    try testing.expect(watch.poll(&hints) == null);
+    _ = try hints.set("SDL_OTHER", "1"); // unrelated: revision moves, pacing does not
+    try testing.expect(watch.poll(&hints) == null);
+    _ = try hints.set(main_callback_rate_hint, "30");
+    try testing.expectEqual(@as(f64, 30), watch.poll(&hints).?.rate_hz);
+    try testing.expect(watch.poll(&hints) == null);
+    _ = try hints.set(main_callback_rate_hint, "waitevent");
+    try testing.expect(watch.poll(&hints).? == .wait_event);
+    _ = try hints.reset(main_callback_rate_hint);
+    try testing.expect(watch.poll(&hints).? == .unlimited);
 }
