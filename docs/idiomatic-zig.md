@@ -1,100 +1,73 @@
-# Idiomatic Zig conventions for the SDL3 port
+# Native Zig design
 
-`src/` is a port of SDL3 from C. It started as `zig translate-c` output and is
-being converted to native Zig. This file is the target the conversion is
-judged against.
+This project ports SDL behavior into a Zig library. C-shaped translated code is
+an input to the conversion, not the target architecture.
 
-## The target
+## Source and build
 
-A `std`-only Zig library with a tree-shakable API. Not a C library that
-happens to be written in Zig.
+`src/root.zig` is the public root. Files describe domain responsibilities, not
+upstream translation units. Keep a small number of cohesive modules; introduce
+folders and nested folders to group related responsibilities. Large cohesive
+files are welcome; there is no arbitrary maximum line count. API names describe
+operations and types without library prefixes. The `zdl` import supplies context.
 
-- No `std.zig.c_translation` — neither `.builtins` nor `.helpers`.
-- No `extern fn` declarations. Cross-file calls are ordinary `@import`s.
-- No `export fn` and no `_REAL` suffix. There is no C ABI.
-- No `src/dynapi/`. The jump table forced every symbol to be exported, which
-  is precisely what prevents dead-code elimination.
-- No `include/SDL3/`. That was the translate-c rendering of the C headers;
-  the public API is `src/zdl.zig`.
-- `extern struct` only where a C struct is genuinely being mirrored for an
-  OS API. Not as a default.
-- `c_int`, `c_uint`, `[*c]T`, `?*anyopaque` → `i32`, `u32`, `*T`,
-  `[]const u8`, and real types.
-- `SDL_malloc`/`SDL_free` → an allocator threaded through the call.
+The build registers the source module. It does not compile exported C objects,
+link a legacy SDL archive, retain temporary ABI bridges, or force every namespace
+into consumers. Unreferenced declarations remain lazy. Do not recreate SDL's
+jump table, automatic subsystem initialization or global ID registries by default.
 
-`libc`, `libm`, `dl` and `pthread` stay linked. SDL is POSIX underneath and
-replacing libc is a different project. What goes is the *translation* layer,
-not the C library.
+## Standard-library reuse
 
-## Shape of the public API
+Use std directly wherever it already expresses the required behavior. A renamed
+wrapper around a std function does not count as a port. Atomic values, ordinary
+locks, allocators, hash maps, lists, sorting, searching, math, ASCII/Unicode,
+formatting, hashing, RNGs, clocks, OS I/O and dynamic loading belong to std.
 
-`src/zdl.zig` is the root. It re-exports modules as namespaces:
+Keep a specialized implementation only when domain semantics justify it. For
+example, a pixel rectangle and a floating-coordinate rectangle differ at their
+edges; signed Gregorian arithmetic supports dates beyond std.time.epoch's
+unsigned year/epoch range; owned heterogeneous properties add ownership that a
+plain string hash map does not provide. Document those distinctions in `///`.
 
-```zig
-pub const atomic = @import("atomic/SDL_atomic.zig");
-pub const spinlock = @import("atomic/SDL_spinlock.zig");
-```
+## Types, ownership and errors
 
-Callers import what they use and the linker drops the rest. A module that
-nothing references must not appear in the final binary.
+Use ordinary structs and real pointer types, slices, enums, optionals and error
+unions. Fixed-width integers express a domain or serialization width, not a C
+spelling. Established C libraries may back a module when they do the job well
+(see AGENTS.md); their `extern`/`callconv(.c)` declarations and C-layout records
+stay private to one binding file, preferably loaded at runtime with
+`std.DynLib`. Modules without such a backend stay pure Zig and libc-free.
+There are no temporary C interfaces between native zdl modules.
 
-## Shape of a converted file
+Pass `std.mem.Allocator` to owned objects. Document what an object owns, what it
+borrows, how long borrowed results survive, and when deinitialization is needed.
+Fallible operations return errors; there is no thread-local last-error state.
+An explicitly owned Diagnostic can accompany an error when human context helps.
+Native strings use slices. Keep a sentinel only when an OS interface requires it.
 
-Exported Zig API, `std` types, error unions where failure is possible:
+Objects own their resources directly. Properties may borrow concrete resource
+types; lifetime and synchronization belong to the resource's owner. Do not hide
+resource ownership in void pointers, cleanup callbacks or process-global IDs.
 
-```zig
-pub const SpinLock = struct {
-    locked: std.atomic.Value(bool) = .init(false),
+## Documentation and naming
 
-    pub fn tryAcquire(self: *SpinLock) bool { ... }
-    pub fn acquire(self: *SpinLock) void { ... }
-    pub fn release(self: *SpinLock) void { ... }
-};
-```
+Use descriptive file names, snake_case functions, PascalCase types and named
+enum variants. Put `//!` module descriptions at the top and `///` documentation
+on public types, methods and meaningful fields. Explain algorithms, ownership,
+boundary conventions, error behavior and necessary platform constraints.
+Comments should explain why code exists, rather than paraphrase each statement.
 
-Name types for what they are, not for the C struct they came from.
-`SDL_SpinLock` was `c_int`; `SpinLock` is a struct with methods.
+## Conversion workflow
 
-## Rules
+1. Read the related files in `.ref/translation_v1/src` and upstream `.ref/SDL`.
+2. Identify std replacements before choosing native types and module boundaries.
+3. Bring over one coherent piece, preserving required domain behavior and
+   correcting confirmed translation defects against upstream source.
+4. Compile the native module and consumers that instantiate its generic APIs.
+5. Update `docs/porting.md` with what was implemented, replaced, changed or remains.
+6. Repeat. Keep unported source in the uncompressed reference tree for browsing.
 
-**Types.** `i32`, `u32`, `usize`, `?*T`, `[]const u8`. Translate C widths at
-the point where an OS ABI actually requires them, not throughout.
-
-**Strings.** `[:0]const u8` for NUL-terminated, `[]const u8` for slices.
-
-**Errors.** `error{...}!T` internally.
-
-**Control flow.** `if (ptr == null)`, not `if (!(ptr != null))`.
-`while (cond)`, not `while (!(cond))`.
-
-**Dead scaffolding.** Delete `var x = ...; _ = &x;` when `x` is never
-mutated or addressed. Delete `pub const SDL_Foo = SDL_Foo_REAL;` aliases that
-nothing reads. `@setEvalBranchQuota` is translate-c scaffolding that assumed
-comptime evaluation; it is always noise here.
-
-**Naming.** `snake_case` functions and locals, `PascalCase` types,
-`SCREAMING_SNAKE_CASE` constants. File names keep the `SDL_*.zig` mapping to
-upstream so the port stays traceable; the API inside does not.
-
-**Doc comments.** `//!` for a file, `///` for anything non-obvious. A comment
-that explains a workaround says what breaks if it is removed.
-
-## Adding tests
-
-Every converted subsystem gets unit tests, reachable from `src/zdl.zig`, run
-by `zig build test`. Prefer deterministic assertions — a spinlock test that
-sleeps and hopes is a flaky test.
-
-## Verifying
-
-```sh
-zig build           # must stay green
-zig build test      # unit tests
-zig build -Dshared=true
-```
-
-## Migration state
-
-`build.zig` lists converted subsystems in its `converted` array; everything
-else is still coming off the C translation via `sources.zig`. Move a file
-between the two lists as it is converted, never both, never neither.
+Do not equate a smaller source tree or a green build with SDL functionality
+being complete. No runtime validation has been performed during this conversion.
+Do not add or run new tests yet unless requested; existing tests compile in the
+normal build and their execution remains an explicit separate step.
