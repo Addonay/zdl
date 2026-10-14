@@ -1350,7 +1350,7 @@ pub const Window = struct {
 
     /// The raw X visual id of this window. Windows use the connection's default
     /// visual, so this equals `Connection.default_visual_id`. EGL matches it
-    /// against EGL_NATIVE_VISUAL_ID when choosing configs.
+    /// against EGL_NATIVE_VISUAL_ID, and GLX uses it to select a compatible FBConfig.
     pub fn visual_id(self: *const Window) u32 {
         return self.connection.default_visual_id();
     }

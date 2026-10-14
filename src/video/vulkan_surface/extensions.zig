@@ -1,7 +1,6 @@
 //! Instance extensions an application must enable before creating a surface on
-//! a native window system. Ported from SDL_x11vulkan.c (Xlib path) and
-//! SDL_waylandvulkan.c (Vulkan_GetInstanceExtensions). SDL's XCB path is not
-//! included because zdl's X11 backend is Xlib.
+//! a native window system. Ported from SDL_x11vulkan.c (Xlib/XCB paths) and
+//! SDL_waylandvulkan.c (Vulkan_GetInstanceExtensions).
 
 const std = @import("std");
 
@@ -9,16 +8,19 @@ const std = @import("std");
 pub const surface = "VK_KHR_surface";
 /// Xlib surface extension (X11).
 pub const xlib_surface = "VK_KHR_xlib_surface";
+/// XCB surface extension (X11).
+pub const xcb_surface = "VK_KHR_xcb_surface";
 /// Wayland surface extension.
 pub const wayland_surface = "VK_KHR_wayland_surface";
 
 /// The native window system a surface is created on.
-pub const Backend = enum { x11, wayland };
+pub const Backend = enum { x11, xcb, wayland };
 
 /// The instance extensions to enable for `backend`. The slice is static data.
 pub fn required(backend: Backend) []const [:0]const u8 {
     return switch (backend) {
         .x11 => &.{ surface, xlib_surface },
+        .xcb => &.{ surface, xcb_surface },
         .wayland => &.{ surface, wayland_surface },
     };
 }

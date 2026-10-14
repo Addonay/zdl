@@ -61,6 +61,7 @@ pub const Functions = struct {
     eglChooseConfig: *const fn (*Display, [*]const Int, ?[*]?*Config, Int, *Int) callconv(.c) Bool,
     eglGetConfigAttrib: *const fn (*Display, *Config, Int, *Int) callconv(.c) Bool,
     eglCreateWindowSurface: *const fn (*Display, *Config, usize, [*]const Int) callconv(.c) ?*Surface,
+    eglCreatePbufferSurface: *const fn (*Display, *Config, [*]const Int) callconv(.c) ?*Surface,
     eglDestroySurface: *const fn (*Display, *Surface) callconv(.c) Bool,
     eglCreateContext: *const fn (*Display, *Config, ?*Context, [*]const Int) callconv(.c) ?*Context,
     eglDestroyContext: *const fn (*Display, *Context) callconv(.c) Bool,

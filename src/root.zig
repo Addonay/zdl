@@ -228,13 +228,15 @@ pub const video = struct {
     pub const yuv_more = @import("video/yuv_more.zig");
 };
 
-/// OpenGL/GLES contexts over runtime-loaded EGL for X11 and Wayland windows:
-/// attributes, config selection, window surfaces, swap control (requires libc).
+/// OpenGL contexts over runtime-loaded GLX or EGL, and OpenGL ES over EGL;
+/// config selection, window/pbuffer surfaces and swap control (requires libc).
 pub const egl = struct {
     pub const attributes = @import("video/egl/attributes.zig");
     pub const display = @import("video/egl/display.zig");
     pub const surface = @import("video/egl/surface.zig");
+    pub const pbuffer = @import("video/egl/pbuffer.zig");
     pub const context = @import("video/egl/context.zig");
+    pub const glx = @import("video/egl/glx.zig");
 };
 
 /// Vulkan instance extensions and VkSurfaceKHR creation for X11 and Wayland
@@ -288,5 +290,10 @@ pub const image = struct {
 };
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    const testing = @import("std").testing;
+    testing.refAllDecls(@This());
+    testing.refAllDecls(@import("gpu/vulkan/memory.zig"));
+    testing.refAllDecls(@import("render/gpu/texture.zig"));
+    testing.refAllDecls(@import("render/gpu/renderer.zig"));
+    testing.refAllDecls(@import("video/egl/glx.zig"));
 }

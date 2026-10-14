@@ -1,4 +1,4 @@
-//! Vulkan presentation surfaces for X11 (Xlib) and Wayland windows, created
+//! Vulkan presentation surfaces for X11 (Xlib or XCB) and Wayland windows, created
 //! through the instance-level entry points of a Vulkan loader. Ported from
 //! SDL_x11vulkan.c (SDL_Vulkan_CreateSurface, SDL_Vulkan_GetPresentationSupport)
 //! and SDL_waylandvulkan.c, with SDL_vulkan_utils.c's loader handling.
@@ -75,6 +75,23 @@ pub fn create_xlib_surface(get_proc: ProcAddress, instance: *anyopaque, display:
     return surface;
 }
 
+/// Creates a VkSurfaceKHR for an XCB window. `connection` is an
+/// `xcb_connection_t*` and `window` is its 32-bit `xcb_window_t` XID. The
+/// instance must enable VK_KHR_surface and VK_KHR_xcb_surface.
+pub fn create_xcb_surface(get_proc: ProcAddress, instance: *anyopaque, connection: *anyopaque, window: u32) Error!Surface {
+    const create: binding.CreateXcbSurface = @ptrCast(lookup(get_proc, instance, "vkCreateXcbSurfaceKHR") orelse return error.ExtensionNotEnabled);
+    const info: binding.XcbSurfaceCreateInfo = .{
+        .s_type = binding.structure_type_xcb_surface_create_info,
+        .p_next = null,
+        .flags = 0,
+        .connection = connection,
+        .window = window,
+    };
+    var surface: u64 = 0;
+    try check(create(@ptrCast(instance), &info, null, &surface));
+    return surface;
+}
+
 /// Creates a VkSurfaceKHR for a Wayland surface. `display` is `wl_display*` and
 /// `wl_surface` the `wl_surface*`, both from libwayland-client. Requires
 /// VK_KHR_surface and VK_KHR_wayland_surface on the instance.
@@ -107,6 +124,12 @@ pub fn destroy_surface(get_proc: ProcAddress, instance: *anyopaque, surface: Sur
 pub fn xlib_presentation_support(get_proc: ProcAddress, instance: *anyopaque, physical_device: *anyopaque, queue_family: u32, display: *anyopaque, visual_id: u64) bool {
     const query: binding.XlibPresentationSupport = @ptrCast(lookup(get_proc, instance, "vkGetPhysicalDeviceXlibPresentationSupportKHR") orelse return false);
     return query(@ptrCast(physical_device), queue_family, display, @intCast(visual_id)) != 0;
+}
+
+/// Whether `queue_family` on `physical_device` can present to an XCB connection.
+pub fn xcb_presentation_support(get_proc: ProcAddress, instance: *anyopaque, physical_device: *anyopaque, queue_family: u32, connection: *anyopaque, visual_id: u32) bool {
+    const query: binding.XcbPresentationSupport = @ptrCast(lookup(get_proc, instance, "vkGetPhysicalDeviceXcbPresentationSupportKHR") orelse return false);
+    return query(@ptrCast(physical_device), queue_family, connection, visual_id) != 0;
 }
 
 /// Whether `queue_family` on `physical_device` can present to a Wayland

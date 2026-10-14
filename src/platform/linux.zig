@@ -1362,6 +1362,7 @@ fn is_modifier(scancode: keyboard.Scancode) bool {
 pub const PixelSize = struct { width: u32, height: u32 };
 
 pub const GlOptions = graphics.GlOptions;
+pub const GlBackend = graphics.GlBackend;
 pub const GlAttributes = graphics.GlAttributes;
 pub const GlShare = graphics.GlShare;
 pub const GlContext = graphics.GlContext;

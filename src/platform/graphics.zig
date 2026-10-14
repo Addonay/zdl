@@ -1,4 +1,4 @@
-//! Window-to-graphics integration for the Linux platform: OpenGL through EGL,
+//! Window-to-graphics integration for the Linux platform: OpenGL through GLX or EGL,
 //! Vulkan surfaces and GPU swapchain claims, all reached from a `Window` without
 //! touching a native handle.
 //!
@@ -10,17 +10,16 @@
 //! SDL_Vulkan_GetPresentationSupport and SDL_ClaimWindowForGPUDevice /
 //! SDL_ReleaseWindowFromGPUDevice. The X11 `Display*`, the `wl_display*`, the
 //! `wl_surface*`, the X window id and its visual stay private to the platform;
-//! the EGL and Vulkan helpers (`video/egl`, `video/vulkan_surface`) receive them
+//! the GLX, EGL and Vulkan helpers (`video/egl`, `video/vulkan_surface`) receive them
 //! from here.
 //!
-//! OpenGL model. A window is given an EGL window surface the first time a
-//! context is created for it (`Window.gl_create_context`); the surface uses the
-//! `GlOptions.attributes` of that first call and later calls reuse it. On X11
-//! the platform keeps one EGL display for every window, so a context can be made
-//! current with any X11 window. On Wayland each window has its own connection
-//! (and so its own EGL display); a context works with the window it was created
-//! for, and `gl_make_current` with another window fails with
-//! `error.IncompatibleContext`. The Wayland wl_egl_window is resized whenever the
+//! OpenGL model. A window gets a GLX or EGL drawable the first time a context is
+//! created for it; that call's `GlOptions.attributes` select the config and later
+//! contexts reuse it. X11 defaults to GLX for desktop OpenGL and switches to EGL
+//! when `force_egl_hint` carries SDL_VIDEO_FORCE_EGL or the caller selects EGL.
+//! Wayland always uses EGL. X11 GLX and EGL displays are shared; Wayland owns one
+//! EGL display per window, so a context works only with the window it was created
+//! for. The Wayland wl_egl_window is resized whenever the
 //! window's pixel size changes (`resize_surface`, called from the platform's
 //! pixel-size check). A window that renders with GL must not also use
 //! `Window.present`: both attach buffers to the same surface.
@@ -29,6 +28,8 @@
 //! - Attributes are passed in `GlOptions` instead of the SDL_GL_SetAttribute
 //!   global; contexts are created on the window's own surface rather than on a
 //!   flag set at window creation.
+//! - SDL_VIDEO_FORCE_EGL is passed explicitly as `force_egl_hint`; the platform
+//!   has no hidden global hint state. GLX supports desktop GL; OpenGL ES uses EGL.
 //! - Context handles are ids looked up in the platform, so a stale handle reports
 //!   `error.NoGlContext` instead of dangling.
 //! - On Wayland `gl_swap` does not wait for the compositor's frame callback
@@ -56,8 +57,10 @@ const egl_attributes = @import("../video/egl/attributes.zig");
 const egl_display = @import("../video/egl/display.zig");
 const egl_surface = @import("../video/egl/surface.zig");
 const egl_context = @import("../video/egl/context.zig");
+const glx = @import("../video/egl/glx.zig");
 const vulkan_surface = @import("../video/vulkan_surface/surface.zig");
 const vulkan_extensions = @import("../video/vulkan_surface/extensions.zig");
+const x11_window = @import("../video/x11/window.zig");
 const gpu_device = @import("../gpu/vulkan/device.zig");
 const gpu_window = @import("../gpu/vulkan/window.zig");
 const platform = @import("linux.zig");
@@ -69,12 +72,12 @@ const Error = platform.Error;
 
 /// Errors of the EGL, Vulkan surface and GPU helpers, joined into
 /// `platform.Error`.
-pub const GraphicsError = egl_display.Error || vulkan_surface.Error || gpu_device.Error || error{
+pub const GraphicsError = egl_display.Error || glx.Error || vulkan_surface.Error || gpu_device.Error || error{
     /// The context handle was destroyed, or no context is current.
     NoGlContext,
     /// `gl_swap` or a similar call was made for a window that is not current.
     NotCurrent,
-    /// The context was created for a window on another EGL display.
+    /// The context was created for a window on another graphics display/backend.
     IncompatibleContext,
     /// The window already has a GPU claim for this device, or none.
     AlreadyClaimed,
@@ -93,12 +96,21 @@ pub const GlShare = union(enum) {
     context: GlContext,
 };
 
+/// OpenGL backend choice. Automatic follows SDL's X11 policy: GLX for desktop
+/// GL, EGL for OpenGL ES and Wayland, unless force_egl_hint is true.
+pub const GlBackend = enum { automatic, egl, glx };
+
 /// Options of `Window.gl_create_context`.
 pub const GlOptions = struct {
     attributes: GlAttributes = .{},
     share: GlShare = .none,
-    /// The EGL library to load; the default is what SDL loads.
+    backend: GlBackend = .automatic,
+    /// Set this from SDL_VIDEO_FORCE_EGL when that hint is enabled.
+    force_egl_hint: bool = false,
+    /// The EGL library to load when EGL is selected.
     library: []const u8 = egl_display.default_library,
+    /// The GLX library to load when GLX is selected.
+    glx_library: []const u8 = glx.default_library,
 };
 
 /// Handle to a context owned by the platform. Valid until `Platform.gl_destroy_context`
@@ -117,21 +129,33 @@ pub const GlContext = struct {
 /// The surface handle of a claimed window, as `gpu.window.acquire_window_texture` takes it.
 pub const GpuSurface = vulkan_surface.Surface;
 
-/// Per-window EGL state, heap-allocated so the borrowed pointers into it stay valid.
-pub const GlWindow = struct {
+pub const EglGlWindow = struct {
     display: *egl_display.Display,
-    /// True on Wayland, where the window's own connection needs its own display.
     owns_display: bool,
     config: egl_display.Config,
     surface: egl_surface.WindowSurface,
+};
+
+pub const GlxGlWindow = struct {
+    display: *glx.Display,
+    config: glx.Config,
+    surface: glx.Surface,
+};
+
+/// Per-window native GL state, heap-allocated so borrowed pointers stay stable.
+pub const GlWindow = union(enum) {
+    egl: EglGlWindow,
+    glx: GlxGlWindow,
 };
 
 const ContextEntry = struct {
     id: u32,
     /// The window the context was created for.
     window: event.WindowId,
-    display: *egl_display.Display,
-    context: egl_context.Context,
+    context: union(enum) {
+        egl: egl_context.Context,
+        glx: glx.Context,
+    },
 };
 
 const GpuClaim = struct {
@@ -149,6 +173,8 @@ const GpuClaim = struct {
 pub const State = struct {
     /// The shared EGL display for X11 windows, opened on first use.
     egl_x11: ?*egl_display.Display = null,
+    /// The shared GLX display/library for X11 windows, opened on first use.
+    glx_x11: ?*glx.Display = null,
     contexts: std.ArrayList(*ContextEntry) = .empty,
     next_context: u32 = 1,
     current_context: ?u32 = null,
@@ -170,11 +196,16 @@ pub const State = struct {
             allocator.destroy(shared);
             self.egl_x11 = null;
         }
+        if (self.glx_x11) |shared| {
+            shared.deinit();
+            allocator.destroy(shared);
+            self.glx_x11 = null;
+        }
     }
 
     fn destroy_contexts(self: *State, allocator: std.mem.Allocator) void {
         while (self.contexts.pop()) |entry| {
-            entry.context.deinit();
+            deinit_context(entry);
             allocator.destroy(entry);
         }
         self.current_context = null;
@@ -182,13 +213,16 @@ pub const State = struct {
     }
 };
 
-/// What the EGL and Vulkan helpers need from a window, copied out of its backend.
+/// A native window for the graphics backends, copied out of the platform record.
+const NativeWindow = union(enum) {
+    x11: struct { id: u64, visual_id: u32, connection: *x11_window.Connection },
+    wayland: *anyopaque,
+};
+
+/// What EGL and Vulkan need from a window, copied out of its backend.
 const NativeHandles = struct {
     display: *anyopaque,
-    window: union(enum) {
-        x11: struct { id: u64, visual_id: u32 },
-        wayland: *anyopaque,
-    },
+    window: NativeWindow,
 };
 
 fn native_handles(p: *Platform, record: *Record) Error!NativeHandles {
@@ -197,7 +231,7 @@ fn native_handles(p: *Platform, record: *Record) Error!NativeHandles {
             const session = p.x11 orelse return error.WindowClosed;
             return .{
                 .display = session.connection.display,
-                .window = .{ .x11 = .{ .id = @backingInt(window.id), .visual_id = window.visual_id() } },
+                .window = .{ .x11 = .{ .id = @backingInt(window.id), .visual_id = window.visual_id(), .connection = &session.connection } },
             };
         },
         .wayland => |*window| {
@@ -223,6 +257,30 @@ fn ensure_gl_window(p: *Platform, record: *Record, options: GlOptions) Error!*Gl
     const handles = try native_handles(p, record);
     const pixels = p.pixel_size_of(record);
     if (pixels.width == 0 or pixels.height == 0) return error.InvalidSize;
+
+    const selected = selected_gl_backend(handles.window, options);
+    if (selected == .glx) {
+        const native = switch (handles.window) {
+            .x11 => |x| x,
+            .wayland => return error.UnsupportedOperation,
+        };
+        var display: *glx.Display = undefined;
+        if (p.graphics.glx_x11) |shared| {
+            display = shared;
+        } else {
+            display = try p.allocator.create(glx.Display);
+            errdefer p.allocator.destroy(display);
+            display.* = try glx.Display.open(native.connection, options.glx_library);
+            p.graphics.glx_x11 = display;
+        }
+        const config = try display.choose_config(options.attributes, .window, native.visual_id);
+        var surface = try glx.Surface.create_window(display, config, native.id, native.visual_id);
+        errdefer surface.deinit();
+        const state = try p.allocator.create(GlWindow);
+        state.* = .{ .glx = .{ .display = display, .config = config, .surface = surface } };
+        record.gl = state;
+        return state;
+    }
 
     var display: *egl_display.Display = undefined;
     var owns_display = false;
@@ -263,33 +321,77 @@ fn ensure_gl_window(p: *Platform, record: *Record, options: GlOptions) Error!*Gl
     errdefer surface.deinit();
 
     const state = try p.allocator.create(GlWindow);
-    state.* = .{ .display = display, .owns_display = owns_display, .config = config, .surface = surface };
+    state.* = .{ .egl = .{ .display = display, .owns_display = owns_display, .config = config, .surface = surface } };
     record.gl = state;
     return state;
 }
 
+fn selected_gl_backend(window: NativeWindow, options: GlOptions) GlBackend {
+    return switch (options.backend) {
+        .egl => .egl,
+        .glx => .glx,
+        .automatic => switch (window) {
+            .x11 => if (options.force_egl_hint or options.attributes.profile == .es) .egl else .glx,
+            .wayland => .egl,
+        },
+    };
+}
+
 /// Creates a context for `record` and makes it current on it (SDL_GL_CreateContext).
 pub fn create_context(p: *Platform, record: *Record, options: GlOptions) Error!GlContext {
-    const gl = try ensure_gl_window(p, record, options);
-    const share: egl_context.Share = switch (options.share) {
-        .none => .none,
-        .current => .current,
-        .context => |other| .{ .context = &(try find_entry(p, other.id)).context },
-    };
+    const gl_window = try ensure_gl_window(p, record, options);
     const entry = try p.allocator.create(ContextEntry);
     errdefer p.allocator.destroy(entry);
     entry.* = .{
         .id = p.graphics.next_context,
         .window = record.id,
-        .display = gl.display,
-        .context = try egl_context.Context.create(gl.display, gl.config, &gl.surface, options.attributes, share),
+        .context = switch (gl_window.*) {
+            .egl => |*gl| .{ .egl = try create_egl_context(p, gl, options) },
+            .glx => |*gl| .{ .glx = try create_glx_context(p, gl, options) },
+        },
     };
-    errdefer entry.context.deinit();
+    errdefer deinit_context(entry);
     try p.graphics.contexts.append(p.allocator, entry);
     p.graphics.next_context += 1;
     p.graphics.current_context = entry.id;
     p.graphics.current_window = record.id;
     return .{ .platform = p, .id = entry.id };
+}
+
+fn create_egl_context(p: *Platform, gl: *const EglGlWindow, options: GlOptions) Error!egl_context.Context {
+    const share: egl_context.Share = switch (options.share) {
+        .none => .none,
+        .current => .current,
+        .context => |other| blk: {
+            const entry = try find_entry(p, other.id);
+            switch (entry.context) {
+                .egl => |*context| {
+                    if (context.display != gl.display) return error.IncompatibleContext;
+                    break :blk .{ .context = context };
+                },
+                .glx => return error.IncompatibleContext,
+            }
+        },
+    };
+    return egl_context.Context.create(gl.display, gl.config, &gl.surface, options.attributes, share);
+}
+
+fn create_glx_context(p: *Platform, gl: *const GlxGlWindow, options: GlOptions) Error!glx.Context {
+    const share: glx.Share = switch (options.share) {
+        .none => .none,
+        .current => .current,
+        .context => |other| blk: {
+            const entry = try find_entry(p, other.id);
+            switch (entry.context) {
+                .egl => return error.IncompatibleContext,
+                .glx => |*context| {
+                    if (context.display != gl.display) return error.IncompatibleContext;
+                    break :blk .{ .context = context };
+                },
+            }
+        },
+    };
+    return glx.Context.create(gl.display, gl.config, &gl.surface, options.attributes, share);
 }
 
 fn find_entry(p: *Platform, id: u32) Error!*ContextEntry {
@@ -311,12 +413,29 @@ pub fn make_current(p: *Platform, window: ?Window, context: ?GlContext) Error!vo
     const entry = try find_entry(p, ctx.id);
     if (window) |handle| {
         const record = try p.record_for(handle.id);
-        const gl = record.gl orelse return error.NoGlContext;
-        if (gl.display != entry.display) return error.IncompatibleContext;
-        try entry.context.make_current(&gl.surface);
+        const window_gl = record.gl orelse return error.NoGlContext;
+        switch (entry.context) {
+            .egl => |*context_value| switch (window_gl.*) {
+                .egl => |*gl| {
+                    if (gl.display != context_value.display) return error.IncompatibleContext;
+                    try context_value.make_current(&gl.surface);
+                },
+                .glx => return error.IncompatibleContext,
+            },
+            .glx => |*context_value| switch (window_gl.*) {
+                .egl => return error.IncompatibleContext,
+                .glx => |*gl| {
+                    if (gl.display != context_value.display) return error.IncompatibleContext;
+                    try context_value.make_current(&gl.surface);
+                },
+            },
+        }
         p.graphics.current_window = handle.id;
     } else {
-        try entry.context.make_current(null);
+        switch (entry.context) {
+            .egl => |*context_value| try context_value.make_current(null),
+            .glx => return error.NoDrawable,
+        }
         p.graphics.current_window = .none;
     }
     p.graphics.current_context = entry.id;
@@ -328,7 +447,10 @@ fn release_current(p: *Platform) Error!void {
         p.graphics.current_window = .none;
         return;
     };
-    try entry.display.release_current();
+    switch (entry.context) {
+        .egl => |*context_value| try context_value.display.release_current(),
+        .glx => |*context_value| try context_value.display.release_current(),
+    }
     p.graphics.current_context = null;
     p.graphics.current_window = .none;
 }
@@ -337,7 +459,7 @@ fn release_current(p: *Platform) Error!void {
 pub fn destroy_context(p: *Platform, id: u32) void {
     for (p.graphics.contexts.items, 0..) |entry, index| {
         if (entry.id != id) continue;
-        entry.context.deinit();
+        deinit_context(entry);
         if (p.graphics.current_context == id) {
             p.graphics.current_context = null;
             p.graphics.current_window = .none;
@@ -353,32 +475,56 @@ pub fn destroy_context(p: *Platform, id: u32) void {
 pub fn swap(p: *Platform, record: *Record) Error!void {
     const gl = record.gl orelse return error.NoGlContext;
     if (p.graphics.current_window != record.id) return error.NotCurrent;
-    try gl.surface.swap_buffers();
+    switch (gl.*) {
+        .egl => |*window_gl| try window_gl.surface.swap_buffers(),
+        .glx => |*window_gl| try window_gl.surface.swap_buffers(),
+    }
 }
 
 /// SDL_GL_SetSwapInterval for the current context's display.
 pub fn set_swap_interval(p: *Platform, interval: i32) Error!void {
     const entry = try current_entry(p);
-    try entry.display.set_swap_interval(interval);
+    switch (entry.context) {
+        .egl => |*context_value| try context_value.display.set_swap_interval(interval),
+        .glx => |*context_value| {
+            const window_id = p.graphics.current_window;
+            if (window_id == .none) return error.NoDrawable;
+            const record = try p.record_for(window_id);
+            const gl = record.gl orelse return error.NoGlContext;
+            switch (gl.*) {
+                .egl => return error.IncompatibleContext,
+                .glx => |*window_gl| try context_value.display.set_swap_interval(&window_gl.surface, interval),
+            }
+        },
+    }
 }
 
 /// SDL_GL_GetSwapInterval for the current context's display.
 pub fn swap_interval(p: *Platform) Error!i32 {
     const entry = try current_entry(p);
-    return entry.display.swap_interval();
+    return switch (entry.context) {
+        .egl => |context_value| context_value.display.swap_interval(),
+        .glx => |context_value| context_value.display.swap_interval(),
+    };
 }
 
 /// SDL_GL_ExtensionSupported: asks the current context.
 pub fn extension_supported(p: *Platform, name: []const u8) bool {
     const entry = current_entry(p) catch return false;
-    return entry.context.gl_has_extension(name);
+    return switch (entry.context) {
+        .egl => |context_value| context_value.gl_has_extension(name),
+        .glx => |context_value| context_value.gl_has_extension(name),
+    };
 }
 
 /// SDL_GL_GetProcAddress for the current context's display; null when there is
 /// no context or the function is unknown.
 pub fn proc_address(p: *Platform, comptime Fn: type, name: [:0]const u8) ?Fn {
     const entry = current_entry(p) catch return null;
-    return entry.display.proc_address(Fn, name);
+    return switch (entry.context) {
+        .egl => |context_value| context_value.display.proc_address(Fn, name),
+        .glx => |context_value| context_value.display.proc_address(Fn, name),
+    };
 }
 
 /// Resizes a Wayland window's wl_egl_window to the pixel size the backend
@@ -387,7 +533,10 @@ pub fn resize_surface(p: *Platform, record: *Record) Error!void {
     const gl = record.gl orelse return;
     const pixels = p.pixel_size_of(record);
     if (pixels.width == 0 or pixels.height == 0) return;
-    try gl.surface.resize(.{ .width = clamp_u31(pixels.width), .height = clamp_u31(pixels.height) });
+    switch (gl.*) {
+        .egl => |*window_gl| try window_gl.surface.resize(.{ .width = clamp_u31(pixels.width), .height = clamp_u31(pixels.height) }),
+        .glx => {},
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -494,24 +643,34 @@ pub fn release_window(p: *Platform, record: *Record) void {
     const gl = record.gl orelse return;
     record.gl = null;
     if (p.graphics.current_window == record.id) p.graphics.current_window = .none;
-    if (gl.owns_display) {
-        var at: usize = 0;
-        while (at < p.graphics.contexts.items.len) {
-            const entry = p.graphics.contexts.items[at];
-            if (entry.display == gl.display) {
-                if (p.graphics.current_context == entry.id) p.graphics.current_context = null;
-                entry.context.deinit();
-                _ = p.graphics.contexts.orderedRemove(at);
-                p.allocator.destroy(entry);
-            } else {
-                at += 1;
-            }
+    var at: usize = 0;
+    while (at < p.graphics.contexts.items.len) {
+        const entry = p.graphics.contexts.items[at];
+        if (entry.window == record.id) {
+            if (p.graphics.current_context == entry.id) p.graphics.current_context = null;
+            deinit_context(entry);
+            _ = p.graphics.contexts.orderedRemove(at);
+            p.allocator.destroy(entry);
+        } else {
+            at += 1;
         }
     }
-    gl.surface.deinit();
-    if (gl.owns_display) {
-        gl.display.deinit();
-        p.allocator.destroy(gl.display);
+    switch (gl.*) {
+        .egl => |*window_gl| {
+            window_gl.surface.deinit();
+            if (window_gl.owns_display) {
+                window_gl.display.deinit();
+                p.allocator.destroy(window_gl.display);
+            }
+        },
+        .glx => |*window_gl| window_gl.surface.deinit(),
     }
     p.allocator.destroy(gl);
+}
+
+fn deinit_context(entry: *ContextEntry) void {
+    switch (entry.context) {
+        .egl => |*context_value| context_value.deinit(),
+        .glx => |*context_value| context_value.deinit(),
+    }
 }

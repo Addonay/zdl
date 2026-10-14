@@ -13,11 +13,13 @@ const binding = @import("binding.zig");
 const attributes = @import("attributes.zig");
 const display_mod = @import("display.zig");
 const surface_mod = @import("surface.zig");
+const pbuffer_mod = @import("pbuffer.zig");
 
 const Display = display_mod.Display;
 const Config = display_mod.Config;
 const Error = display_mod.Error;
 const WindowSurface = surface_mod.WindowSurface;
+const Pbuffer = pbuffer_mod.Pbuffer;
 const Attributes = attributes.Attributes;
 const Api = attributes.Api;
 
@@ -42,6 +44,17 @@ pub const Context = struct {
     /// the swap interval to 0 (vsync off), as SDL_GL_CreateContext does. A
     /// `Share.current` request uses the calling thread's current context.
     pub fn create(display: *Display, config: Config, surface: *const WindowSurface, options: Attributes, share: Share) Error!Context {
+        if (surface.display != display) return error.MakeCurrentFailed;
+        return create_on_surface(display, config, surface.handle, options, share);
+    }
+
+    /// Creates and binds a context to an offscreen EGL pbuffer.
+    pub fn create_pbuffer(display: *Display, config: Config, surface: *const Pbuffer, options: Attributes, share: Share) Error!Context {
+        if (surface.display != display) return error.MakeCurrentFailed;
+        return create_on_surface(display, config, surface.handle, options, share);
+    }
+
+    fn create_on_surface(display: *Display, config: Config, native_surface: *binding.Surface, options: Attributes, share: Share) Error!Context {
         try options.validate();
         const api = options.api();
         const support: attributes.ContextSupport = .{
@@ -62,13 +75,13 @@ pub const Context = struct {
         const share_handle: ?*binding.Context = switch (share) {
             .none => null,
             .current => display.library.functions.eglGetCurrentContext(),
-            .context => |other| other.handle,
+            .context => |other| if (other.display == display) other.handle else return error.MakeCurrentFailed,
         };
         const handle = display.library.functions.eglCreateContext(display.handle, config.handle, share_handle, request.ptr) orelse {
             return error.ContextCreationFailed;
         };
         var context: Context = .{ .display = display, .handle = handle, .api = api, .surfaceless = false };
-        context.make_current(surface) catch |err| {
+        context.make_current_raw(native_surface) catch |err| {
             _ = display.library.functions.eglDestroyContext(display.handle, handle);
             return err;
         };
@@ -82,12 +95,25 @@ pub const Context = struct {
     /// draw and read. A null surface makes it current without a surface, which
     /// requires `surfaceless`. Binds the context's API first, as SDL does.
     pub fn make_current(self: *Context, surface: ?*const WindowSurface) Error!void {
+        return self.make_current_raw(if (surface) |window_surface| window_surface.handle else null);
+    }
+
+    /// Makes this context current with an EGL pbuffer, or surfaceless when null.
+    /// The pbuffer must belong to the same display.
+    pub fn make_current_pbuffer(self: *Context, surface: ?*const Pbuffer) Error!void {
+        if (surface) |pbuffer| {
+            if (pbuffer.display != self.display) return error.MakeCurrentFailed;
+            return self.make_current_raw(pbuffer.handle);
+        }
+        return self.make_current_raw(null);
+    }
+
+    fn make_current_raw(self: *Context, draw: ?*binding.Surface) Error!void {
         const bind: binding.Enum = switch (self.api) {
             .gl => binding.egl_opengl_api,
             .es => binding.egl_opengl_es_api,
         };
         _ = self.display.library.functions.eglBindAPI(bind);
-        const draw: ?*binding.Surface = if (surface) |s| s.handle else null;
         if (draw == null and !self.surfaceless) return error.SurfacelessUnsupported;
         if (self.display.library.functions.eglMakeCurrent(self.display.handle, draw, draw, self.handle) != binding.true_value) {
             return error.MakeCurrentFailed;

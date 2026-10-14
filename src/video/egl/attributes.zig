@@ -28,8 +28,11 @@ pub const egl = struct {
     pub const config_caveat: i32 = 0x3027;
     pub const surface_type: i32 = 0x3033;
     pub const native_visual_id: i32 = 0x302E;
+    pub const width: i32 = 0x3057;
+    pub const height: i32 = 0x3056;
     pub const renderable_type: i32 = 0x3040;
     pub const window_bit: i32 = 0x0004;
+    pub const pbuffer_bit: i32 = 0x0001;
     pub const opengl_bit: i32 = 0x0008;
     pub const opengl_es_bit: i32 = 0x0001;
     pub const opengl_es2_bit: i32 = 0x0004;
@@ -184,6 +187,11 @@ pub const ContextList = AttributeList(max_list_pairs);
 /// bit (see `renderable_type`). `caveat_none` requests EGL_CONFIG_CAVEAT ==
 /// EGL_NONE, which SDL tries first to avoid slow and non-conformant configs.
 pub fn config_list(attributes: Attributes, renderable: i32, caveat_none: bool) ConfigList {
+    return config_list_for_surface(attributes, renderable, caveat_none, egl.window_bit);
+}
+
+/// Builds an `eglChooseConfig` request for a window or pbuffer surface.
+pub fn config_list_for_surface(attributes: Attributes, renderable: i32, caveat_none: bool, surface_bit: i32) ConfigList {
     var list: ConfigList = .{};
     // Capacity is fixed and far above the maximum pair count, so these cannot fail.
     list.append(egl.red_size, attributes.red_size) catch unreachable;
@@ -197,7 +205,7 @@ pub fn config_list(attributes: Attributes, renderable: i32, caveat_none: bool) C
     if (attributes.multisample_buffers != 0) list.append(egl.sample_buffers, attributes.multisample_buffers) catch unreachable;
     if (attributes.multisample_samples != 0) list.append(egl.samples, attributes.multisample_samples) catch unreachable;
     if (attributes.float_buffers) list.append(egl.color_component_type_ext, egl.color_component_type_float_ext) catch unreachable;
-    list.append(egl.surface_type, egl.window_bit) catch unreachable;
+    list.append(egl.surface_type, surface_bit) catch unreachable;
     list.append(egl.renderable_type, renderable) catch unreachable;
     return list;
 }
