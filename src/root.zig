@@ -74,6 +74,8 @@ pub const fs = struct {
 /// Event model, caller-owned event queue and mouse/touch/pen input state.
 pub const events = struct {
     pub const event = @import("events/event.zig");
+    pub const timestamp = @import("events/timestamp.zig");
+    pub const payload = @import("events/payload.zig");
     pub const queue = @import("events/queue.zig");
     pub const mouse = @import("events/mouse.zig");
     pub const touch = @import("events/touch.zig");

@@ -273,7 +273,7 @@ pub const Clipboard = struct {
         event.selection.selection = selection_atom;
         event.selection.target = target;
         event.selection.property = answered;
-        event.selection.time = @intCast(request.timestamp);
+        event.selection.time = @intCast(request.server_time_ms);
         _ = api.XSendEvent(connection.display, requestor, 0, 0, &event);
         try connection.flush();
     }

@@ -32,6 +32,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const camera = @import("camera.zig");
+const timestamp = @import("../events/timestamp.zig");
 
 pub const Error = camera.Error || error{
     /// The path could not be opened.
@@ -74,6 +75,8 @@ pub const Error = camera.Error || error{
     UnsupportedFormat,
     /// The device path or directory name does not fit the path buffer.
     NameTooLong,
+    /// The driver returned a malformed or negative frame timestamp.
+    InvalidTimestamp,
     /// The /dev directory could not be read.
     DirectoryFailed,
 };
@@ -258,10 +261,12 @@ fn ioctl_errno(fd: i32, request: u32, arg: anytype) linux.E {
     }
 }
 
-fn monotonic_ns() u64 {
+fn monotonic_ns() Error!timestamp.Timestamp {
     var ts: linux.timespec = undefined;
-    if (linux.errno(linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return 0;
-    return @as(u64, @intCast(ts.sec)) *% 1_000_000_000 +% @as(u64, @intCast(ts.nsec));
+    if (linux.errno(linux.clock_gettime(linux.CLOCK.MONOTONIC, &ts)) != .SUCCESS) return error.PollFailed;
+    const seconds = std.math.cast(u64, ts.sec) orelse return error.PollFailed;
+    const nanoseconds = std.math.cast(u64, ts.nsec) orelse return error.PollFailed;
+    return std.math.add(u64, std.math.mul(u64, seconds, std.time.ns_per_s) catch return error.PollFailed, nanoseconds) catch return error.PollFailed;
 }
 
 /// Copies `path` into `buffer` with a terminating zero.
@@ -686,7 +691,7 @@ pub const Session = struct {
     driver_pitch: u32 = 0,
     /// Frames still to drop after start. The first frames are often dark.
     drop_frames: u32 = 1,
-    timestamps: camera.Timestamp = .{},
+    timestamps: camera.TimestampMapper = .{},
 
     const Buffer = struct {
         mapping: []u8 = &.{},
@@ -791,12 +796,13 @@ pub const Session = struct {
         const used: usize = if (bytes_used == 0 or bytes_used > length) length else bytes_used;
         const stride: usize = if (self.driver_pitch != 0) self.driver_pitch else used;
 
-        // timeval fields are read as signed 64-bit and reinterpreted, since
-        // the kernel's signed seconds are never negative for a capture time.
-        const sec: u64 = @bitCast(get_i64(&buf, buf_timestamp_sec));
-        const usec: u64 = @bitCast(get_i64(&buf, buf_timestamp_usec));
-        const driver_ns = sec *% 1_000_000_000 +% usec *% 1000;
-        const timestamp_ns = self.timestamps.map(driver_ns, monotonic_ns());
+        // V4L2 reports a timeval. Rebase the driver epoch to CLOCK_MONOTONIC,
+        // preserving frame spacing while keeping all public frame times aligned.
+        const sec = get_i64(&buf, buf_timestamp_sec);
+        const usec = get_i64(&buf, buf_timestamp_usec);
+        if (sec < 0 or usec < 0) return error.InvalidTimestamp;
+        const driver_ns = timestamp.from_timeval(@intCast(sec), @intCast(usec)) orelse return error.InvalidTimestamp;
+        const timestamp_ns = self.timestamps.map(driver_ns, try monotonic_ns());
 
         return .{
             .slot = index,

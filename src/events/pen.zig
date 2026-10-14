@@ -1,7 +1,7 @@
 //! Pressure-sensitive pen devices: proximity, tip contact, buttons, position
 //! and axes. Altered native port of SDL_pen.c (state machine and event
-//! generation). Each call returns the events it produced; nothing is queued
-//! here.
+//! generation). Each call takes timestamps in the shared monotonic nanosecond
+//! domain and returns the events it produced; nothing is queued here.
 //!
 //! Differences from SDL:
 //! - Pens live in a `Pens` table owned by the caller and allocated from its
@@ -122,7 +122,7 @@ pub const Pens = struct {
     /// If `in_proximity` is true the pen is reported entering proximity at once.
     pub fn add(
         self: *Pens,
-        timestamp: u64,
+        timestamp: event.Timestamp,
         window_id: event.WindowId,
         pen_name: ?[]const u8,
         device_type: DeviceType,
@@ -150,7 +150,7 @@ pub const Pens = struct {
     }
 
     /// Removes a pen, reporting its proximity loss first. Unknown ids are ignored.
-    pub fn remove(self: *Pens, timestamp: u64, window_id: event.WindowId, id: event.PenId) event.Batch {
+    pub fn remove(self: *Pens, timestamp: event.Timestamp, window_id: event.WindowId, id: event.PenId) event.Batch {
         var batch: event.Batch = .{};
         const index = self.index_of(id) orelse return batch;
         set_proximity(&self.list.items[index], timestamp, window_id, false, true, &batch);
@@ -162,7 +162,7 @@ pub const Pens = struct {
     /// Pen tip contact or eraser end changed. An event is reported only when the
     /// tip or eraser state actually changes. Its kind follows `down`, as in SDL,
     /// so an eraser-only change reports the current tip direction.
-    pub fn touch(self: *Pens, timestamp: u64, window_id: event.WindowId, id: event.PenId, eraser: bool, down: bool) event.Batch {
+    pub fn touch(self: *Pens, timestamp: event.Timestamp, window_id: event.WindowId, id: event.PenId, eraser: bool, down: bool) event.Batch {
         var batch: event.Batch = .{};
         const pen = self.find(id) orelse return batch;
         var state = pen.state;
@@ -198,7 +198,7 @@ pub const Pens = struct {
 
     /// Updates one axis. Returns the axis event only when the value changed.
     /// Axis values are stored as given, not clamped or normalized.
-    pub fn axis(self: *Pens, timestamp: u64, window_id: event.WindowId, id: event.PenId, which: Axis, value: f32) ?event.Event {
+    pub fn axis(self: *Pens, timestamp: event.Timestamp, window_id: event.WindowId, id: event.PenId, which: Axis, value: f32) ?event.Event {
         const pen = self.find(id) orelse return null;
         if (pen.axes[@backingInt(which)] == value) return null;
         pen.axes[@backingInt(which)] = value;
@@ -217,7 +217,7 @@ pub const Pens = struct {
 
     /// Moves the pen. A pen that is not yet in proximity (or whose deferred
     /// proximity loss is pending) first reports proximity, as SDL does.
-    pub fn motion(self: *Pens, timestamp: u64, window_id: event.WindowId, id: event.PenId, x: f32, y: f32) event.Batch {
+    pub fn motion(self: *Pens, timestamp: event.Timestamp, window_id: event.WindowId, id: event.PenId, x: f32, y: f32) event.Batch {
         var batch: event.Batch = .{};
         const pen = self.find(id) orelse return batch;
         ensure_proximity(pen, timestamp, window_id, &batch);
@@ -237,7 +237,7 @@ pub const Pens = struct {
     }
 
     /// One-based pen button changed. Buttons outside 1 to 5 are ignored, as in SDL.
-    pub fn button(self: *Pens, timestamp: u64, window_id: event.WindowId, id: event.PenId, button_index: u8, down: bool) event.Batch {
+    pub fn button(self: *Pens, timestamp: event.Timestamp, window_id: event.WindowId, id: event.PenId, button_index: u8, down: bool) event.Batch {
         var batch: event.Batch = .{};
         if (button_index < 1 or button_index > 5) return batch;
         const pen = self.find(id) orelse return batch;
@@ -262,7 +262,7 @@ pub const Pens = struct {
     /// Reports a pen entering or leaving proximity. `immediate` false defers a
     /// leave: `next_pending_proximity` reports it later, and any motion or
     /// button event for the pen cancels it.
-    pub fn proximity(self: *Pens, timestamp: u64, window_id: event.WindowId, id: event.PenId, in: bool, immediate: bool) event.Batch {
+    pub fn proximity(self: *Pens, timestamp: event.Timestamp, window_id: event.WindowId, id: event.PenId, in: bool, immediate: bool) event.Batch {
         var batch: event.Batch = .{};
         const pen = self.find(id) orelse return batch;
         set_proximity(pen, timestamp, window_id, in, immediate, &batch);
@@ -271,7 +271,7 @@ pub const Pens = struct {
 
     /// Returns the proximity-out batch for the next pen with a deferred leave,
     /// clearing it, or null when none remain. Timestamp is applied as given.
-    pub fn next_pending_proximity(self: *Pens, timestamp: u64) ?event.Batch {
+    pub fn next_pending_proximity(self: *Pens, timestamp: event.Timestamp) ?event.Batch {
         for (self.list.items) |*pen| {
             if (!pen.pending_out) continue;
             pen.pending_out = false;
@@ -315,7 +315,7 @@ pub const Pens = struct {
 
 /// Before pen input, a pen that is not in proximity reports entering it. A
 /// deferred leave that is still pending is simply cancelled.
-fn ensure_proximity(pen: *Pen, timestamp: u64, window_id: event.WindowId, batch: *event.Batch) void {
+fn ensure_proximity(pen: *Pen, timestamp: event.Timestamp, window_id: event.WindowId, batch: *event.Batch) void {
     if (pen.pending_out) {
         pen.pending_out = false;
     } else if (!pen.state.in_proximity) {
@@ -327,7 +327,7 @@ fn ensure_proximity(pen: *Pen, timestamp: u64, window_id: event.WindowId, batch:
 /// proximity bit and all buttons, and first reports each button that was
 /// pressed as released, as SDL does. A deferred leave (`immediate` false) only
 /// marks the pen pending.
-fn set_proximity(pen: *Pen, timestamp: u64, window_id: event.WindowId, in: bool, immediate: bool, batch: *event.Batch) void {
+fn set_proximity(pen: *Pen, timestamp: event.Timestamp, window_id: event.WindowId, in: bool, immediate: bool, batch: *event.Batch) void {
     if (!(in or immediate)) {
         pen.pending_out = true;
         pen.pending_window = window_id;

@@ -31,12 +31,14 @@
 //! - The effect duration is the kernel maximum (SDL_MAX_RUMBLE_DURATION_MS); the
 //!   caller-visible expiry is tracked by `rumble.zig`, not by the kernel.
 //! - Event timestamps are the kernel timestamps converted to nanoseconds. Polled
-//!   state uses CLOCK_MONOTONIC, which is what SDL_GetTicksNS uses.
+//!   timeval records use CLOCK_REALTIME by default; a per-device source-clock
+//!   offset rebases them to CLOCK_MONOTONIC and clamps future samples like SDL.
 //! - AxisCorrect uses 64-bit intermediates, avoiding SDL's C int overflow.
 const std = @import("std");
 const builtin = @import("builtin");
 const joystick = @import("joystick.zig");
 const gamepad = @import("gamepad.zig");
+const event_time = @import("../events/timestamp.zig");
 
 pub const Guid = joystick.Guid;
 
@@ -184,6 +186,8 @@ pub const Error = error{
     SystemError,
     /// The kernel returned fewer bytes than the record size.
     ShortRead,
+    /// The kernel returned invalid seconds or microseconds in an input record.
+    InvalidTimestamp,
     /// The device has neither FF_RUMBLE nor FF_SINE, so it cannot rumble.
     Unsupported,
 } || std.mem.Allocator.Error;
@@ -339,6 +343,8 @@ pub const Device = struct {
     name: []u8,
     guid: Guid,
     options: Options,
+    /// Maps the kernel's default CLOCK_REALTIME timeval to host monotonic time.
+    event_clock: event_time.SourceClock = .{},
     layout: joystick.Layout = .{},
     /// Kernel key code -> button index, valid where `has_key` is set.
     key_map: [key_count]u16 = @splat(0),
@@ -447,7 +453,7 @@ pub const Device = struct {
     ) Error!void {
         if (self.fresh) {
             self.fresh = false;
-            try self.poll_all_values(allocator, js, out, now_ns());
+            try self.poll_all_values(allocator, js, out, try now_ns());
         }
 
         const record_size = 2 * @sizeOf(usize) + 8;
@@ -484,27 +490,28 @@ pub const Device = struct {
         const event_type = std.mem.readInt(u16, record[type_offset..][0..2], native_endian);
         const code: usize = std.mem.readInt(u16, record[type_offset + 2 ..][0..2], native_endian);
         const value = std.mem.readInt(i32, record[type_offset + 4 ..][0..4], native_endian);
-        const timestamp = @max(1, @as(u64, sec) *% std.time.ns_per_s +% @as(u64, usec) *% std.time.ns_per_us);
+        const source_ns = event_time.from_timeval(@intCast(sec), @intCast(usec)) orelse return error.InvalidTimestamp;
+        const event_timestamp = self.event_clock.rebase(source_ns, try now_ns());
 
         if (self.recovering_from_dropped and !(event_type == ev_syn and code == syn_report)) return;
 
         switch (event_type) {
             ev_key => {
                 if (code < key_count and self.has_key[code]) {
-                    try js.set_button(allocator, out, timestamp, self.key_map[code], value != 0);
+                    try js.set_button(allocator, out, event_timestamp, self.key_map[code], value != 0);
                 }
             },
             ev_abs => {
                 if (code >= abs_hat0x and code <= abs_hat3y) {
                     const hat_index = (code - abs_hat0x) / 2;
                     if (self.has_hat[hat_index]) {
-                        try self.handle_hat(allocator, js, out, timestamp, hat_index, (code - abs_hat0x) % 2, value);
+                        try self.handle_hat(allocator, js, out, event_timestamp, hat_index, (code - abs_hat0x) % 2, value);
                         return;
                     }
                 }
                 if (code < abs_cnt and self.has_abs[code]) {
                     const corrected = self.axis_correct(code, value);
-                    try js.set_axis(allocator, out, timestamp, self.abs_map[code], corrected);
+                    try js.set_axis(allocator, out, event_timestamp, self.abs_map[code], corrected);
                 }
             },
             ev_rel => {
@@ -517,13 +524,13 @@ pub const Device = struct {
                 syn_report => {
                     if (self.recovering_from_dropped) {
                         self.recovering_from_dropped = false;
-                        try self.poll_all_values(allocator, js, out, timestamp);
+                        try self.poll_all_values(allocator, js, out, event_timestamp);
                     }
                     if (self.layout.balls > 0 and (self.ball_pending[0] != 0 or self.ball_pending[1] != 0)) {
                         const dx: i16 = @intCast(std.math.clamp(self.ball_pending[0], std.math.minInt(i16), std.math.maxInt(i16)));
                         const dy: i16 = @intCast(std.math.clamp(self.ball_pending[1], std.math.minInt(i16), std.math.maxInt(i16)));
                         self.ball_pending = .{ 0, 0 };
-                        try js.set_ball(allocator, out, timestamp, 0, dx, dy);
+                        try js.set_ball(allocator, out, event_timestamp, 0, dx, dy);
                     }
                 },
                 else => {},
@@ -539,7 +546,7 @@ pub const Device = struct {
         allocator: std.mem.Allocator,
         js: *joystick.Joystick,
         out: *std.ArrayList(joystick.Change),
-        timestamp: u64,
+        timestamp: joystick.Timestamp,
         hat_index: usize,
         axis: usize,
         raw: i32,
@@ -601,7 +608,7 @@ pub const Device = struct {
         allocator: std.mem.Allocator,
         js: *joystick.Joystick,
         out: *std.ArrayList(joystick.Change),
-        timestamp: u64,
+        timestamp: joystick.Timestamp,
     ) Error!void {
         var abs_bytes: [24]u8 = undefined;
         for (0..abs_cnt) |code| {
@@ -644,10 +651,13 @@ fn upload_effect(self: *Device) Error!void {
 }
 
 /// Monotonic clock in nanoseconds, used for polled state.
-fn now_ns() u64 {
+fn now_ns() Error!joystick.Timestamp {
     var ts: linux.timespec = undefined;
-    _ = linux.clock_gettime(.MONOTONIC, &ts);
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    if (linux.errno(linux.clock_gettime(.MONOTONIC, &ts)) != .SUCCESS) return error.SystemError;
+    const seconds = std.math.cast(u64, ts.sec) orelse return error.SystemError;
+    const nanoseconds = std.math.cast(u64, ts.nsec) orelse return error.SystemError;
+    const value = std.math.add(u64, std.math.mul(u64, seconds, std.time.ns_per_s) catch return error.SystemError, nanoseconds) catch return error.SystemError;
+    return @max(1, value);
 }
 
 /// Issues an ioctl that writes into `buffer`. Returns the byte count the kernel reported.
@@ -853,6 +863,7 @@ pub fn scan(allocator: std.mem.Allocator, options: Options) Error![]Device {
         const device = open_index(allocator, index, options) catch |err| switch (err) {
             error.NotJoystick, error.SystemError, error.ShortRead, error.NameTooLong, error.Unsupported => continue,
             error.OutOfMemory => return error.OutOfMemory,
+            error.InvalidTimestamp => return error.InvalidTimestamp,
         };
         try devices.append(allocator, device);
     }

@@ -14,6 +14,9 @@
 //! registered: incoming method calls are read from the connection queue and
 //! routed here by object path. `Item.close` drops the connection, which makes
 //! the watcher forget the item.
+//! Request values decoded from D-Bus live only in a per-request arena while
+//! `process` dispatches them. Tray callbacks receive the owned model, not those
+//! temporary decoded slices, and are synchronous on the caller's thread.
 //!
 //! Object routing: `/StatusNotifierItem` serves the item properties and
 //! `ContextMenu`/`Activate`/`SecondaryActivate`/`Scroll`; `/StatusNotifierItem/menu`

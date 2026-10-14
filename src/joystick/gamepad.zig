@@ -815,7 +815,7 @@ pub const Gamepad = struct {
 
     /// Gamepad change: an axis value or a button state with its timestamp.
     pub const Change = struct {
-        timestamp: u64,
+        timestamp: joystick.Timestamp,
         event: union(enum) {
             axis: struct { axis: Axis, value: i16 },
             button: struct { button: Button, down: bool },
@@ -897,16 +897,16 @@ pub const Gamepad = struct {
     }
 
     /// Releases the guide button after a delayed press (SDL_GamepadHandleDelayedGuideButton).
-    pub fn release_delayed_guide(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: u64) std.mem.Allocator.Error!void {
+    pub fn release_delayed_guide(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: joystick.Timestamp) std.mem.Allocator.Error!void {
         try self.send_button(allocator, out, timestamp, .guide, false);
     }
 
-    fn send_axis(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: u64, axis: Axis, value: i16) std.mem.Allocator.Error!void {
+    fn send_axis(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: joystick.Timestamp, axis: Axis, value: i16) std.mem.Allocator.Error!void {
         _ = self;
         try out.append(allocator, .{ .timestamp = timestamp, .event = .{ .axis = .{ .axis = axis, .value = value } } });
     }
 
-    fn send_button(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: u64, button: Button, down: bool) std.mem.Allocator.Error!void {
+    fn send_button(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: joystick.Timestamp, button: Button, down: bool) std.mem.Allocator.Error!void {
         if (button == .guide) {
             if (down) {
                 self.guide_down_ns = timestamp;
@@ -922,14 +922,14 @@ pub const Gamepad = struct {
         try out.append(allocator, .{ .timestamp = timestamp, .event = .{ .button = .{ .button = button, .down = down } } });
     }
 
-    fn reset_output(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: u64, binding_index: usize) std.mem.Allocator.Error!void {
+    fn reset_output(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: joystick.Timestamp, binding_index: usize) std.mem.Allocator.Error!void {
         switch (self.bindings[binding_index].output) {
             .axis => |a| try self.send_axis(allocator, out, timestamp, a.axis, 0),
             .button => |b| try self.send_button(allocator, out, timestamp, b, false),
         }
     }
 
-    fn handle_axis(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: u64, index: usize, raw: i16) std.mem.Allocator.Error!void {
+    fn handle_axis(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: joystick.Timestamp, index: usize, raw: i16) std.mem.Allocator.Error!void {
         if (index >= self.last_match_axis.len) return;
         const value: i32 = raw;
         var match: ?usize = null;
@@ -983,7 +983,7 @@ pub const Gamepad = struct {
         self.last_match_axis[index] = match;
     }
 
-    fn handle_button(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: u64, index: usize, down: bool) std.mem.Allocator.Error!void {
+    fn handle_button(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: joystick.Timestamp, index: usize, down: bool) std.mem.Allocator.Error!void {
         for (self.bindings) |binding| {
             switch (binding.input) {
                 .button => |input| {
@@ -999,7 +999,7 @@ pub const Gamepad = struct {
         }
     }
 
-    fn handle_hat(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: u64, index: usize, value: joystick.Hat) std.mem.Allocator.Error!void {
+    fn handle_hat(self: *Gamepad, allocator: std.mem.Allocator, out: *std.ArrayList(Change), timestamp: joystick.Timestamp, index: usize, value: joystick.Hat) std.mem.Allocator.Error!void {
         if (index >= self.last_hat_mask.len) return;
         const bits = value.bits();
         const changed = self.last_hat_mask[index] ^ bits;

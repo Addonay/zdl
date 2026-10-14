@@ -9,8 +9,12 @@
 //! discovery on Linux. Platform code or a game-controller driver feeds samples
 //! through `Sensor.update`. The returned `Event` replaces SDL's global event push,
 //! and no registry, thread or event queue exists here.
+//!
+//! Event timestamps are nanoseconds on the host monotonic clock. A sensor's
+//! independent sample clock is rebased to that domain when `update` is called.
 
 const std = @import("std");
+const timestamp = @import("../events/timestamp.zig");
 
 /// Standard gravity in m/s^2, as SDL_STANDARD_GRAVITY. Accelerometers report in
 /// multiples of this value, so 1.0 means one g.
@@ -66,10 +70,10 @@ pub const Type = enum(i8) {
 /// samples. The full state, up to `max_values` values, is available from the
 /// `Sensor` after the update.
 pub const Event = struct {
-    timestamp_ns: u64,
+    timestamp_ns: timestamp.Timestamp,
     sensor_id: Id,
-    /// Timestamp from the sensor's own clock, in nanoseconds.
-    sensor_timestamp_ns: u64,
+    /// Sensor sample time rebased into the host monotonic clock domain.
+    sensor_timestamp_ns: timestamp.Timestamp,
     values: [event_values]f32,
     /// Number of meaningful entries in `values`.
     count: usize,
@@ -88,6 +92,8 @@ pub const Sensor = struct {
     non_portable_type: i32 = -1,
     /// Latest sample, zero-filled until the first update.
     data: [max_values]f32 = @splat(0),
+    /// Rebase state for the sensor's nanosecond clock into host monotonic time.
+    sensor_clock: timestamp.SourceClock = .{},
 
     /// Creates a sensor with zeroed state. No device is opened.
     pub fn init(instance_id: Id, name: []const u8, sensor_type: Type, non_portable_type: i32) Sensor {
@@ -113,7 +119,7 @@ pub const Sensor = struct {
     /// Duplicate samples are accepted, since SDL allows repeated step and heartbeat
     /// values. Values beyond `max_values` are dropped from the stored state, and
     /// the event carries at most `event_values` of them.
-    pub fn update(self: *Sensor, timestamp_ns: u64, sensor_timestamp_ns: u64, values: []const f32) Event {
+    pub fn update(self: *Sensor, timestamp_ns: timestamp.Timestamp, sensor_clock_ns: u64, values: []const f32) Event {
         const stored = @min(values.len, max_values);
         @memcpy(self.data[0..stored], values[0..stored]);
 
@@ -123,9 +129,18 @@ pub const Sensor = struct {
         return .{
             .timestamp_ns = timestamp_ns,
             .sensor_id = self.instance_id,
-            .sensor_timestamp_ns = sensor_timestamp_ns,
+            .sensor_timestamp_ns = self.sensor_clock.rebase(sensor_clock_ns, timestamp_ns),
             .values = event_data,
             .count = carried,
         };
+    }
+
+    test "sensor sample time is rebased to the host monotonic event clock" {
+        var sensor = Sensor.init(1, "test", .gyro, -1);
+        const first = sensor.update(10_000, 5_000_000, &.{ 1, 2, 3 });
+        const second = sensor.update(11_000, 5_000_500, &.{ 4, 5, 6 });
+        try std.testing.expectEqual(@as(timestamp.Timestamp, 10_000), first.timestamp_ns);
+        try std.testing.expectEqual(@as(timestamp.Timestamp, 10_000), first.sensor_timestamp_ns);
+        try std.testing.expectEqual(@as(timestamp.Timestamp, 10_500), second.sensor_timestamp_ns);
     }
 };

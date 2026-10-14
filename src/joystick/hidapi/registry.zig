@@ -33,6 +33,7 @@ const filter = @import("../../hid/filter.zig");
 const common = @import("common.zig");
 const device_mod = @import("device.zig");
 const joycon = @import("joycon.zig");
+const timestamp = @import("../../events/timestamp.zig");
 
 const Allocator = std.mem.Allocator;
 const Device = device_mod.Device;
@@ -78,7 +79,7 @@ pub const Registry = struct {
     /// are added and matched; nodes that disappeared are disconnected and freed.
     /// Combined Joy-Con devices are not in sysfs: they are kept here and created
     /// or dissolved by the registry itself.
-    pub fn scan(self: *Registry, updates: *Updates, now: u64) Error!void {
+    pub fn scan(self: *Registry, updates: *Updates, now: timestamp.Timestamp) Error!void {
         for (self.devices.items) |dev| dev.seen = is_combined(dev);
 
         const records = try sysfs.enumerate(self.allocator, self.options);
@@ -122,7 +123,8 @@ pub const Registry = struct {
 
     /// Runs one update pass over every claimed device (HIDAPI_UpdateDevices).
     /// Input and device events are appended to `updates`; the caller clears it.
-    pub fn update(self: *Registry, updates: *Updates, now: u64) Error!void {
+    /// Runs the input pass using `now` in the host monotonic nanosecond domain.
+    pub fn update(self: *Registry, updates: *Updates, now: timestamp.Timestamp) Error!void {
         for (self.devices.items) |dev| {
             // A Joy-Con child is read through its combined device.
             if (dev.driver == null or dev.parent != null) continue;

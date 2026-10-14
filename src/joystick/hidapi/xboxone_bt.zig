@@ -71,10 +71,10 @@ pub const Context = struct {
     left_trigger_rumble: u8 = 0,
     right_trigger_rumble: u8 = 0,
     rumble_state: RumbleState = .idle,
-    rumble_time_ns: u64 = 0,
+    rumble_time_ns: common.Timestamp = 0,
     rumble_pending: bool = false,
     /// Timestamp of the current update pass.
-    now_ns: u64 = 0,
+    now_ns: common.Timestamp = 0,
 };
 
 /// Bluetooth Xbox One controllers only. The USB driver handles the wired ones.

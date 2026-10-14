@@ -150,9 +150,9 @@ pub const Context = struct {
     sensors_supported: bool = false,
     report_sensors: bool = false,
     has_sensor_data: bool = false,
-    last_input_ns: u64 = 0,
-    last_imu_reset_ns: u64 = 0,
-    imu_sample_timestamp_ns: u64 = 0,
+    last_input_ns: common.Timestamp = 0,
+    last_imu_reset_ns: common.Timestamp = 0,
+    imu_sample_timestamp_ns: common.Timestamp = 0,
     imu_samples: u32 = 0,
     imu_update_interval_ns: u64 = imu_initial_interval_ns,
     timestamp_ns: u64 = 0,
@@ -163,7 +163,7 @@ pub const Context = struct {
     imu: ImuScale = .{},
     last_buttons: [3]u8 = @splat(0),
     /// Time of the current update pass, in nanoseconds.
-    now_ns: u64 = 0,
+    now_ns: common.Timestamp = 0,
     power_state: common.PowerState = .unknown,
     power_percent: u8 = 0,
 };

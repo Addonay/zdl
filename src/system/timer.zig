@@ -21,6 +21,10 @@
 //!
 //! Delay helpers are provided over `std.Io` and `std.Io.Clock.awake`.
 const std = @import("std");
+const timestamp = @import("../events/timestamp.zig");
+
+/// Nanoseconds in the host monotonic clock domain.
+pub const Timestamp = timestamp.Timestamp;
 
 /// Typed handle to a timer. Valid until the timer is removed or completes.
 pub const TimerId = struct {
@@ -51,7 +55,7 @@ pub fn Scheduler(comptime Context: type) type {
             callback: Callback = undefined,
             context: Context = undefined,
             interval_ns: u64 = 0,
-            deadline_ns: u64 = 0,
+            deadline_ns: Timestamp = 0,
             /// Monotonic tie-breaker: lower sequence fires first at equal deadlines.
             sequence: u64 = 0,
         };
@@ -84,7 +88,7 @@ pub fn Scheduler(comptime Context: type) type {
 
         /// Schedules a timer that first fires at `now_ns + interval_ns`. An interval of
         /// zero makes it due at the next `run_due` call, as SDL allows.
-        pub fn add(self: *Self, now_ns: u64, interval_ns: u64, callback: Callback, context: Context) Error!TimerId {
+        pub fn add(self: *Self, now_ns: Timestamp, interval_ns: u64, callback: Callback, context: Context) Error!TimerId {
             // Reserve everything that can fail before mutating state.
             try self.queue.ensureUnusedCapacity(self.allocator, 1);
             const index = self.find_free_slot() orelse blk: {
@@ -122,7 +126,7 @@ pub fn Scheduler(comptime Context: type) type {
 
         /// Deadline of the timer that fires next, or null when nothing is scheduled.
         /// Use it to decide how long the caller may block before calling `run_due`.
-        pub fn next_deadline(self: *const Self) ?u64 {
+        pub fn next_deadline(self: *const Self) ?Timestamp {
             const last = self.last_queued() orelse return null;
             return self.slots.items[last].deadline_ns;
         }
@@ -131,7 +135,7 @@ pub fn Scheduler(comptime Context: type) type {
         /// and returns how many callbacks ran. Each callback's return value decides
         /// whether the timer is rescheduled or removed. Rescheduling reuses the queue
         /// entry just popped, so this never allocates and cannot fail.
-        pub fn run_due(self: *Self, now_ns: u64) usize {
+        pub fn run_due(self: *Self, now_ns: Timestamp) usize {
             var fired: usize = 0;
             while (self.last_queued()) |index| {
                 const slot = &self.slots.items[index];
@@ -219,9 +223,8 @@ pub fn Scheduler(comptime Context: type) type {
 }
 
 /// Monotonic time in nanoseconds from `std.Io.Clock.awake`, which excludes suspend.
-pub fn monotonic_now_ns(io: std.Io) u64 {
-    const timestamp = std.Io.Clock.awake.now(io);
-    return @intCast(timestamp.nanoseconds);
+pub fn monotonic_now_ns(io: std.Io) Timestamp {
+    return timestamp.now_ns(io);
 }
 
 /// Sleeps at least `duration_ns`. Uses the OS sleep primitive through `std.Io`, so

@@ -157,6 +157,19 @@ splitting only to satisfy an arbitrary line count or preserving every C unit.
 - Allocating objects receive/capture std.mem.Allocator. Document ownership,
   borrowed-result lifetime, synchronization and deinitialization. No global
   allocator hooks, hidden subsystem startup or thread-local last-error state.
+- Event timestamps use the single `events.timestamp.Timestamp` domain: unsigned
+  nanoseconds from the host monotonic clock (`std.Io.Clock.awake`, which maps to
+  CLOCK_MONOTONIC on Linux). Producers must convert or rebase foreign clocks,
+  or replace protocol times with the current monotonic time before creating a
+  library event. Keep raw wire times visibly unit-named (for example
+  `server_time_ms`) and document why they are not event timestamps.
+- Plain event values own no memory. A queued event payload slice borrows from
+  the producing queue/store and is valid until that producer's next pump/poll
+  call. A queue shallow-copies events and does not extend payload lifetime.
+  Producers copy payloads into producer-owned storage before queueing; retaining
+  consumers copy before the next pump/poll. Returned event lists/results that
+  own payloads must document that ownership and provide `deinit`; no API may
+  expose transient callback or request-arena memory without a stated lease.
 - Preserve required domain behavior against upstream source. Confirm translation
   defects before correcting them. Record deliberate API/rounding/compatibility
   changes instead of pretending they are byte-exact SDL parity.
@@ -197,11 +210,12 @@ become `builtin.target.*`; `@bitCast` on extern types is gone; bit sets are
 are removed; `ArrayList.getLast` becomes `last()`. Local langrefs:
 `/home/addo/.zvm/{0.17.0,master}/doc/langref.html`.
 
-The build compiles existing tests and a consumer; it does not run them. The user
-has requested no new tests or runtime testing yet. Do not run `zig build test`,
-consumer executables, GUI windows, audio capture/playback, or device probes without
-new authorization. Backend call bodies in the compile consumer are protected by
-the impossible user PID zero, and checks still compile/link their methods.
+The build compiles existing tests and a consumer; it does not run them. Tests and
+runtime checks are opt-in per task. This task explicitly requests `zig build test`
+and focused timestamp/payload tests. Do not run consumer executables, GUI windows,
+audio capture/playback, or device probes without separate authorization. Backend
+call bodies in the compile consumer are protected by the impossible user PID
+zero, and checks still compile/link their methods.
 
 Compile-only Xlib layout validation used both Zig guards and a C-header static
 assert object under `.cache`; it did not execute native code. Core-only

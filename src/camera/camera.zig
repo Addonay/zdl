@@ -3,7 +3,8 @@
 //! Altered native port of SDL_camera.c and SDL_syscamera.h. The pure decision
 //! logic (spec ordering, duplicate removal, closest-spec matching, app spec
 //! defaults and timestamp mapping) is ported with SDL's comparison order and
-//! float arithmetic. Backends own the device handle, the capture loop and the
+//! float arithmetic. Public frame timestamps use host monotonic nanoseconds;
+//! driver epochs are rebased. Backends own the device handle, capture loop and
 //! frame buffers.
 //!
 //! Deliberate differences from SDL:
@@ -17,6 +18,7 @@
 //! - A disconnect is reported as a backend error rather than replaced by
 //!   synthetic black "zombie" frames, which relied on the device thread.
 const std = @import("std");
+const timestamp = @import("../events/timestamp.zig");
 
 /// Errors from spec validation and negotiation. Backend-specific failures are
 /// defined by each backend.
@@ -335,15 +337,15 @@ pub fn negotiate(specs: []const Spec, requested: ?Spec) Error!Negotiation {
 /// frame is anchored to the current time, and later frames keep their driver
 /// spacing, as SDL's CameraThreadIterate does. Arithmetic wraps like SDL's
 /// unsigned 64-bit math. The clock is passed in, so this stays pure and testable.
-pub const Timestamp = struct {
+pub const TimestampMapper = struct {
     /// Driver timestamp of the first frame, in nanoseconds.
-    base_ns: u64 = 0,
+    base_ns: timestamp.Timestamp = 0,
     /// Application timestamp assigned to the first frame. Zero means unanchored.
-    adjust_ns: u64 = 0,
+    adjust_ns: timestamp.Timestamp = 0,
 
     /// Converts a driver timestamp to application time. `now_ns` is only read for
     /// the first frame after a reset.
-    pub fn map(self: *Timestamp, driver_ns: u64, now_ns: u64) u64 {
+    pub fn map(self: *TimestampMapper, driver_ns: u64, now_ns: timestamp.Timestamp) timestamp.Timestamp {
         if (self.adjust_ns == 0) {
             self.adjust_ns = now_ns;
             self.base_ns = driver_ns;
@@ -352,10 +354,13 @@ pub const Timestamp = struct {
     }
 
     /// Forgets the anchor, so the next frame re-anchors to the current time.
-    pub fn reset(self: *Timestamp) void {
+    pub fn reset(self: *TimestampMapper) void {
         self.* = .{};
     }
 };
+
+/// Backward-compatible name for the frame timestamp rebasing state.
+pub const Timestamp = TimestampMapper;
 
 /// One captured frame. `data` and `slot` borrow the backend's buffer, which is
 /// only valid until the frame is released back to its session. Frames are
@@ -370,5 +375,13 @@ pub const Frame = struct {
     /// the driver reports no pitch.
     stride: usize,
     /// Application-clock timestamp in nanoseconds.
-    timestamp_ns: u64,
+    timestamp_ns: timestamp.Timestamp,
 };
+
+test "camera timestamps are rebased into the monotonic event domain" {
+    var mapper: TimestampMapper = .{};
+    try std.testing.expectEqual(@as(timestamp.Timestamp, 8_000), mapper.map(2_000_000, 8_000));
+    try std.testing.expectEqual(@as(timestamp.Timestamp, 8_500), mapper.map(2_000_500, 9_000));
+    mapper.reset();
+    try std.testing.expectEqual(@as(timestamp.Timestamp, 10_000), mapper.map(40, 10_000));
+}

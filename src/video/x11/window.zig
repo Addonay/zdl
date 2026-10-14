@@ -142,6 +142,10 @@ pub const AtomName = enum {
 
 /// Keyboard, pointer and window events after X11 translation. Fields that
 /// SDL keeps in global state (current modifiers, button history) are per-event here.
+/// Values named `server_time_ms` are raw X server `Time` values in milliseconds,
+/// retained for protocol work such as repeat-pair detection and selection
+/// conversion. The Linux platform replaces them with its monotonic nanosecond
+/// clock when it creates `events.Event`s.
 pub const Event = struct {
     window: WindowId,
     payload: Payload,
@@ -164,7 +168,7 @@ pub const Event = struct {
         button: Button,
         motion: Motion,
         /// Wheel ticks from X buttons 4-7: positive y is up, positive x is right.
-        wheel: struct { x: i32, y: i32, timestamp: u32 },
+        wheel: struct { x: i32, y: i32, server_time_ms: u32 },
         /// Keyboard mapping changed on the server; the layout was rebuilt.
         keymap_changed,
         /// Another client took a selection this window owned.
@@ -246,7 +250,7 @@ pub const Event = struct {
         position: geometry.Point(f32),
         pressure: f32,
         tilt: geometry.Point(f32),
-        timestamp: u32,
+        server_time_ms: u32,
     };
 
     pub const PenProximity = struct {
@@ -271,19 +275,19 @@ pub const Event = struct {
         keycode: Keycode,
         modifiers: Modifiers,
         x_keycode: u8,
-        timestamp: u32,
+        server_time_ms: u32,
     };
     pub const Button = struct {
         pressed: bool,
         button: u8,
         position: geometry.Point(i32),
         modifiers: Modifiers,
-        timestamp: u32,
+        server_time_ms: u32,
     };
     pub const Motion = struct {
         position: geometry.Point(i32),
         modifiers: Modifiers,
-        timestamp: u32,
+        server_time_ms: u32,
     };
     pub const SelectionRequest = struct {
         requestor: WindowId,
@@ -291,14 +295,14 @@ pub const Event = struct {
         target: Atom,
         /// Destination property named by the requestor; `none` for obsolete clients.
         property: Atom,
-        timestamp: u32,
+        server_time_ms: u32,
     };
     pub const SelectionNotify = struct {
         selection: Atom,
         target: Atom,
         /// `none` when the owner refused the conversion.
         property: Atom,
-        timestamp: u32,
+        server_time_ms: u32,
     };
 };
 
@@ -590,7 +594,7 @@ pub const Connection = struct {
                     .keycode = self.keyboard.keycode(scancode, modifiers),
                     .modifiers = modifiers,
                     .x_keycode = x_keycode,
-                    .timestamp = @truncate(raw.key.time),
+                    .server_time_ms = @truncate(raw.key.time),
                 } } };
             },
             xlib.button_press, xlib.button_release => {
@@ -599,7 +603,7 @@ pub const Connection = struct {
                     return .{ .window = window, .payload = .{ .wheel = .{
                         .x = if (button == 6) 1 else if (button == 7) -1 else 0,
                         .y = if (button == 4) 1 else if (button == 5) -1 else 0,
-                        .timestamp = @truncate(raw.key.time),
+                        .server_time_ms = @truncate(raw.key.time),
                     } } };
                 }
                 if (button >= 4 and button <= 7) return null;
@@ -608,13 +612,13 @@ pub const Connection = struct {
                     .button = @intCast(button),
                     .position = .{ .x = raw.key.x, .y = raw.key.y },
                     .modifiers = self.modifiers_for_state(raw.key.state),
-                    .timestamp = @truncate(raw.key.time),
+                    .server_time_ms = @truncate(raw.key.time),
                 } } };
             },
             xlib.motion_notify => return .{ .window = window, .payload = .{ .motion = .{
                 .position = .{ .x = raw.motion.x, .y = raw.motion.y },
                 .modifiers = self.modifiers_for_state(raw.motion.state),
-                .timestamp = @truncate(raw.motion.time),
+                .server_time_ms = @truncate(raw.motion.time),
             } } },
             xlib.enter_notify, xlib.leave_notify => return .{ .window = window, .payload = .{
                 .pointer_crossed = raw.kind == xlib.enter_notify,
@@ -666,7 +670,7 @@ pub const Connection = struct {
                 .selection = @fromBackingInt(@intCast(raw.selection_request.selection)),
                 .target = @fromBackingInt(@intCast(raw.selection_request.target)),
                 .property = @fromBackingInt(@intCast(raw.selection_request.property)),
-                .timestamp = @truncate(raw.selection_request.time),
+                .server_time_ms = @truncate(raw.selection_request.time),
             } } },
             xlib.selection_notify => {
                 if (try dnd.translate_selection(self, raw)) |drop_event| return drop_event;
@@ -674,7 +678,7 @@ pub const Connection = struct {
                     .selection = @fromBackingInt(@intCast(raw.selection.selection)),
                     .target = @fromBackingInt(@intCast(raw.selection.target)),
                     .property = @fromBackingInt(@intCast(raw.selection.property)),
-                    .timestamp = @truncate(raw.selection.time),
+                    .server_time_ms = @truncate(raw.selection.time),
                 } } };
             },
             xlib.mapping_notify => {

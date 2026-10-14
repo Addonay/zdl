@@ -148,7 +148,8 @@ pub const Context = struct {
     quit_on_quit_event: bool = true,
 
     /// Monotonic nanoseconds from the `io` clock (`std.Io.Clock.awake`).
-    pub fn now_ns(self: *const Context) u64 {
+    /// Host monotonic time in nanoseconds, shared with event timestamps.
+    pub fn now_ns(self: *const Context) event.Timestamp {
         return timer.monotonic_now_ns(self.io);
     }
 };
@@ -229,6 +230,8 @@ fn poll_signals(context: *Context, options: Options) queue.PushError!void {
 }
 
 /// Hands every queued event to the app in order (SDL_DispatchMainCallbackEvents).
+/// Borrowed event payloads are valid through this dispatch pass and until the
+/// next platform pump; an app that retains them copies them before then.
 /// Once the result is no longer continue, no events reach the app but the queue is
 /// still drained.
 fn deliver_events(comptime App: type, app: *App, context: *Context) void {
