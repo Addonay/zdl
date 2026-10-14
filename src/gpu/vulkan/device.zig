@@ -720,6 +720,8 @@ pub const Device = struct {
     /// preference. Small resources share 16 MiB blocks; resources larger than
     /// SDL's 2 MiB small-allocation threshold receive their own allocation.
     /// Buffers and images use separate blocks to honor buffer-image granularity.
+    /// Mappable uniform/transfer buffers use dedicated blocks: the current API
+    /// maps resources individually, and Vulkan allows only one map per block.
     pub fn allocate_memory(self: *Device, requirements: vk.MemoryRequirements, class: MemoryClass, kind: MemoryKind) Error!MemoryAllocation {
         const props = memory_properties(class);
         var candidates: [vk.VK_MAX_MEMORY_TYPES]u32 = undefined;
@@ -730,7 +732,10 @@ pub const Device = struct {
         else
             1;
         const alignment = @max(requirements.alignment, map_alignment);
-        const dedicated = requirements.size > small_allocation_threshold;
+        // Keep independently mapped resources in distinct VkDeviceMemory
+        // objects. Pooling these requires mapping an entire block once and
+        // returning slices without resource-level vkMapMemory/vkUnmapMemory.
+        const dedicated = dedicated_memory_required(requirements.size, class);
         const block_size = if (dedicated) requirements.size else small_block_size;
         for (list) |index| {
             if (!dedicated) {
@@ -2747,4 +2752,21 @@ fn buffer_image_copy(texture: *const Texture, transfer: types.TextureTransferInf
         .imageOffset = .{ .x = @intCast(region.x), .y = @intCast(region.y), .z = @intCast(region.z) },
         .imageExtent = .{ .width = region.w, .height = region.h, .depth = region.d },
     };
+}
+
+fn dedicated_memory_required(size: u64, class: MemoryClass) bool {
+    return size > small_allocation_threshold or
+        memory_properties(class).required & vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT != 0;
+}
+
+test "independently mapped resources never share a Vulkan memory block" {
+    // Even the smallest mapped resources must remain independent, including
+    // uniform buffers whose mapping stays live across multiple submissions.
+    for ([_]u64{ 1, 32 * 1024, small_allocation_threshold }) |size| {
+        try std.testing.expect(dedicated_memory_required(size, .uniform_buffer));
+        try std.testing.expect(dedicated_memory_required(size, .transfer_buffer));
+        try std.testing.expect(!dedicated_memory_required(size, .gpu_buffer));
+        try std.testing.expect(!dedicated_memory_required(size, .texture));
+    }
+    try std.testing.expect(dedicated_memory_required(small_allocation_threshold + 1, .gpu_buffer));
 }

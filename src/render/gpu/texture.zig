@@ -168,9 +168,6 @@ pub const Texture = struct {
     palette: ?device.Texture = null,
     access: Access,
     format: Format,
-    /// Vulkan's sRGB texel format performs the sRGB-to-linear conversion while
-    /// sampling. The GPU renderer uses this for ordinary textures on linear output.
-    hardware_srgb: bool = false,
     pixel_width: u31,
     pixel_height: u31,
     /// Bytes per texel of `gpu`; the row size of a CPU shadow and of `update`.

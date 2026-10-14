@@ -46,10 +46,11 @@
 //!   points) and are not truncated; the CPU renderer truncates instead.
 //! - `read_pixels` returns `rgba8` surfaces; BGRA targets are swizzled on readback.
 //! - `set_vsync` is fallible: changing the present mode recreates the swapchain.
-//! - Ordinary RGBA/BGRA textures use Vulkan's sRGB texel formats on scRGB output,
-//!   so the sampler decodes sRGB to linear light. Other paths use SDL's shader
-//!   conversions. Custom fragment shaders and per-texture palettes shared between
-//!   textures are not ported.
+//! - Renderer textures retain UNORM storage because their colorspace is mutable.
+//!   Explicit sRGB/scRGB/HDR10 conversion uses SDL's advanced shader; unspecified
+//!   encoding leaves conversion to the sampler, which is UNORM here. Automatic
+//!   sRGB texel decoding needs colorspace-aware image views and remains pending.
+//!   Custom fragment shaders and shared per-texture palettes are not ported.
 //! - A palette belongs to one texture (`set_palette`); SDL shares palette objects.
 //! - Textures are heap-allocated by this renderer. Textures and the renderer must
 //!   not move while commands referring to them are pending, which the heap
@@ -795,8 +796,9 @@ pub const GpuRenderer = struct {
     /// textures keep a CPU shadow for `lock`. Destroy with `destroy_texture`.
     pub fn create_texture(self: *GpuRenderer, width: u31, height: u31, format: pixels.Format, access: Access) Error!*Texture {
         if (width == 0 or height == 0) return error.InvalidArgument;
-        const hardware_srgb = self.output == .srgb_linear and (format == .rgba8 or format == .bgra8);
-        const texel_format = try texture_mod.gpu_format(format, hardware_srgb);
+        // Colorspace can change after creation. An sRGB image would always
+        // decode, even when callers identify its samples as scRGB or HDR10.
+        const texel_format = try texture_mod.gpu_format(format, false);
         const texel_bytes: u32 = if (texel_format == .r8_unorm) 1 else texture_mod.bytes_per_texel;
         const usage: types.TextureUsage = if (access == .target) .{ .sampler = true, .color_target = true } else .{ .sampler = true };
         var gpu = try self.dev.create_texture(.{ .format = texel_format, .usage = usage, .width = width, .height = height });
@@ -808,7 +810,6 @@ pub const GpuRenderer = struct {
             .gpu = gpu,
             .access = access,
             .format = .{ .pixels = format },
-            .hardware_srgb = hardware_srgb,
             .pixel_width = width,
             .pixel_height = height,
             .texel_bytes = texel_bytes,
@@ -1461,7 +1462,7 @@ fn texture_kind(tex: *const Texture, scale: surface.ScaleMode) shaders.TextureKi
 fn texture_input(tex: *const Texture) color.Input {
     return switch (tex.format) {
         .yuv => |layout| if (layout == .p010) .hdr10 else .srgb,
-        .pixels => if (tex.hardware_srgb and (tex.colorspace == .srgb or tex.colorspace == .unspecified)) .unspecified else tex.colorspace,
+        .pixels => tex.colorspace,
     };
 }
 
