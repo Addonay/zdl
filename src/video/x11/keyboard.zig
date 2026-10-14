@@ -20,17 +20,21 @@
 //! `set_group` follows XkbStateNotify. When the server has no XKB, the single
 //! core keymap is used exactly as before.
 //!
-//! Levels: XKB numbers the levels of a key type 0 to 7. The standard types
-//! (TWO_LEVEL, FOUR_LEVEL, EIGHT_LEVEL and their alphabetic forms) give level
-//! bit 0 the Shift modifier, bit 1 Level 3 (AltGr, `Modifiers.mode`) and bit 2
-//! Level 5 (`Modifiers.level5`). Each level that has a keysym is mapped with
-//! those modifiers; levels beyond a key's type return NoSymbol and are skipped.
+//! Levels follow SDL_x11keyboard.c's key-type walk. For every key and group the
+//! key's XkbKeyType gives the number of levels and a map of modifier masks to
+//! levels. Each active map entry whose mask only uses Shift, Lock, Alt, Level 3
+//! or Level 5 (the modifiers SDL keymaps distinguish) records the level's keysym
+//! under the matching modifier set, so custom key types (CTRL+ALT levels,
+//! KEYPAD, SHIFT+LOCK, EIGHT_LEVEL with Level 5) get their real modifiers. A level
+//! with no usable map entry is recorded as unmodified only for level 0. Groups a
+//! key does not define are redirected, clamped or wrapped by its group info
+//! (`effective_group`). Virtual modifier masks (Alt, Meta, Super, LevelThree,
+//! LevelFive, NumLock, ScrollLock) come from the server map's bindings.
 //!
-//! Deliberate difference: SDL walks each key type's map entries and takes the
-//! modifier masks from them, which needs the full XkbDesc layout. This layer uses
-//! the level-index convention above, which holds for the standard types. Custom
-//! types whose level order differs produce the keysyms of their level numbers,
-//! with the modifiers of the standard convention.
+//! Deliberate differences: SDL's loop stops before the last keycode (a defect);
+//! this one includes it. A virtual modifier the keymap does not define keeps the
+//! core default mask (Mod1 Alt, Mod4 Super, Mod5 Level 3, Mod3 Level 5) where SDL
+//! would use an empty mask, so modifier state still decodes on partial keymaps.
 const std = @import("std");
 const keyboard = @import("../../input/keyboard.zig");
 const linux_keys = @import("../../input/linux_keys.zig");
@@ -39,18 +43,51 @@ const xlib = @import("xlib.zig");
 /// XKB keyboard groups supported by the protocol (XkbNumKbdGroups).
 pub const max_groups = 4;
 
-/// Levels read per key: the eight XKB levels of the widest standard key type
-/// (EIGHT_LEVEL), which carries Level 5 as well as Level 3 and Shift.
-pub const xkb_levels = 8;
+/// X modifier masks that decide which key-type map entries SDL keymaps keep.
+pub const ModifierMasks = struct {
+    alt: c_uint,
+    level3: c_uint,
+    level5: c_uint,
 
-/// The modifiers that select XKB level `level` under the standard level-index
-/// convention: bit 0 Shift, bit 1 Level 3 (AltGr), bit 2 Level 5.
-pub fn level_modifiers(level: usize) Modifiers {
+    /// Shift, Lock, Alt, Level 3 and Level 5: the only modifiers a keymap entry can name.
+    pub fn valid(self: ModifierMasks) c_uint {
+        return xlib.shift_mask | xlib.lock_mask | self.alt | self.level3 | self.level5;
+    }
+};
+
+/// SDL modifiers for an XKB key-type map entry mask, or null when the mask uses
+/// a modifier outside `ModifierMasks.valid` (the entry is then not recorded).
+pub fn entry_modifiers(mask: c_uint, masks: ModifierMasks) ?Modifiers {
+    if ((mask | masks.valid()) != masks.valid()) return null;
     var modifiers: Modifiers = .none;
-    if (level & 1 != 0) modifiers.left_shift = true;
-    if (level & 2 != 0) modifiers.mode = true;
-    if (level & 4 != 0) modifiers.level5 = true;
+    if (mask & xlib.shift_mask != 0) modifiers = modifiers.either(Modifiers.shift_keys);
+    if (mask & xlib.lock_mask != 0) modifiers.caps = true;
+    if (mask & masks.alt != 0) modifiers = modifiers.either(Modifiers.alt_keys);
+    if (mask & masks.level3 != 0) modifiers.mode = true;
+    if (mask & masks.level5 != 0) modifiers.level5 = true;
     return modifiers;
+}
+
+/// XkbOutOfRangeGroupAction values (XKB.h) held in a key's group info.
+const group_wrap: u8 = 0x00;
+const group_clamp: u8 = 0x40;
+const group_redirect: u8 = 0x80;
+
+/// The group whose symbols a key shows for keyboard group `group`: a key with
+/// fewer groups wraps, clamps or redirects by its group info (low nibble: group
+/// count; bits 6-7: action; bits 4-5: redirect target). A key with no groups
+/// keeps `group`.
+pub fn effective_group(group: u8, group_info: u8) u8 {
+    const count = group_info & 0x0f;
+    if (count == 0 or group < count) return group;
+    return switch (group_info & 0xc0) {
+        group_clamp => count - 1,
+        group_redirect => blk: {
+            const target = (group_info & 0x30) >> 4;
+            break :blk if (target >= count) 0 else target;
+        },
+        else => group % count,
+    };
 }
 
 const Scancode = keyboard.Scancode;
@@ -119,18 +156,26 @@ pub const Layout = struct {
         return self.group_count > 0;
     }
 
-    /// Builds one keymap per XKB group from the server's keysyms (levels 0 and 1)
-    /// and reads the active group. Returns false, leaving the core layout in
-    /// place, when the server reports no XKB keyboard description. A previous
-    /// group table is replaced.
+    /// Builds one keymap per XKB group by walking each key's key type, and reads
+    /// the active group and the virtual modifier masks. Returns false, leaving the
+    /// core layout in place, when the server reports no XKB keyboard description.
+    /// A previous group table is replaced.
     pub fn load_xkb_groups(self: *Layout, allocator: std.mem.Allocator, api: *const xlib.Functions, display: *xlib.Display) (std.mem.Allocator.Error || error{KeymapUnavailable})!bool {
         const description = api.XkbGetKeyboard(display, 0xff, xlib.XkbUseCoreKbd) orelse return false;
         defer api.XkbFreeKeyboard(description, 0xff, 1);
+        _ = api.XkbGetNames(display, xlib.XkbVirtualModNamesMask, description);
+        _ = api.XkbGetUpdatedMap(display, xlib.XkbClientInfoAndVirtualMods, description);
         const controls = description.ctrls orelse return false;
+        const client = description.map orelse return false;
+        const types = (client.types orelse return false)[0..client.num_types];
+        const symbol_maps = client.key_sym_map orelse return false;
         const count: u8 = @min(@max(controls.num_groups, 1), max_groups);
         const min_keycode = description.min_key_code;
         const max_keycode = description.max_key_code;
         if (min_keycode < 8 or max_keycode < min_keycode) return error.KeymapUnavailable;
+
+        self.read_virtual_modifiers(api, display, description);
+        const masks: ModifierMasks = .{ .alt = self.alt_mask, .level3 = self.level3_mask, .level5 = self.level5_mask };
 
         var groups: [max_groups]?keyboard.Keymap = @splat(null);
         errdefer for (&groups) |*group| {
@@ -143,13 +188,26 @@ pub const Layout = struct {
             while (x_code <= max_keycode) : (x_code += 1) {
                 const mapped = self.scancodes[x_code];
                 if (mapped == .unknown) continue;
-                for (0..xkb_levels) |level| {
-                    const keysym_raw = api.XkbKeycodeToKeysym(display, @intCast(x_code), @intCast(group_index), @intCast(level));
+                const symbol_map = symbol_maps[x_code];
+                const key_group = effective_group(@intCast(group_index), symbol_map.group_info);
+                const type_index = symbol_map.kt_index[key_group & 3];
+                if (type_index >= types.len) continue;
+                const key_type = types[type_index];
+                const entries: []const xlib.XkbKeyTypeEntry = if (key_type.map) |entries_ptr| entries_ptr[0..key_type.map_count] else &.{};
+                for (0..key_type.num_levels) |level| {
+                    const keysym_raw = api.XkbKeycodeToKeysym(display, @intCast(x_code), key_group, @intCast(level));
                     if (keysym_raw == 0) continue;
                     const keysym = std.math.cast(u32, keysym_raw) orelse continue;
                     var key = linux_keys.keysym_keycode(keysym, @intCast(x_code), .none);
                     if (key == .unknown) key = fallback_keycode(mapped);
-                    try map.set(mapped, level_modifiers(level), key);
+                    var added = false;
+                    for (entries) |entry| {
+                        if (entry.active == 0 or entry.level != level) continue;
+                        const modifiers = entry_modifiers(entry.mods.mask, masks) orelse continue;
+                        try map.set(mapped, modifiers, key);
+                        added = true;
+                    }
+                    if (level == 0 and !added) try map.set(mapped, .none, key);
                 }
             }
             groups[group_index] = map;
@@ -163,6 +221,36 @@ pub const Layout = struct {
         var state: [32]u8 = @splat(0);
         if (api.XkbGetState(display, xlib.XkbUseCoreKbd, &state) == 0) self.set_group(state[0]);
         return true;
+    }
+
+    /// Reads the masks of the named virtual modifiers (X11_GetXkbVirtualModifierMask).
+    /// Names the keymap does not define keep their previous mask.
+    fn read_virtual_modifiers(self: *Layout, api: *const xlib.Functions, display: *xlib.Display, description: *const xlib.XkbDesc) void {
+        const server = description.server orelse return;
+        const names = description.names orelse return;
+        const lookup = struct {
+            fn mask(vapi: *const xlib.Functions, vdisplay: *xlib.Display, vserver: *const xlib.XkbServerMap, vnames: *const xlib.XkbNames, name: [*:0]const u8) c_uint {
+                const atom = vapi.XInternAtom(vdisplay, name, 1);
+                if (atom == 0) return 0;
+                for (vnames.vmods, 0..) |candidate, index| {
+                    if (candidate == atom) return vserver.vmods[index];
+                }
+                return 0;
+            }
+        }.mask;
+        var alt = lookup(api, display, server, names, "Alt");
+        if (alt == 0) alt = lookup(api, display, server, names, "Meta");
+        if (alt != 0) self.alt_mask = alt;
+        const gui = lookup(api, display, server, names, "Super");
+        if (gui != 0) self.gui_mask = gui;
+        const level3 = lookup(api, display, server, names, "LevelThree");
+        if (level3 != 0) self.level3_mask = level3;
+        const level5 = lookup(api, display, server, names, "LevelFive");
+        if (level5 != 0) self.level5_mask = level5;
+        const num = lookup(api, display, server, names, "NumLock");
+        if (num != 0) self.num_lock_mask = num;
+        const scroll = lookup(api, display, server, names, "ScrollLock");
+        if (scroll != 0) self.scroll_lock_mask = scroll;
     }
 
     /// Selects the group for later lookups. Groups beyond the table fall back to group 0.
@@ -329,4 +417,31 @@ fn fallback_keycode(scancode: Scancode) Keycode {
         .delete => .delete,
         else => Keycode.from_scancode(scancode),
     };
+}
+
+test "entry modifiers keep only the modifiers a keymap can name" {
+    const masks: ModifierMasks = .{ .alt = xlib.mod1_mask, .level3 = xlib.mod5_mask, .level5 = xlib.mod3_mask };
+    try std.testing.expectEqual(Modifiers.none, entry_modifiers(0, masks).?);
+    const shift = entry_modifiers(xlib.shift_mask, masks).?;
+    try std.testing.expect(shift.left_shift and shift.right_shift);
+    const level3_shift = entry_modifiers(xlib.shift_mask | xlib.mod5_mask, masks).?;
+    try std.testing.expect(level3_shift.left_shift and level3_shift.mode and !level3_shift.level5);
+    try std.testing.expect(entry_modifiers(xlib.mod3_mask, masks).?.level5);
+    try std.testing.expect(entry_modifiers(xlib.lock_mask, masks).?.caps);
+    // Control and Mod4 (Super) are not keymap modifiers: the entry is skipped.
+    try std.testing.expect(entry_modifiers(xlib.control_mask, masks) == null);
+    try std.testing.expect(entry_modifiers(xlib.shift_mask | xlib.mod4_mask, masks) == null);
+}
+
+test "keys with fewer groups wrap, clamp or redirect" {
+    // Three groups, wrap (default): group 3 shows group 0.
+    try std.testing.expectEqual(@as(u8, 1), effective_group(1, 3));
+    try std.testing.expectEqual(@as(u8, 0), effective_group(3, 3));
+    // Clamp into range: the last defined group.
+    try std.testing.expectEqual(@as(u8, 2), effective_group(3, 0x40 | 3));
+    // Redirect to group 1, or to 0 when the target is itself out of range.
+    try std.testing.expectEqual(@as(u8, 1), effective_group(3, 0x80 | (1 << 4) | 2));
+    try std.testing.expectEqual(@as(u8, 0), effective_group(3, 0x80 | (3 << 4) | 2));
+    // No group information leaves the request alone.
+    try std.testing.expectEqual(@as(u8, 2), effective_group(2, 0));
 }

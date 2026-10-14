@@ -704,10 +704,44 @@ pub const Platform = struct {
     /// nothing, so the X11 path can register on every sample. `eraser` is fixed
     /// at registration.
     pub fn pen_register(self: *Platform, window_id: event.WindowId, source: u32, eraser: bool) Error!void {
+        return self.pen_register_named(window_id, source, eraser, null, .unknown, false);
+    }
+
+    /// Like `pen_register`, with the pen's name and device type, and an initial
+    /// proximity (reported at once). A known source is left unchanged.
+    pub fn pen_register_named(
+        self: *Platform,
+        window_id: event.WindowId,
+        source: u32,
+        eraser: bool,
+        name: ?[]const u8,
+        device_type: pen.DeviceType,
+        in_proximity: bool,
+    ) Error!void {
         if (self.pen_link(source) != null) return;
-        const added = try self.pens.add(self.now_ns(), window_id, null, .unknown, false);
+        const added = try self.pens.add(self.now_ns(), window_id, name, device_type, in_proximity);
         errdefer _ = self.pens.remove(self.now_ns(), window_id, added.id);
         try self.pen_links.append(self.allocator, .{ .source = source, .id = added.id, .eraser = eraser });
+        try self.emit_batch(added.events);
+    }
+
+    /// Whether a backend pen source is registered.
+    pub fn pen_is_registered(self: *const Platform, source: u32) bool {
+        return self.pen_link(source) != null;
+    }
+
+    /// The pens currently registered, in registration order. Free with `allocator`.
+    /// This is SDL_GetPens.
+    pub fn pen_ids(self: *const Platform, allocator: std.mem.Allocator) std.mem.Allocator.Error![]event.PenId {
+        const ids = try allocator.alloc(event.PenId, self.pens.list.items.len);
+        for (self.pens.list.items, ids) |entry, *id| id.* = entry.id;
+        return ids;
+    }
+
+    /// Name of a registered pen (SDL_GetPenName), or null for an unknown id. Valid
+    /// until the pen is removed.
+    pub fn pen_name(self: *const Platform, id: event.PenId) ?[]const u8 {
+        return self.pens.name(id);
     }
 
     /// Removes a registered pen, reporting its proximity loss first.
@@ -919,6 +953,16 @@ pub const Platform = struct {
             .end => try self.touches.up(&self.mouse, input),
         };
         for (batch.slice()) |ev| try self.emit(ev);
+    }
+
+    /// Pinch gesture step for a window. Span and focus are not available from the
+    /// X11 gesture events (SDL passes -1 as well).
+    pub fn pinch_input(self: *Platform, record: *Record, kind: event.PinchKind, scale: f32) Error!void {
+        try self.emit(touch.pinch(kind, self.now_ns(), .{
+            .window = record.id,
+            .width = record.state.current.width,
+            .height = record.state.current.height,
+        }, scale, -1, -1, -1, -1));
     }
 
     /// Cancels every finger on the platform touch device.

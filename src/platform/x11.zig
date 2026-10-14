@@ -24,9 +24,14 @@
 //! another line of the same kind is joined with it, because the piece boundary is
 //! not otherwise visible.
 //!
+//! Pens: XInput2 enumerates them at start-up and on hot-plug with their names
+//! (`pen_added`, `pen_removed`); the tip is button 1 and buttons 2 and up are pen
+//! buttons 1 and up, as SDL reports them. Distance, rotation and slider axes are
+//! reported when the device has them (an addition). Pinch gestures (XI 2.4) become
+//! pinch events without span or focus.
+//!
 //! Deliberate differences: buttons 8 and 9 map to the X1 and X2 buttons (4 and 5).
-//! Exclusive fullscreen mode switches are made by linux.zig through RandR. Pen
-//! down follows pressure (SDL uses the tip button, which is not selected here).
+//! Exclusive fullscreen mode switches are made by linux.zig through RandR.
 const std = @import("std");
 const platform = @import("linux.zig");
 const event = @import("../events/event.zig");
@@ -104,7 +109,13 @@ pub fn create_window(session: *Session, options: platform.WindowOptions) platfor
     });
     errdefer window.deinit();
     if (session.xinput_enabled()) {
-        try window.select_xinput(.{ .motion = true, .touch = session.touch_supported(), .pen = true });
+        const supports_gesture = if (session.connection.xi) |state| state.supports_gesture() else false;
+        try window.select_xinput(.{
+            .motion = true,
+            .touch = session.touch_supported(),
+            .pen = true,
+            .gesture = supports_gesture,
+        });
     }
     return window;
 }
@@ -162,6 +173,15 @@ fn pen_source(device: i32) u32 {
     return @bitCast(device);
 }
 
+/// Registers an XInput2 pen with its name and initial proximity. Known pens are
+/// left alone, so this is cheap to call before every pen event.
+fn pen_added(p: *platform.Platform, session: *Session, device: i32) platform.Error!void {
+    const source = pen_source(device);
+    if (p.pen_is_registered(source)) return;
+    const info = session.connection.pen_info(device) orelse return;
+    try p.pen_register_named(p.mouse.focus, source, info.eraser, info.name, .unknown, info.in_proximity);
+}
+
 /// Translates one X11 event into platform events.
 fn handle(p: *platform.Platform, session: *Session, ev: x11.Event) platform.Error!void {
     switch (ev.payload) {
@@ -170,6 +190,16 @@ fn handle(p: *platform.Platform, session: *Session, ev: x11.Event) platform.Erro
         .display_changed => return p.refresh_x11_displays(session),
         .keyboard_group => return,
         .raw_motion => |raw| return p.raw_motion_input(@floatCast(raw.dx), @floatCast(raw.dy)),
+        // Pen hierarchy and proximity changes come from the root window; they are
+        // reported against the window the pointer is in (SDL looks the window up
+        // and accepts none).
+        .pen_added => |device| return pen_added(p, session, device),
+        .pen_removed => |device| return p.pen_unregister(p.mouse.focus, pen_source(device)),
+        .pen_proximity => |pen_event| {
+            const source = pen_source(pen_event.device);
+            try pen_added(p, session, pen_event.device);
+            return p.pen_proximity_input(p.mouse.focus, source, pen_event.in_proximity, pen_event.in_proximity);
+        },
         else => {},
     }
     if (try session.clipboard.handle_event(&session.connection, ev)) return;
@@ -246,21 +276,33 @@ fn handle(p: *platform.Platform, session: *Session, ev: x11.Event) platform.Erro
             try flush_drop_line(p, session);
             try p.emit_drop(id, .complete, 0, 0, null);
         },
-        .pen_proximity => |pen_event| {
-            const source = pen_source(pen_event.device);
-            try p.pen_register(id, source, pen_event.eraser);
-            try p.pen_proximity_input(id, source, pen_event.in_proximity, true);
+        .pen_button => |button| {
+            // Button 1 is the tip; button n is pen button n - 1 (SDL_x11xinput2.c).
+            const source = pen_source(button.device);
+            try pen_added(p, session, button.device);
+            if (button.button == 1) {
+                try p.pen_touch_input(id, source, button.pressed);
+            } else if (button.button <= 6) {
+                try p.pen_button_input(id, source, button.button - 1, button.pressed);
+            }
         },
         .pen_motion => |pen_event| {
-            // SDL reports motion, then the axes; pen down is pressure above zero here.
+            // SDL reports motion, then the axes. The tip comes from pen_button events.
             const source = pen_source(pen_event.device);
-            try p.pen_register(id, source, pen_event.eraser);
+            try pen_added(p, session, pen_event.device);
             try p.pen_motion_input(id, source, pen_event.position.x, pen_event.position.y);
-            try p.pen_touch_input(id, source, pen_event.down);
             try p.pen_axis_input(id, source, .pressure, pen_event.pressure);
             try p.pen_axis_input(id, source, .xtilt, pen_event.tilt.x);
             try p.pen_axis_input(id, source, .ytilt, pen_event.tilt.y);
+            if (pen_event.distance) |value| try p.pen_axis_input(id, source, .distance, value);
+            if (pen_event.rotation) |value| try p.pen_axis_input(id, source, .rotation, value);
+            if (pen_event.slider) |value| try p.pen_axis_input(id, source, .slider, value);
         },
+        .pinch => |pinch| try p.pinch_input(record, switch (pinch.phase) {
+            .begin => .begin,
+            .update => .update,
+            .end => .end,
+        }, pinch.scale),
         // Keymap and group events were handled above; selection requests are
         // answered by the clipboard. Property, XKB and RandR notices need no event.
         else => {},
