@@ -34,6 +34,13 @@ pub const Store = struct {
         self.strings.clearRetainingCapacity();
     }
 
+    fn rollback(self: *Store, string_count: usize, list_count: usize) void {
+        for (self.lists.items[list_count..]) |list| self.allocator.free(list);
+        self.lists.shrinkRetainingCapacity(list_count);
+        for (self.strings.items[string_count..]) |text| self.allocator.free(text);
+        self.strings.shrinkRetainingCapacity(string_count);
+    }
+
     /// Copies bytes into this producer's storage.
     pub fn copy_text(self: *Store, text: []const u8) std.mem.Allocator.Error![]const u8 {
         const copy = try self.allocator.dupe(u8, text);
@@ -45,6 +52,8 @@ pub const Store = struct {
     /// Copies each string and the containing slice into this producer's storage.
     pub fn copy_list(self: *Store, values: []const []const u8) std.mem.Allocator.Error![]const []const u8 {
         if (values.len == 0) return &.{};
+        const string_count = self.strings.items.len;
+        errdefer self.rollback(string_count, self.lists.items.len);
         const copy = try self.allocator.alloc([]const u8, values.len);
         errdefer self.allocator.free(copy);
         for (values, 0..) |value, index| copy[index] = try self.copy_text(value);
@@ -53,7 +62,12 @@ pub const Store = struct {
     }
 
     /// Returns an event whose borrowed slices all point into this store.
+    /// Allocation failure preserves previously stored payloads and releases
+    /// every partial copy made by this call.
     pub fn copy_event(self: *Store, source: event.Event) std.mem.Allocator.Error!event.Event {
+        const string_count = self.strings.items.len;
+        const list_count = self.lists.items.len;
+        errdefer self.rollback(string_count, list_count);
         var copied = source;
         switch (copied) {
             .text_editing => |*payload| payload.text = try self.copy_text(payload.text),
@@ -101,4 +115,25 @@ test "event payload storage copies text and nested MIME lists" {
     store.clear();
     try std.testing.expectEqual(@as(usize, 0), store.strings.items.len);
     try std.testing.expectEqual(@as(usize, 0), store.lists.items.len);
+}
+
+fn check_copy_failures(allocator: std.mem.Allocator, source: event.Event) !void {
+    var store = Store.init(allocator);
+    defer store.deinit();
+    const existing = try store.copy_text("existing");
+    _ = store.copy_event(source) catch |err| {
+        try std.testing.expectEqual(@as(usize, 1), store.strings.items.len);
+        try std.testing.expectEqual(@as(usize, 0), store.lists.items.len);
+        try std.testing.expectEqualStrings("existing", existing);
+        return err;
+    };
+}
+
+test "payload copies roll back partial allocations without invalidating prior events" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_copy_failures, .{
+        event.Event{ .clipboard = .{ .mime_types = &.{ "text/plain", "image/png", "text/html" } } },
+    });
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, check_copy_failures, .{
+        event.Event{ .drop = .{ .kind = .file, .source = "local", .data = "/tmp/a" } },
+    });
 }

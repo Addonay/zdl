@@ -791,6 +791,9 @@ pub const Session = struct {
 
         const slot = &self.buffers[index];
         slot.held = true;
+        // Failed timestamp validation must not strand a dequeued buffer: no
+        // Frame reaches the caller, so it cannot release the slot itself.
+        errdefer self.queue(index) catch {};
         const bytes_used = get_u32(&buf, buf_bytesused);
         const length = slot.mapping.len;
         const used: usize = if (bytes_used == 0 or bytes_used > length) length else bytes_used;

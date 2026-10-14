@@ -134,13 +134,13 @@ pub const Sensor = struct {
             .count = carried,
         };
     }
-
-    test "sensor sample time is rebased to the host monotonic event clock" {
-        var sensor = Sensor.init(1, "test", .gyro, -1);
-        const first = sensor.update(10_000, 5_000_000, &.{ 1, 2, 3 });
-        const second = sensor.update(11_000, 5_000_500, &.{ 4, 5, 6 });
-        try std.testing.expectEqual(@as(timestamp.Timestamp, 10_000), first.timestamp_ns);
-        try std.testing.expectEqual(@as(timestamp.Timestamp, 10_000), first.sensor_timestamp_ns);
-        try std.testing.expectEqual(@as(timestamp.Timestamp, 10_500), second.sensor_timestamp_ns);
-    }
 };
+
+test "sensor sample time is rebased to the host monotonic event clock" {
+    var sensor = Sensor.init(1, "test", .gyro, -1);
+    const first = sensor.update(10_000, 5_000_000, &.{ 1, 2, 3 });
+    const second = sensor.update(11_000, 5_000_500, &.{ 4, 5, 6 });
+    try std.testing.expectEqual(@as(timestamp.Timestamp, 10_000), first.timestamp_ns);
+    try std.testing.expectEqual(@as(timestamp.Timestamp, 10_000), first.sensor_timestamp_ns);
+    try std.testing.expectEqual(@as(timestamp.Timestamp, 10_500), second.sensor_timestamp_ns);
+}
