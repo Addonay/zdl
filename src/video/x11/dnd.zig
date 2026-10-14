@@ -14,11 +14,20 @@
 //!   split into lines at CR or LF. text/uri-list lines are `drop_file` events,
 //!   every other target is `drop_text`.
 //!
+//! Streamed drops: a source that answers with the INCR type (ICCCM 2.7.2) sends
+//! the data in chunks. The size announcement is deleted to start the transfer,
+//! each PropertyNotify(NewValue) on the receiving window delivers one chunk, and a
+//! zero-length chunk ends it. Lines are queued as soon as their end arrives, so
+//! a large drop reports its first items while the rest is still in flight; a line
+//! cut by a chunk boundary is carried to the next chunk. Directly answered drops
+//! use the same line splitter.
+//!
 //! Deliberate differences: URIs are reported as received (SDL converts file URIs
 //! to local paths with SDL_URIToLocal, which is left to the caller here). Long
 //! lines are split into pieces of at most `text_input.extended_capacity` bytes.
-//! Drop data is read in full and not streamed, so a very large drop waits for its
-//! whole transfer before its events are queued.
+//! SDL reads a drop with a single blocking conversion and no INCR support; the
+//! streaming here is an addition. A source that dies mid-transfer leaves the drop
+//! open until the next XdndEnter or XdndLeave resets it.
 //!
 //! Ownership: the drag state (source window, chosen target, version) lives in the
 //! Connection. Reply messages go to the source window; no memory outlives a call
@@ -55,8 +64,16 @@ pub const State = struct {
     request: xlib.Atom = 0,
     /// Protocol version from XdndEnter.
     version: c_long = 0,
+    /// True while an INCR transfer is delivering chunks to `target_window`.
+    incremental: bool = false,
+    /// Receiving window of the transfer in progress.
+    target_window: xlib.Window = 0,
+    /// Start of a line whose end has not arrived yet (INCR chunk boundaries).
+    carry: std.ArrayList(u8) = .empty,
 
-    fn reset(self: *State) void {
+    /// Forgets the drag and releases the carried partial line.
+    pub fn reset(self: *State, allocator: std.mem.Allocator) void {
+        self.carry.deinit(allocator);
         self.* = .{};
     }
 };
@@ -84,6 +101,7 @@ pub fn translate_client(connection: *window.Connection, raw: *xlib.Event) window
     const words: [5]c_ulong = @bitCast(raw.client.data.longs);
     if (message == connection.atom(.XdndEnter)) {
         const state = &connection.drop;
+        state.reset(connection.library.allocator);
         state.source = words[0];
         state.version = @intCast(words[1] >> 24);
         const use_list = words[1] & 1 != 0;
@@ -110,7 +128,7 @@ pub fn translate_client(connection: *window.Connection, raw: *xlib.Event) window
         return .{ .window = target, .payload = .{ .drop_position = .{ .x = x, .y = y } } };
     }
     if (message == connection.atom(.XdndLeave)) {
-        connection.drop.reset();
+        connection.drop.reset(connection.library.allocator);
         return .{ .window = target, .payload = .drop_left };
     }
     if (message == connection.atom(.XdndDrop)) {
@@ -120,7 +138,7 @@ pub fn translate_client(connection: *window.Connection, raw: *xlib.Event) window
             try send_message(connection, state.source, connection.atom(.XdndFinished), .{
                 @bitCast(@as(c_ulong, raw.any.window)), 0, 0, 0, 0,
             });
-            state.reset();
+            state.reset(connection.library.allocator);
             return null;
         }
         const time: xlib.Time = if (state.version >= 1) @intCast(words[2]) else xlib.current_time;
@@ -140,40 +158,97 @@ pub fn translate_client(connection: *window.Connection, raw: *xlib.Event) window
 /// Handles a SelectionNotify for the drop target: reads and reports the dropped
 /// data, then sends XdndFinished. Returns null for other selection notifications.
 /// The per-line events are queued first; the returned event is `drop_complete`.
+/// An INCR answer is acknowledged here and continues in `translate_property`; the
+/// call then returns null and the completion arrives with the last chunk.
 pub fn translate_selection(connection: *window.Connection, raw: *xlib.Event) window.Error!?window.Event {
     const state = &connection.drop;
     if (state.source == 0 or state.request == 0) return null;
     if (raw.selection.target != state.request) return null;
     const target: window.WindowId = @fromBackingInt(@intCast(raw.any.window));
-    const api = &connection.library.functions;
     const allocator = connection.library.allocator;
     const xid = raw.any.window;
 
     const data = try read_property(connection, xid, connection.atom(.PRIMARY), true);
     defer if (data) |reply| allocator.free(reply.bytes);
     if (data) |reply| {
-        const is_uri = state.request == connection.drop_atoms.uri_list;
-        var lines = std.mem.tokenizeAny(u8, reply.bytes, "\r\n");
-        while (lines.next()) |line| {
-            var rest: []const u8 = line;
-            while (rest.len > 0) {
-                const split = text_input.split_chunk(rest, text_input.extended_capacity);
-                var chunk: window.Event.Utf8Chunk = .{ .length = @intCast(split.chunk.len), .bytes = undefined };
-                @memcpy(chunk.bytes[0..split.chunk.len], split.chunk);
-                const payload: window.Event.Payload = if (is_uri) .{ .drop_file = chunk } else .{ .drop_text = chunk };
-                try connection.queue.append(allocator, .{ .window = target, .payload = payload });
-                rest = split.rest;
-            }
+        if (reply.kind == connection.atom(.INCR)) {
+            // Deleting the size announcement asked the source to start sending chunks.
+            state.incremental = true;
+            state.target_window = xid;
+            try connection.flush();
+            return null;
         }
+        try feed(connection, target, state.request == connection.drop_atoms.uri_list, reply.bytes, true);
     }
+    return try finish(connection, xid);
+}
 
-    // Reply with acceptance, as SDL does even when the conversion produced no data.
+/// Handles a PropertyNotify while an INCR drop transfer runs: reads one chunk and
+/// queues its completed lines. The zero-length chunk ends the drop and returns
+/// `drop_complete`. Returns null for every other property change.
+pub fn translate_property(connection: *window.Connection, raw: *xlib.Event) window.Error!?window.Event {
+    const state = &connection.drop;
+    if (!state.incremental) return null;
+    if (raw.any.window != state.target_window) return null;
+    if (raw.property.atom != connection.atom(.PRIMARY) or raw.property.state != xlib.property_new_value) return null;
+    const allocator = connection.library.allocator;
+    const target: window.WindowId = @fromBackingInt(@intCast(raw.any.window));
+    const chunk = (try read_property(connection, raw.any.window, connection.atom(.PRIMARY), true)) orelse
+        return try finish(connection, raw.any.window);
+    defer allocator.free(chunk.bytes);
+    const last = chunk.bytes.len == 0;
+    try feed(connection, target, state.request == connection.drop_atoms.uri_list, chunk.bytes, last);
+    if (last) return try finish(connection, raw.any.window);
+    return null;
+}
+
+/// Replies with acceptance, as SDL does even when the conversion produced no data,
+/// and ends the drag.
+fn finish(connection: *window.Connection, xid: xlib.Window) window.Error!window.Event {
+    const state = &connection.drop;
+    const target: window.WindowId = @fromBackingInt(@intCast(xid));
     try send_message(connection, state.source, connection.atom(.XdndFinished), .{
         @bitCast(@as(c_ulong, xid)), 1, @bitCast(connection.atom(.XdndActionCopy)), 0, 0,
     });
-    _ = api.XSync(connection.display, 0);
-    state.reset();
+    _ = connection.library.functions.XSync(connection.display, 0);
+    state.reset(connection.library.allocator);
     return .{ .window = target, .payload = .drop_complete };
+}
+
+/// Index of the first CR or LF in `bytes`, if any.
+fn line_end(bytes: []const u8) ?usize {
+    return std.mem.findAny(u8, bytes, "\r\n");
+}
+
+/// Appends `bytes` to the carried partial line and queues every line it completes.
+/// With `final`, the remainder is a line too. Empty lines are skipped.
+fn feed(connection: *window.Connection, target: window.WindowId, is_uri: bool, bytes: []const u8, final: bool) window.Error!void {
+    const allocator = connection.library.allocator;
+    const state = &connection.drop;
+    try state.carry.appendSlice(allocator, bytes);
+    var start: usize = 0;
+    while (line_end(state.carry.items[start..])) |offset| {
+        try queue_line(connection, target, is_uri, state.carry.items[start..][0..offset]);
+        start += offset + 1;
+    }
+    if (final) {
+        try queue_line(connection, target, is_uri, state.carry.items[start..]);
+        start = state.carry.items.len;
+    }
+    state.carry.replaceRangeAssumeCapacity(0, start, &.{});
+}
+
+/// Queues one line as pieces of at most `text_input.extended_capacity` bytes.
+fn queue_line(connection: *window.Connection, target: window.WindowId, is_uri: bool, line: []const u8) window.Error!void {
+    var rest = line;
+    while (rest.len > 0) {
+        const split = text_input.split_chunk(rest, text_input.extended_capacity);
+        var chunk: window.Event.Utf8Chunk = .{ .length = @intCast(split.chunk.len), .bytes = undefined };
+        @memcpy(chunk.bytes[0..split.chunk.len], split.chunk);
+        const payload: window.Event.Payload = if (is_uri) .{ .drop_file = chunk } else .{ .drop_text = chunk };
+        try connection.queue.append(connection.library.allocator, .{ .window = target, .payload = payload });
+        rest = split.rest;
+    }
 }
 
 /// Chooses the drag target from a list of offered atoms (SDL's X11_PickTarget).

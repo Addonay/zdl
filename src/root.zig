@@ -290,3 +290,12 @@ pub const image = struct {
 test {
     @import("std").testing.refAllDecls(@This());
 }
+
+// The X11 and Wayland backends sit behind namespaces that refAllDecls does not
+// enter; naming their files pulls in the tests that need no display.
+test "windowing backend unit tests" {
+    _ = @import("video/x11/shape.zig");
+    _ = @import("video/x11/keyboard.zig");
+    _ = @import("video/x11/dnd.zig");
+    _ = @import("video/x11/xinput.zig");
+}

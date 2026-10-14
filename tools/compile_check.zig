@@ -71,6 +71,7 @@ pub fn main() !void {
     if (@import("builtin").target.os.tag == .linux) try @import("checks/hidapi3.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/platform3.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/graphics.zig").check();
+    if (@import("builtin").target.os.tag == .linux) try @import("checks/video_x11_ext.zig").check();
 }
 
 fn keyboard() !void {

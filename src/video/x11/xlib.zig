@@ -111,6 +111,7 @@ pub const client_message_format: c_int = 32;
 
 // Predefined atoms (Xatom.h).
 pub const xa_atom: Atom = 4;
+pub const xa_integer: Atom = 19;
 pub const xa_cardinal: Atom = 6;
 pub const xa_string: Atom = 31;
 pub const xa_window: Atom = 33;
@@ -473,13 +474,81 @@ pub const XkbDesc = extern struct {
     min_key_code: u8,
     max_key_code: u8,
     ctrls: ?*const XkbControls,
-    server: ?*anyopaque,
-    map: ?*anyopaque,
+    server: ?*const XkbServerMap,
+    map: ?*const XkbClientMap,
     indicators: ?*anyopaque,
-    names: ?*anyopaque,
+    names: ?*const XkbNames,
     compat: ?*anyopaque,
     geom: ?*anyopaque,
 };
+
+/// XkbModsRec: real modifier mask, virtual modifier bits and their combined
+/// effective mask (the `mask` field once the server map resolves virtual mods).
+pub const XkbMods = extern struct { mask: u8, real_mods: u8, vmods: u16 };
+
+/// XkbKTMapEntryRec: the modifier combination `mods` selects `level`.
+pub const XkbKeyTypeEntry = extern struct {
+    active: Bool,
+    level: u8,
+    mods: XkbMods,
+};
+
+/// XkbKeyTypeRec (XKBstr.h): how modifiers choose a shift level of a key.
+pub const XkbKeyType = extern struct {
+    mods: XkbMods,
+    num_levels: u8,
+    map_count: u8,
+    map: ?[*]const XkbKeyTypeEntry,
+    preserve: ?*anyopaque,
+    name: Atom,
+    level_names: ?*anyopaque,
+};
+
+/// XkbSymMapRec: key types per group, group wrapping info and symbol offset.
+pub const XkbSymMap = extern struct {
+    kt_index: [4]u8,
+    group_info: u8,
+    width: u8,
+    offset: u16,
+};
+
+/// XkbClientMapRec: key types and the per-key symbol map.
+pub const XkbClientMap = extern struct {
+    size_types: u8,
+    num_types: u8,
+    types: ?[*]const XkbKeyType,
+    size_syms: u16,
+    num_syms: u16,
+    syms: ?[*]const KeySym,
+    key_sym_map: ?[*]const XkbSymMap,
+    modmap: ?[*]const u8,
+};
+
+/// XkbServerMapRec up to the virtual modifier bindings (`vmods[i]` is the real
+/// modifier mask virtual modifier i is bound to).
+pub const XkbServerMap = extern struct {
+    num_acts: u16,
+    size_acts: u16,
+    acts: ?*anyopaque,
+    behaviors: ?*anyopaque,
+    key_acts: ?*anyopaque,
+    explicit: ?*anyopaque,
+    vmods: [16]u8,
+};
+
+/// XkbNamesRec up to the virtual modifier names (atoms indexed like `vmods`).
+pub const XkbNames = extern struct {
+    keycodes: Atom,
+    geometry: Atom,
+    symbols: Atom,
+    types: Atom,
+    compat: Atom,
+    vmods: [16]Atom,
+};
+
+pub const XkbVirtualModNamesMask: c_uint = 1 << 7;
+/// XkbAllClientInfoMask | XkbVirtualModsMask, as SDL requests after a map change.
+pub const XkbClientInfoAndVirtualMods: c_uint = 0x17;
 
 /// First bytes of XkbControlsRec.
 pub const XkbControls = extern struct {
@@ -846,6 +915,98 @@ pub const XIRawEvent = extern struct {
     raw_values: ?[*]f64,
 };
 
+/// XIHierarchyInfo and XIHierarchyEvent (XI2.h): devices added, removed, enabled
+/// or disabled. `info` points at `num_info` records.
+pub const XIHierarchyInfo = extern struct {
+    deviceid: c_int,
+    attachment: c_int,
+    use: c_int,
+    enabled: Bool,
+    flags: c_int,
+};
+pub const XIHierarchyEvent = extern struct {
+    kind: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    extension: c_int,
+    evtype: c_int,
+    time: Time,
+    flags: c_int,
+    num_info: c_int,
+    info: ?[*]const XIHierarchyInfo,
+};
+
+/// XIPropertyEvent (XI2.h): a device property was created, modified or deleted.
+pub const XIPropertyEvent = extern struct {
+    kind: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    extension: c_int,
+    evtype: c_int,
+    time: Time,
+    deviceid: c_int,
+    property: Atom,
+    what: c_int,
+};
+
+/// Leading part of XIDeviceChangedEvent: the device whose classes changed.
+pub const XIDeviceChangedEvent = extern struct {
+    kind: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    extension: c_int,
+    evtype: c_int,
+    time: Time,
+    deviceid: c_int,
+    sourceid: c_int,
+};
+
+/// XIGesturePinchEvent (XI2.h, protocol 2.4). `scale` is relative to the start of
+/// the gesture; deltas are in pixels.
+pub const XIGesturePinchEvent = extern struct {
+    kind: c_int,
+    serial: c_ulong,
+    send_event: Bool,
+    display: ?*Display,
+    extension: c_int,
+    evtype: c_int,
+    time: Time,
+    deviceid: c_int,
+    sourceid: c_int,
+    detail: c_int,
+    root: Window,
+    event: Window,
+    child: Window,
+    root_x: f64,
+    root_y: f64,
+    event_x: f64,
+    event_y: f64,
+    flags: c_int,
+    mods: XIModifierState,
+    group: XIGroupState,
+    delta_x: f64,
+    delta_y: f64,
+    delta_unaccel_x: f64,
+    delta_unaccel_y: f64,
+    scale: f64,
+    delta_angle: f64,
+};
+
+/// XIGrabModifiers: one modifier combination of a passive grab and its result.
+pub const XIGrabModifiers = extern struct { modifiers: c_int, status: c_int };
+
+/// XIButtonClassInfo (XI2.h): how many buttons a device reports.
+pub const XIButtonClassInfo = extern struct {
+    type: c_int,
+    sourceid: c_int,
+    num_buttons: c_int,
+    labels: ?*anyopaque,
+    state: XIButtonState,
+};
+
 /// XIEventMask (XI2.h): `mask_len` bytes of event-type bits for one device.
 pub const XIEventMask = extern struct { deviceid: c_int, mask_len: c_int, mask: [*]u8 };
 
@@ -887,7 +1048,30 @@ pub const XIDeviceInfo = extern struct {
     classes: ?[*]?*XIAnyClassInfo,
 };
 
+pub const xi_class_button: c_int = 1;
 pub const xi_class_valuator: c_int = 2;
+pub const xi_all_devices: c_int = 0;
+pub const xi_slave_pointer: c_int = 3;
+pub const xi_floating_slave: c_int = 5;
+pub const xi_device_changed: c_int = 1;
+pub const xi_button_press: c_int = 4;
+pub const xi_button_release: c_int = 5;
+pub const xi_hierarchy_changed: c_int = 11;
+pub const xi_property_event: c_int = 12;
+pub const xi_gesture_pinch_begin: c_int = 27;
+pub const xi_gesture_pinch_update: c_int = 28;
+pub const xi_gesture_pinch_end: c_int = 29;
+/// XIHierarchyInfo flags.
+pub const xi_slave_added: c_int = 1 << 2;
+pub const xi_slave_removed: c_int = 1 << 3;
+pub const xi_device_enabled: c_int = 1 << 6;
+pub const xi_device_disabled: c_int = 1 << 7;
+/// XIPropertyEvent.what: the property's value changed.
+pub const xi_property_modified: c_int = 2;
+/// XIGestureEnd flag: the gesture was cancelled instead of completed.
+pub const xi_gesture_cancelled: c_int = 1 << 0;
+/// XIAnyModifier for passive grabs.
+pub const xi_any_modifier: c_int = @bitCast(@as(c_uint, 1) << 31);
 pub const xi_class_scroll: c_int = 3;
 pub const xi_scroll_type_vertical: c_int = 1;
 pub const xi_scroll_type_horizontal: c_int = 2;
@@ -898,9 +1082,6 @@ pub const xi_raw_motion: c_int = 17;
 pub const xi_touch_begin: c_int = 18;
 pub const xi_touch_update: c_int = 19;
 pub const xi_touch_end: c_int = 20;
-/// Tablet proximity (XI2.h): a pen entered or left the sensing area.
-pub const xi_proximity_in: c_int = 10;
-pub const xi_proximity_out: c_int = 11;
 
 pub const xim_preedit_nothing: c_ulong = 0x0008;
 pub const xim_status_nothing: c_ulong = 0x0400;
@@ -1074,6 +1255,8 @@ pub const Functions = struct {
     XkbGetKeyboard: *const fn (*Display, c_uint, c_uint) callconv(.c) ?*XkbDesc,
     XkbFreeKeyboard: *const fn (*XkbDesc, c_uint, Bool) callconv(.c) void,
     XkbKeycodeToKeysym: *const fn (*Display, KeyCode, c_int, c_int) callconv(.c) KeySym,
+    XkbGetNames: *const fn (*Display, c_uint, *XkbDesc) callconv(.c) Status,
+    XkbGetUpdatedMap: *const fn (*Display, c_uint, *XkbDesc) callconv(.c) Status,
     XkbGetState: *const fn (*Display, c_uint, *[32]u8) callconv(.c) Status,
     // Input methods (Xlib.h, Xutil.h). XCreateIC, XSetICValues and
     // XVaCreateNestedList are C variadic; their argument lists are passed as
@@ -1145,6 +1328,7 @@ pub const Xshape = struct {
     XShapeCombineMask: *const fn (*Display, Window, c_int, c_int, c_int, Pixmap, c_int) callconv(.c) void,
 };
 /// Shape kinds and operations (XShape.h). Input shapes are what SDL applies.
+pub const shape_bounding: c_int = 0;
 pub const shape_input: c_int = 2;
 pub const shape_set: c_int = 0;
 
@@ -1171,6 +1355,9 @@ pub const Xi = struct {
     XISelectEvents: *const fn (*Display, Window, [*]XIEventMask, c_int) callconv(.c) Status,
     XIQueryDevice: *const fn (*Display, c_int, *c_int) callconv(.c) ?[*]XIDeviceInfo,
     XIFreeDeviceInfo: *const fn ([*]XIDeviceInfo) callconv(.c) void,
+    XIGetProperty: *const fn (*Display, c_int, Atom, c_long, c_long, Bool, Atom, *Atom, *c_int, *c_ulong, *c_ulong, *?[*]u8) callconv(.c) Status,
+    XIGrabTouchBegin: *const fn (*Display, c_int, Window, Bool, *XIEventMask, c_int, [*]XIGrabModifiers) callconv(.c) c_int,
+    XIUngrabTouchBegin: *const fn (*Display, c_int, Window, c_int, [*]XIGrabModifiers) callconv(.c) c_int,
 };
 
 /// Themed cursor loading (libXcursor.so.1). Optional, like Xi.
@@ -1367,6 +1554,16 @@ comptime {
         std.debug.assert(@sizeOf(XSizeHints) == 80);
         std.debug.assert(@sizeOf(XGCValues) == 128);
         std.debug.assert(@offsetOf(XkbDesc, "ctrls") == 16);
+        std.debug.assert(@offsetOf(XkbDesc, "map") == 32);
+        std.debug.assert(@offsetOf(XkbDesc, "names") == 48);
+        std.debug.assert(@sizeOf(XkbKeyTypeEntry) == 12);
+        std.debug.assert(@sizeOf(XkbKeyType) == 40);
+        std.debug.assert(@offsetOf(XkbKeyType, "map") == 8);
+        std.debug.assert(@sizeOf(XkbSymMap) == 8);
+        std.debug.assert(@offsetOf(XkbClientMap, "types") == 8);
+        std.debug.assert(@offsetOf(XkbClientMap, "key_sym_map") == 32);
+        std.debug.assert(@offsetOf(XkbServerMap, "vmods") == 40);
+        std.debug.assert(@offsetOf(XkbNames, "vmods") == 40);
         std.debug.assert(@sizeOf(XShmSegmentInfo) == 32);
         std.debug.assert(@sizeOf(XRRScreenResources) == 64);
         std.debug.assert(@sizeOf(XRRModeInfo) == 80);
@@ -1389,6 +1586,12 @@ comptime {
         std.debug.assert(@offsetOf(GenericEventCookie, "cookie") == 40);
         std.debug.assert(@offsetOf(GenericEventCookie, "data") == 48);
         std.debug.assert(@sizeOf(XIScrollClassInfo) == 32);
+        std.debug.assert(@offsetOf(XIHierarchyEvent, "info") == 56);
+        std.debug.assert(@offsetOf(XIPropertyEvent, "property") == 56);
+        std.debug.assert(@offsetOf(XIGesturePinchEvent, "mods") == 124);
+        std.debug.assert(@offsetOf(XIGesturePinchEvent, "scale") == 176);
+        std.debug.assert(@sizeOf(XIGesturePinchEvent) == 192);
+        std.debug.assert(@sizeOf(XIButtonClassInfo) == 40);
         std.debug.assert(@sizeOf(XIDeviceInfo) == 40);
     }
 }

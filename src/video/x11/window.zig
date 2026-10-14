@@ -212,6 +212,15 @@ pub const Event = struct {
         pen_motion: PenMotion,
         /// A pen came into or left the sensing range of the tablet.
         pen_proximity: PenProximity,
+        /// A pen tip or button changed (after `Window.select_xinput` with `pen`).
+        pen_button: xinput.PenButton,
+        /// A pen appeared (at start-up enumeration or hot-plug). Query it with
+        /// `Connection.pen_info`.
+        pen_added: i32,
+        /// A pen was unplugged or disabled; its name is no longer valid.
+        pen_removed: i32,
+        /// A pinch gesture step (XInput 2.4; after `select_xinput` with `gesture`).
+        pinch: xinput.Pinch,
     };
 
     /// UTF-8 text of at most `text_input.extended_capacity` bytes.
@@ -246,6 +255,12 @@ pub const Event = struct {
         position: geometry.Point(f32),
         pressure: f32,
         tilt: geometry.Point(f32),
+        /// Normalized 0 to 1, or null when the device has no distance axis.
+        distance: ?f32 = null,
+        /// Degrees, plus or minus 180, or null without a rotation axis.
+        rotation: ?f32 = null,
+        /// Normalized slider (airbrush wheel), or null without one.
+        slider: ?f32 = null,
         timestamp: u32,
     };
 
@@ -435,6 +450,7 @@ pub const Connection = struct {
         const api = &self.library.functions;
         self.text.deinit(api);
         if (self.xi) |*state| state.deinit();
+        self.drop.reset(self.library.allocator);
         self.queue.deinit(self.library.allocator);
         self.keyboard.deinit();
         xlib.unregister_display(api, self.display);
@@ -639,6 +655,7 @@ pub const Connection = struct {
             xlib.unmap_notify => return .{ .window = window, .payload = .hidden },
             xlib.destroy_notify => return .{ .window = window, .payload = .destroyed },
             xlib.property_notify => {
+                if (try dnd.translate_property(self, raw)) |drop_event| return drop_event;
                 // Window-state properties get their own event so callers re-read the state.
                 if (ewmh.is_state_property(self, raw.property.atom)) {
                     return .{ .window = window, .payload = .window_state_changed };
@@ -847,6 +864,18 @@ pub const Connection = struct {
         try xinput.enable(self);
     }
 
+    /// The pens XInput2 knows now, with names borrowed from the connection (valid
+    /// until the matching `pen_removed` event). Free the slice with `allocator`.
+    /// Empty without `enable_xinput`.
+    pub fn pens(self: *Connection, allocator: std.mem.Allocator) std.mem.Allocator.Error![]xinput.PenInfo {
+        return xinput.pens(self, allocator);
+    }
+
+    /// Describes one pen by its XInput2 device id.
+    pub fn pen_info(self: *Connection, device: i32) ?xinput.PenInfo {
+        return xinput.pen_info(self, device);
+    }
+
     /// Selects or deselects raw relative motion on the root window. Requires
     /// `enable_xinput`. Raw motion arrives as `Payload.raw_motion`.
     pub fn set_raw_motion(self: *Connection, enabled: bool) Error!void {
@@ -1011,6 +1040,7 @@ pub const Window = struct {
     /// Frees the graphics context and destroys the server window.
     pub fn deinit(self: *Window) void {
         const api = &self.connection.library.functions;
+        xinput.forget_window(self.connection, @intCast(@backingInt(self.id)));
         if (self.frame) |*frame| {
             if (self.connection.library.xext) |*extension| frame.deinit(extension, self.connection.display);
             self.frame = null;
@@ -1486,8 +1516,11 @@ pub const Window = struct {
                 if (result != xlib.grab_success) connection.pointer_grab_broken = true;
             }
             _ = api.XRaiseWindow(display, id);
+            // Keep touches from the window manager while the pointer is grabbed (SDL).
+            xinput.grab_touch(connection, id) catch {};
         } else {
             _ = api.XUngrabPointer(display, xlib.current_time);
+            xinput.ungrab_touch(connection, id) catch {};
         }
         _ = api.XSync(display, 0);
         if (connection.pointer_grab_broken) return error.GrabFailed;
@@ -1519,6 +1552,14 @@ pub const Window = struct {
     pub fn set_shape(self: *Window, allocator: std.mem.Allocator, view: ?surface.View) Error!void {
         try self.require_alive();
         try xshape.set_input_shape(self.connection, allocator, @intCast(@backingInt(self.id)), self.size, view);
+    }
+
+    /// Clips the visible window to the opaque pixels of `view` (XShape bounding
+    /// region), scaled to the window size. A null view restores the full window.
+    /// An addition to SDL, which only shapes input; see shape.zig.
+    pub fn set_bounding_shape(self: *Window, allocator: std.mem.Allocator, view: ?surface.View) Error!void {
+        try self.require_alive();
+        try xshape.set_bounding_shape(self.connection, allocator, @intCast(@backingInt(self.id)), self.size, view);
     }
 
     /// Selects XInput2 events for this window. Requires `Connection.enable_xinput`.
