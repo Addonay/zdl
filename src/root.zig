@@ -289,4 +289,7 @@ pub const image = struct {
 
 test {
     @import("std").testing.refAllDecls(@This());
+    // refAllDecls does not enter nested namespaces, so test-bearing video modules are named here.
+    _ = @import("video/blit_simd.zig");
+    _ = @import("video/yuv_wide.zig");
 }

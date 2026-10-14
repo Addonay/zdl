@@ -32,6 +32,7 @@ pub fn check() !void {
     _ = zdl.colorspace.convert_primaries(.{ 1.0, 0.0, 0.0 }, zdl.colorspace.primaries_matrix(.bt709, .bt2020).?);
     _ = (zdl.colorspace.Chrome.init(2.0, 1.0)).apply(.{ 1.0, 0.5, 0.25 });
     _ = zdl.colorspace.ycbcr_matrix(zdl.colorspace.bt2020_limited, 1080, 10);
+    _ = zdl.colorspace.ycbcr_matrix_for_depth(zdl.colorspace.bt709_limited, 1080, 16);
 
     // Wide formats and conversion pipeline.
     var word: [16]u8 = undefined;
@@ -56,6 +57,16 @@ pub fn check() !void {
     try iv.convert_into(dst.view, zdl.colorspace.bt2020_limited);
     var wide_bytes: [4 * 4 * 4]u8 = undefined;
     try iv.convert_into_wide(.xbgr2101010, &wide_bytes, 16, zdl.colorspace.bt2020_full);
+
+    // Planar I0FL/I4FL sixteen-bit storage, plus the scalar reference blit that
+    // validates the vector kernels.
+    var planar = try zdl.yuv_wide.PlanarImage.init(gpa, .i4fl, 4, 4);
+    defer planar.deinit();
+    const planar_view = try planar.view();
+    _ = try planar_view.sample(0, 0);
+    _ = try planar_view.read_rgb(3, 3, zdl.colorspace.bt709_full);
+    try planar_view.convert_into(dst.view, zdl.colorspace.bt709_limited);
+    _ = try dst.view.blit_scalar(gpa, surf.view, .{ .blend = zdl.surface.Blend.ALPHA, .modulation = .{ .r = 128, .g = 128, .b = 128 } });
 
     // RLE colorkey and per-pixel alpha streams.
     var keyed = try zdl.rle.encode_colorkey(gpa, surf.view, .{ .pixel = 0 });

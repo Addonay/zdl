@@ -13,7 +13,8 @@
 //! - Identical byte or wide layouts with identical colorspaces are row copies.
 //! - 8-bit YUV decodes with SDL's integer scalar coefficients (`yuv.to_rgb`) when
 //!   the colorspace names an explicit matrix; otherwise it uses the float matrix
-//!   from `colorspace.ycbcr_matrix`. P010 always uses the float matrix.
+//!   from `colorspace.ycbcr_matrix_for_depth`, which re-centres offsets to the
+//!   sample depth. P010 always uses the float matrix.
 //! - Colorspace transfers and primaries apply through `pixels_wide.Pipeline`.
 //!   As in SDL, 8-bit YUV and 8-bit RGB pass through an sRGB intermediate, while
 //!   P010 and wide formats keep their own colorspace.
@@ -394,7 +395,7 @@ fn normalize_ycbcr(space: Colorspace, bits: u8) Colorspace {
 /// Decode matrix for a YCbCr colorspace at a sample depth and frame height.
 fn ycbcr_for(space: Colorspace, height: usize, bits: u8) colorspace.YcbcrToRgb {
     // Every normalized matrix/depth pair is accepted by ycbcr_matrix, so null is unreachable.
-    return colorspace.ycbcr_matrix(normalize_ycbcr(space, bits), height, bits) orelse unreachable;
+    return colorspace.ycbcr_matrix_for_depth(normalize_ycbcr(space, bits), height, bits) orelse unreachable;
 }
 
 /// Explicit integer-coefficient path for 8-bit sources whose matrix SDL tabulates
