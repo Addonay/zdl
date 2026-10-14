@@ -6,5 +6,6 @@ comptime {
     _ = @import("video/pixels_test.zig");
     _ = @import("video/surface_test.zig");
     _ = @import("video/blit_test.zig");
+    _ = @import("render/renderer_test.zig");
     _ = @import("core/properties_test.zig");
 }

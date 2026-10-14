@@ -14,6 +14,8 @@
 //! - Viewport, clip rectangle (relative to the viewport), render scale and
 //!   logical presentation (disabled, stretch, letterbox, overscan, integer scale)
 //!   with window <-> render coordinate conversion.
+//! - Texture addressing of `render_geometry` (`set_texture_address`): clamp, wrap, or
+//!   SDL's default auto (wrap on an axis when a vertex coordinate leaves [0, 1]).
 //! - Float coordinates are scaled, then truncated toward zero to integers, as the
 //!   software backend does for points, lines and rectangles.
 //!
@@ -74,10 +76,40 @@ pub const Error = surface.Error || geometry.GeometryError || software.Error ||
     InvalidTileScale,
 };
 
+/// SDL's AUTO rule: an axis wraps when any vertex coordinate on it leaves [0, 1].
+fn resolve_addressing(requested: [2]TextureAddress, vertices: []const Vertex) [2]software.Address {
+    var result: [2]software.Address = undefined;
+    for (requested, 0..) |mode, axis| {
+        result[axis] = switch (mode) {
+            .clamp => .clamp,
+            .wrap => .repeat,
+            .auto => blk: {
+                for (vertices) |vertex| {
+                    const coordinate = if (axis == 0) vertex.uv.x else vertex.uv.y;
+                    if (coordinate < 0 or coordinate > 1) break :blk .repeat;
+                }
+                break :blk .clamp;
+            },
+        };
+    }
+    return result;
+}
+
 /// Mirroring applied before rotation (`copy_ex`).
 pub const Flip = struct {
     horizontal: bool = false,
     vertical: bool = false,
+};
+
+/// Texture coordinate addressing for `render_geometry` (SDL_TextureAddressMode).
+pub const TextureAddress = enum {
+    /// Wrap on an axis when any vertex coordinate on it lies outside [0, 1];
+    /// otherwise clamp. This is SDL's default.
+    auto,
+    /// Coordinates are clamped to [0, 1].
+    clamp,
+    /// The texture repeats (tiles).
+    wrap,
 };
 
 /// How a logical size is fitted into the output raster (SDL_RendererLogicalPresentation).
@@ -149,6 +181,8 @@ pub const Renderer = struct {
     main_view: ViewState = .{},
     /// View state of the active target; reset whenever a target becomes current.
     target_view: ViewState = .{},
+    /// Horizontal and vertical addressing of textured geometry (not of `copy`).
+    texture_address: [2]TextureAddress = .{ .auto, .auto },
     /// Recorded for API compatibility; rendering has no vertical sync to control.
     vsync: bool = false,
 
@@ -197,6 +231,16 @@ pub const Renderer = struct {
     /// Sets the blend used by primitives. Use `surface.Blend.ALPHA` for SDL's BLEND.
     pub fn set_blend(self: *Renderer, blend: Blend) void {
         self.blend = blend;
+    }
+
+    /// Sets how `render_geometry` addresses texture coordinates outside [0, 1].
+    pub fn set_texture_address(self: *Renderer, horizontal: TextureAddress, vertical: TextureAddress) void {
+        self.texture_address = .{ horizontal, vertical };
+    }
+
+    /// Current horizontal and vertical texture addressing.
+    pub fn texture_addressing(self: Renderer) [2]TextureAddress {
+        return self.texture_address;
     }
 
     /// Sets the viewport in render coordinates, or null for the full output.
@@ -554,7 +598,10 @@ pub const Renderer = struct {
         }
 
         const blend = if (tex) |texture| texture.blend else self.blend;
-        const sampler: ?software.Texture = if (tex) |texture| .{ .view = texture.view() } else null;
+        const sampler: ?software.Texture = if (tex) |texture| blk: {
+            const modes = resolve_addressing(self.texture_address, vertices);
+            break :blk .{ .view = texture.view(), .horizontal = modes[0], .vertical = modes[1] };
+        } else null;
         const raster: software.Rasterizer = .{
             .target = self.active_view(),
             .clip = clip,

@@ -19,6 +19,7 @@ const convert = @import("convert.zig");
 const pixels_wide = @import("pixels_wide.zig");
 const pixels_test = @import("pixels_test.zig");
 const images = @import("../testdata/images.zig");
+const support = @import("../testdata/support.zig");
 const bmp = @import("bmp.zig");
 const png = @import("../image/png.zig");
 const load = @import("../image/load.zig");
@@ -419,19 +420,7 @@ test "sdl surface: palettization chooses the nearest color" {
     for (0..palette_colors.len) |i| try testing.expectEqual(i, output.view.data[colors.len + i]);
 }
 
-fn compare_surfaces(x: surface.View, y: surface.View, allowable_error: u8) !void {
-    try testing.expectEqual(x.width, y.width);
-    try testing.expectEqual(x.height, y.height);
-    for (0..x.height) |row| for (0..x.width) |col| {
-        const c1 = try x.read(col, row);
-        const c2 = try y.read(col, row);
-        const diffs = [_]u8{ @intCast(@abs(@as(i16, c1.r) - c2.r)), @intCast(@abs(@as(i16, c1.g) - c2.g)), @intCast(@abs(@as(i16, c1.b) - c2.b)), @intCast(@abs(@as(i16, c1.a) - c2.a)) };
-        for (diffs) |d| if (d > allowable_error) {
-            std.debug.print("mismatch at {d},{d}: {any} vs {any}\n", .{ col, row, c1, c2 });
-            return error.SurfacesDiffer;
-        };
-    };
-}
+const compare_surfaces = support.compare_surfaces;
 
 // surface_testSurfaceConversion
 test "sdl surface: conversion of the face image" {
