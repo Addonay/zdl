@@ -237,3 +237,72 @@ fn with_trailing_slash(allocator: Allocator, value: []const u8) Allocator.Error!
     if (value.len > 0 and value[value.len - 1] == '/') return allocator.dupe(u8, value);
     return std.fmt.allocPrint(allocator, "{s}/", .{value});
 }
+
+const testing = std.testing;
+
+test "path validation follows SDL" {
+    try validate_path("");
+    try validate_path("a/b/c.txt");
+    try validate_path("dir/");
+    try validate_path("..hidden/.dot");
+    try testing.expectError(error.InvalidStoragePath, validate_path("a\\b"));
+    try testing.expectError(error.InvalidStoragePath, validate_path("../x"));
+    try testing.expectError(error.InvalidStoragePath, validate_path("a/./b"));
+    try testing.expectError(error.InvalidStoragePath, validate_path("a/.."));
+    try testing.expectError(error.InvalidStoragePath, validate_path("."));
+}
+
+test "title storage is read-only with an override root" {
+    var storage = try Storage.open_title(testing.allocator, testing.io, "/some/dir");
+    defer storage.deinit();
+    try testing.expectEqualStrings("/some/dir/", storage.root);
+    try testing.expect(!storage.is_writable());
+    try testing.expect(storage.ready());
+    try testing.expectEqual(@as(u64, std.math.maxInt(u64)), storage.space_remaining());
+    try testing.expectError(error.ReadOnlyStorage, storage.write_file(testing.io, "x", "y"));
+    try testing.expectError(error.ReadOnlyStorage, storage.create_directory(testing.io, "x"));
+    try testing.expectError(error.ReadOnlyStorage, storage.remove(testing.io, "x"));
+    try testing.expectError(error.ReadOnlyStorage, storage.rename(testing.io, "x", "y"));
+    try testing.expectError(error.ReadOnlyStorage, storage.copy_file(testing.io, "x", "y"));
+
+    var empty = try Storage.open_title(testing.allocator, testing.io, "");
+    defer empty.deinit();
+    try testing.expectEqualStrings("", empty.root);
+}
+
+test "file storage writes, reads, copies, renames and removes" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(testing.allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer testing.allocator.free(root);
+
+    var storage = try Storage.open_file(testing.allocator, testing.io, root);
+    defer storage.deinit();
+    try testing.expect(storage.is_writable());
+    try testing.expect(std.mem.endsWith(u8, storage.root, "/"));
+    try testing.expect(storage.root[0] == '/'); // resolved against the cwd
+
+    try storage.create_directory(testing.io, "sub/deeper");
+    try storage.write_file(testing.io, "sub/a.txt", "hello world");
+    var buffer: [5]u8 = undefined;
+    try storage.read_file(testing.io, "sub/a.txt", &buffer);
+    try testing.expectEqualStrings("hello", &buffer); // longer file is fine
+    var too_big: [64]u8 = undefined;
+    try testing.expectError(error.LengthMismatch, storage.read_file(testing.io, "sub/a.txt", &too_big));
+
+    const info = try storage.path_info(testing.io, "sub/a.txt");
+    try testing.expectEqual(@as(u64, 11), info.size);
+
+    try storage.copy_file(testing.io, "sub/a.txt", "sub/b.txt");
+    try storage.rename(testing.io, "sub/b.txt", "sub/deeper/c.txt");
+    var small: [11]u8 = undefined;
+    try storage.read_file(testing.io, "sub/deeper/c.txt", &small);
+    try testing.expectEqualStrings("hello world", &small);
+
+    try storage.remove(testing.io, "sub/deeper/c.txt");
+    try storage.remove(testing.io, "sub/deeper/c.txt"); // missing is success
+    try testing.expectError(error.FileNotFound, storage.read_file(testing.io, "sub/deeper/c.txt", &small));
+
+    try testing.expectError(error.InvalidStoragePath, storage.write_file(testing.io, "../escape", "x"));
+    try testing.expectError(error.InvalidStoragePath, storage.read_file(testing.io, "a\\b", &small));
+}

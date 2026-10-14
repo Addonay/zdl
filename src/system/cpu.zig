@@ -244,3 +244,55 @@ fn feature_from_name(name: []const u8) ?Feature {
     }
     return null;
 }
+
+const testing = std.testing;
+
+test "feature mask removes, re-adds and ignores unknown names" {
+    const all = Features.full;
+    const masked = apply_feature_mask(all, "-avx,-avx2, -SSE2 ,bogus");
+    try testing.expect(!masked.contains(.avx));
+    try testing.expect(!masked.contains(.avx2));
+    try testing.expect(!masked.contains(.sse2));
+    try testing.expect(masked.contains(.sse));
+    try testing.expect(masked.contains(.neon));
+
+    // "-all" clears everything, a later "+name" turns that one back on.
+    const only_sse = apply_feature_mask(all, "-all,+sse");
+    try testing.expect(only_sse.contains(.sse));
+    try testing.expectEqual(@as(usize, 1), only_sse.count());
+
+    // Masks only ever narrow the detected set.
+    var detected: Features = .empty;
+    detected.insert(.sse2);
+    const kept = apply_feature_mask(detected, "all");
+    try testing.expect(kept.eql(detected));
+    try testing.expectEqual(@as(usize, 0), apply_feature_mask(detected, "-sse2").count());
+    try testing.expect(apply_feature_mask(detected, "").eql(detected));
+}
+
+test "simd alignment uses the widest enabled feature" {
+    try testing.expectEqual(@as(usize, @sizeOf(usize)), simd_alignment(.empty));
+    try testing.expectEqual(@as(usize, 16), simd_alignment(.initMany(&.{.sse2})));
+    try testing.expectEqual(@as(usize, 32), simd_alignment(.initMany(&.{ .sse2, .avx2 })));
+    try testing.expectEqual(@as(usize, 64), simd_alignment(.initMany(&.{ .avx, .avx512f })));
+    try testing.expectEqual(@as(usize, 8), simd_alignment(.initMany(&.{.mmx})));
+}
+
+test "features follow the cpu model" {
+    const x86 = std.Target.x86.cpu.x86_64_v3.toCpu(.x86_64);
+    const set = features_from_cpu(x86);
+    try testing.expect(set.contains(.sse2));
+    try testing.expect(set.contains(.sse42));
+    try testing.expect(set.contains(.avx2));
+    try testing.expect(!set.contains(.avx512f));
+    try testing.expect(!set.contains(.neon));
+}
+
+test "host query returns sane values" {
+    const info = query(testing.io);
+    try testing.expect(info.logical_cpus >= 1);
+    try testing.expect(info.cache_line_size > 0);
+    try testing.expect(std.math.isPowerOfTwo(info.page_size));
+    try testing.expect(info.simd_alignment >= @sizeOf(usize));
+    if (info.system_ram) |bytes| try testing.expect(bytes > 0);
+}

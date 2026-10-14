@@ -121,3 +121,51 @@ pub fn parse_csv(allocator: std.mem.Allocator, csv: []const u8) Error!Locales {
     const owned_items = try items.toOwnedSlice(allocator);
     return .{ .items = owned_items, .text = text };
 }
+
+const testing = std.testing;
+
+fn expect_locale(locale: Locale, language: []const u8, country: ?[]const u8) !void {
+    try testing.expectEqualStrings(language, locale.language);
+    if (country) |expected| {
+        try testing.expectEqualStrings(expected, locale.country.?);
+    } else {
+        try testing.expect(locale.country == null);
+    }
+}
+
+test "LANG and LANGUAGE are normalized and ordered" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("LANG", "en_US.UTF-8");
+    try env.put("LANGUAGE", "fr_CA:de@euro:C:es");
+    var locales = try preferred(testing.allocator, &env, null);
+    defer locales.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 4), locales.items.len);
+    try expect_locale(locales.items[0], "en", "US");
+    try expect_locale(locales.items[1], "fr", "CA");
+    try expect_locale(locales.items[2], "de", null);
+    try expect_locale(locales.items[3], "es", null);
+}
+
+test "C locale and empty environment give an empty list" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    var none = try preferred(testing.allocator, &env, null);
+    defer none.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), none.items.len);
+    try env.put("LANG", "C");
+    var neutral = try preferred(testing.allocator, &env, null);
+    defer neutral.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 0), neutral.items.len);
+}
+
+test "hint replaces the environment and skips empty entries" {
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    try env.put("LANG", "ja_JP");
+    var locales = try preferred(testing.allocator, &env, "  pt_BR, ,it ,");
+    defer locales.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), locales.items.len);
+    try expect_locale(locales.items[0], "pt", "BR");
+    try expect_locale(locales.items[1], "it", null);
+}

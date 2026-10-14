@@ -242,3 +242,85 @@ pub fn read_all(gpa: std.mem.Allocator, io: std.Io, process: *Process) ReadAllEr
     const term = (try process.wait(io, true)).?;
     return .{ .bytes = bytes, .term = term };
 }
+
+const testing = std.testing;
+
+test "exit codes follow SDL's convention" {
+    try testing.expectEqual(@as(i32, 7), sdl_exit_code(.{ .exited = 7 }));
+    try testing.expectEqual(@as(i32, -9), sdl_exit_code(.{ .signal = .KILL }));
+    try testing.expectEqual(@as(i32, -255), sdl_exit_code(.{ .unknown = 1 }));
+}
+
+test "waitpid status words decode like the W macros" {
+    try testing.expectEqual(@as(u8, 3), status_to_term(3 << 8).exited);
+    try testing.expectEqual(@as(i32, -15), sdl_exit_code(status_to_term(15)));
+    try testing.expect(status_to_term((19 << 8) | 0x7f) == .stopped);
+}
+
+test "invalid arguments are rejected" {
+    try testing.expectError(error.InvalidArguments, spawn(testing.io, .{ .argv = &.{} }));
+    try testing.expectError(error.InvalidArguments, spawn(testing.io, .{ .argv = &.{""} }));
+}
+
+test "captures stdout and the exit status of a child" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    var child = try spawn(testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "printf hello; exit 3" },
+        .env = &env,
+        .stdout = .pipe,
+    });
+    defer child.deinit(testing.io);
+    const output = try read_all(testing.allocator, testing.io, &child);
+    defer testing.allocator.free(output.bytes);
+    try testing.expectEqualStrings("hello", output.bytes);
+    try testing.expectEqual(@as(i32, 3), sdl_exit_code(output.term));
+    try testing.expect(child.pid() == null or child.term != null);
+}
+
+test "stderr can follow stdout and stdin can be piped" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    // A piped stdout cannot be shared with stderr (documented limitation).
+    try testing.expectError(error.Unsupported, spawn(testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "true" },
+        .env = &env,
+        .stdout = .pipe,
+        .stderr_to_stdout = true,
+    }));
+
+    var child = try spawn(testing.io, .{
+        .argv = &.{"/bin/cat"},
+        .env = &env,
+        .stdin = .pipe,
+        .stdout = .pipe,
+    });
+    defer child.deinit(testing.io);
+    const input = child.stdin().?;
+    try input.writeStreamingAll(testing.io, "round trip");
+    input.close(testing.io);
+    child.child.stdin = null;
+    const output = try read_all(testing.allocator, testing.io, &child);
+    defer testing.allocator.free(output.bytes);
+    try testing.expectEqualStrings("round trip", output.bytes);
+    try testing.expectEqual(@as(i32, 0), sdl_exit_code(output.term));
+}
+
+test "non-blocking wait and kill" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var env = std.process.Environ.Map.init(testing.allocator);
+    defer env.deinit();
+    var child = try spawn(testing.io, .{
+        .argv = &.{ "/bin/sh", "-c", "sleep 30" },
+        .env = &env,
+    });
+    defer child.deinit(testing.io);
+    try testing.expect((try child.wait(testing.io, false)) == null);
+    try child.kill(true);
+    const term = (try child.wait(testing.io, true)).?;
+    try testing.expectEqual(@as(i32, -9), sdl_exit_code(term));
+    try testing.expectError(error.NotRunning, child.kill(false));
+    try testing.expectEqual(@as(i32, -9), sdl_exit_code((try child.wait(testing.io, false)).?));
+}

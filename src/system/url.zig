@@ -58,3 +58,9 @@ pub fn open(
     });
     handler.deinit(io);
 }
+
+test "empty URLs are rejected before anything is spawned" {
+    var env = std.process.Environ.Map.init(std.testing.allocator);
+    defer env.deinit();
+    try std.testing.expectError(error.InvalidUrl, open(std.testing.allocator, std.testing.io, &env, "", .{}));
+}
