@@ -59,6 +59,9 @@ const steamdeck = @import("steamdeck.zig");
 const joycon = @import("joycon.zig");
 const ps3 = @import("ps3.zig");
 const gamecube = @import("gamecube.zig");
+const luna = @import("luna.zig");
+const shield = @import("shield.zig");
+const stadia = @import("stadia.zig");
 const joycon_pair = @import("joycon_pair.zig");
 
 pub const Allocator = std.mem.Allocator;
@@ -98,14 +101,14 @@ pub const SlotMask = u8;
 /// Driver identifiers, in the order SDL tries them (the comptime registry).
 /// `joycon_pair` is never matched from sysfs: the registry creates it for two
 /// Joy-Con children (SDL's HIDAPI_CreateCombinedJoyCons).
-pub const DriverId = enum { gamecube, ps4, ps5, xboxone, switch_pro, xbox360, xbox360w, xboxone_bt, steam, steamdeck, joycon, joycon_pair, ps3 };
+pub const DriverId = enum { gamecube, luna, shield, ps4, ps5, stadia, xboxone, switch_pro, xbox360, xbox360w, xboxone_bt, steam, steamdeck, joycon, joycon_pair, ps3 };
 
 /// SDL_hidapi_ps4.c, SDL_hidapi_ps5.c and SDL_hidapi_switch.c: a Bluetooth
 /// controller is not connected while the same controller is connected over USB.
 pub fn bluetooth_yields_to_usb(id: DriverId) bool {
     return switch (id) {
         .ps4, .ps5, .switch_pro, .joycon => true,
-        .gamecube, .xboxone, .xbox360, .xbox360w, .xboxone_bt, .steam, .steamdeck, .joycon_pair, .ps3 => false,
+        .gamecube, .luna, .shield, .stadia, .xboxone, .xbox360, .xbox360w, .xboxone_bt, .steam, .steamdeck, .joycon_pair, .ps3 => false,
     };
 }
 
@@ -114,6 +117,9 @@ pub fn bluetooth_yields_to_usb(id: DriverId) bool {
 pub fn driver_module(comptime id: DriverId) type {
     return switch (id) {
         .gamecube => gamecube,
+        .luna => luna,
+        .shield => shield,
+        .stadia => stadia,
         .joycon_pair => joycon_pair,
         .ps4 => ps4,
         .ps5 => ps5,
@@ -132,8 +138,11 @@ pub fn driver_module(comptime id: DriverId) type {
 /// Per-device state of whichever driver claimed the device.
 pub const DriverState = union(DriverId) {
     gamecube: gamecube.Context,
+    luna: luna.Context,
+    shield: shield.Context,
     ps4: ps4.Context,
     ps5: ps5.Context,
+    stadia: stadia.Context,
     xboxone: xboxone.Context,
     switch_pro: switch_pro.Context,
     xbox360: xbox360.Context,

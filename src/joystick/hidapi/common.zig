@@ -382,3 +382,37 @@ pub fn battery_from_sony(status: u8, level: u8) struct { state: PowerState, perc
         else => .{ .state = .unknown, .percent = 0 },
     };
 }
+
+/// Test fixture: a joystick model with the sinks a driver writes into. The
+/// fixture owns the joystick and its event lists, and `output` borrows them, so
+/// the fixture must stay at its address while the output is used.
+pub const TestSink = struct {
+    allocator: Allocator,
+    js: joystick.Joystick,
+    updates: Updates = .{},
+    state: State = .{},
+
+    pub fn init(allocator: Allocator, layout: joystick.Layout) Allocator.Error!TestSink {
+        return .{
+            .allocator = allocator,
+            .js = try joystick.Joystick.init(allocator, .{}, layout),
+        };
+    }
+
+    pub fn deinit(self: *TestSink) void {
+        self.updates.deinit(self.allocator);
+        self.js.deinit();
+        self.* = undefined;
+    }
+
+    /// An output that writes to the fixture's joystick. Timestamps must be nonzero.
+    pub fn output(self: *TestSink, timestamp: u64) Output {
+        return .{
+            .allocator = self.allocator,
+            .joystick = &self.js,
+            .updates = &self.updates,
+            .state = &self.state,
+            .timestamp = timestamp,
+        };
+    }
+};

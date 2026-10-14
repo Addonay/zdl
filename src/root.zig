@@ -173,6 +173,9 @@ pub const joystick = struct {
         pub const joycon_pair = @import("joystick/hidapi/joycon_pair.zig");
         pub const ps3 = @import("joystick/hidapi/ps3.zig");
         pub const gamecube = @import("joystick/hidapi/gamecube.zig");
+        pub const luna = @import("joystick/hidapi/luna.zig");
+        pub const stadia = @import("joystick/hidapi/stadia.zig");
+        pub const shield = @import("joystick/hidapi/shield.zig");
     };
 };
 
@@ -291,4 +294,7 @@ test {
     @import("std").testing.refAllDecls(@This());
     // Driver modules sit in nested namespaces, which refAllDecls does not reach.
     _ = @import("joystick/hidapi/gamecube.zig");
+    _ = @import("joystick/hidapi/stadia.zig");
+    _ = @import("joystick/hidapi/luna.zig");
+    _ = @import("joystick/hidapi/shield.zig");
 }
