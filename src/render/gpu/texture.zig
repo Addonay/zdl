@@ -131,10 +131,10 @@ pub const Kind = enum(u8) {
 };
 
 /// Maps a renderer pixel format to the GPU texel format of its main plane.
-pub fn gpu_format(format: pixels.Format) Error!types.TextureFormat {
+pub fn gpu_format(format: pixels.Format, sample_srgb: bool) Error!types.TextureFormat {
     return switch (format) {
-        .rgba8 => .r8g8b8a8_unorm,
-        .bgra8 => .b8g8r8a8_unorm,
+        .rgba8 => if (sample_srgb) .r8g8b8a8_unorm_srgb else .r8g8b8a8_unorm,
+        .bgra8 => if (sample_srgb) .b8g8r8a8_unorm_srgb else .b8g8r8a8_unorm,
         .indexed => |indexed| if (indexed.bits == 8) .r8_unorm else error.UnsupportedFormat,
         else => error.UnsupportedFormat,
     };
@@ -149,6 +149,13 @@ pub fn yuv_formats(layout: YuvLayout) [2]types.TextureFormat {
     };
 }
 
+test "GPU renderer selects sRGB texel formats only for packed color" {
+    try std.testing.expectEqual(types.TextureFormat.r8g8b8a8_unorm_srgb, try gpu_format(.rgba8, true));
+    try std.testing.expectEqual(types.TextureFormat.b8g8r8a8_unorm_srgb, try gpu_format(.bgra8, true));
+    try std.testing.expectEqual(types.TextureFormat.r8g8b8a8_unorm, try gpu_format(.rgba8, false));
+    try std.testing.expectEqual(types.TextureFormat.r8_unorm, try gpu_format(.{ .indexed = .{ .bits = 8 } }, true));
+}
+
 /// A texture living on the GPU, with the state drawn with it.
 pub const Texture = struct {
     /// Device storage of the RGBA/BGRA or indexed texels, or the luma plane.
@@ -161,6 +168,9 @@ pub const Texture = struct {
     palette: ?device.Texture = null,
     access: Access,
     format: Format,
+    /// Vulkan's sRGB texel format performs the sRGB-to-linear conversion while
+    /// sampling. The GPU renderer uses this for ordinary textures on linear output.
+    hardware_srgb: bool = false,
     pixel_width: u31,
     pixel_height: u31,
     /// Bytes per texel of `gpu`; the row size of a CPU shadow and of `update`.

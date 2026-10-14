@@ -19,6 +19,9 @@ pub fn check() !void {
         std.testing.refAllDecls(gpu.debug);
         std.testing.refAllDecls(gpu.tables);
         std.testing.refAllDecls(gpu.device.Device);
+        std.testing.refAllDecls(gpu.device.MemoryBlock);
+        std.testing.refAllDecls(gpu.device.MemoryAllocation);
+        std.testing.refAllDecls(gpu.device.MemoryKind);
         std.testing.refAllDecls(gpu.device.CommandBuffer);
         std.testing.refAllDecls(gpu.device.Swapchain);
         std.testing.refAllDecls(gpu.device.Texture);

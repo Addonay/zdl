@@ -46,10 +46,10 @@
 //!   points) and are not truncated; the CPU renderer truncates instead.
 //! - `read_pixels` returns `rgba8` surfaces; BGRA targets are swizzled on readback.
 //! - `set_vsync` is fallible: changing the present mode recreates the swapchain.
-//! - Textures are not sampled as sRGB (zdl.gpu has no sRGB texel formats), so
-//!   sRGB-encoded textures on a linear output are not decoded by the sampler; only
-//!   the vertex colors are converted. Custom fragment shaders, sRGB texture
-//!   formats and per-texture palettes shared between textures are not ported.
+//! - Ordinary RGBA/BGRA textures use Vulkan's sRGB texel formats on scRGB output,
+//!   so the sampler decodes sRGB to linear light. Other paths use SDL's shader
+//!   conversions. Custom fragment shaders and per-texture palettes shared between
+//!   textures are not ported.
 //! - A palette belongs to one texture (`set_palette`); SDL shares palette objects.
 //! - Textures are heap-allocated by this renderer. Textures and the renderer must
 //!   not move while commands referring to them are pending, which the heap
@@ -795,7 +795,8 @@ pub const GpuRenderer = struct {
     /// textures keep a CPU shadow for `lock`. Destroy with `destroy_texture`.
     pub fn create_texture(self: *GpuRenderer, width: u31, height: u31, format: pixels.Format, access: Access) Error!*Texture {
         if (width == 0 or height == 0) return error.InvalidArgument;
-        const texel_format = try texture_mod.gpu_format(format);
+        const hardware_srgb = self.output == .srgb_linear and (format == .rgba8 or format == .bgra8);
+        const texel_format = try texture_mod.gpu_format(format, hardware_srgb);
         const texel_bytes: u32 = if (texel_format == .r8_unorm) 1 else texture_mod.bytes_per_texel;
         const usage: types.TextureUsage = if (access == .target) .{ .sampler = true, .color_target = true } else .{ .sampler = true };
         var gpu = try self.dev.create_texture(.{ .format = texel_format, .usage = usage, .width = width, .height = height });
@@ -807,6 +808,7 @@ pub const GpuRenderer = struct {
             .gpu = gpu,
             .access = access,
             .format = .{ .pixels = format },
+            .hardware_srgb = hardware_srgb,
             .pixel_width = width,
             .pixel_height = height,
             .texel_bytes = texel_bytes,
@@ -1459,7 +1461,7 @@ fn texture_kind(tex: *const Texture, scale: surface.ScaleMode) shaders.TextureKi
 fn texture_input(tex: *const Texture) color.Input {
     return switch (tex.format) {
         .yuv => |layout| if (layout == .p010) .hdr10 else .srgb,
-        .pixels => tex.colorspace,
+        .pixels => if (tex.hardware_srgb and (tex.colorspace == .srgb or tex.colorspace == .unspecified)) .unspecified else tex.colorspace,
     };
 }
 
@@ -1490,6 +1492,22 @@ fn checked_rect(tex: *const Texture, region: ?IRect) Error!IRect {
     const bottom = @as(i64, rect.y) + rect.height;
     if (rect.x < 0 or rect.y < 0 or right > full.width or bottom > full.height) return error.InvalidRect;
     return rect;
+}
+
+test "scRGB sRGB textures use sampler decoding instead of shader decoding" {
+    var tex: Texture = .{
+        .gpu = undefined,
+        .access = .static,
+        .format = .{ .pixels = .rgba8 },
+        .pixel_width = 1,
+        .pixel_height = 1,
+        .texel_bytes = 4,
+        .colorspace = .srgb,
+        .hardware_srgb = true,
+    };
+    try std.testing.expectEqual(color.Input.unspecified, texture_input(&tex));
+    tex.hardware_srgb = false;
+    try std.testing.expectEqual(color.Input.srgb, texture_input(&tex));
 }
 
 /// The half-size chroma area of a luma rectangle (SDL's `rect->x / 2`, `(w + 1) / 2`).

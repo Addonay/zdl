@@ -149,6 +149,15 @@ pub const Display = struct {
     /// will receive the surface (`XVisualIDFromVisual` of its visual); pass null
     /// on Wayland. The EGL API for `options.profile` is bound on this thread.
     pub fn choose_config(self: *Display, options: Attributes, required_visual_id: ?u32) Error!Config {
+        return self.choose_config_for_surface(options, required_visual_id, attributes.egl.window_bit);
+    }
+
+    /// Selects a config that supports an EGL pbuffer surface.
+    pub fn choose_pbuffer_config(self: *Display, options: Attributes) Error!Config {
+        return self.choose_config_for_surface(options, null, attributes.egl.pbuffer_bit);
+    }
+
+    fn choose_config_for_surface(self: *Display, options: Attributes, required_visual_id: ?u32, surface_bit: i32) Error!Config {
         try options.validate();
         const api: binding.Enum = switch (options.api()) {
             .gl => binding.egl_opengl_api,
@@ -156,8 +165,8 @@ pub const Display = struct {
         };
         if (self.library.functions.eglBindAPI(api) != binding.true_value) return error.BindApiFailed;
         const renderable = attributes.renderable_type(options, self.has_extension("EGL_KHR_create_context"));
-        if (try self.choose_matching(options, renderable, true, required_visual_id)) |config| return config;
-        if (try self.choose_matching(options, renderable, false, required_visual_id)) |config| return config;
+        if (try self.choose_matching(options, renderable, true, required_visual_id, surface_bit)) |config| return config;
+        if (try self.choose_matching(options, renderable, false, required_visual_id, surface_bit)) |config| return config;
         return error.NoMatchingConfig;
     }
 
@@ -202,8 +211,8 @@ pub const Display = struct {
         return self.library.functions.eglGetError();
     }
 
-    fn choose_matching(self: *Display, options: Attributes, renderable: i32, caveat_none: bool, required_visual_id: ?u32) Error!?Config {
-        var list = attributes.config_list(options, renderable, caveat_none);
+    fn choose_matching(self: *Display, options: Attributes, renderable: i32, caveat_none: bool, required_visual_id: ?u32, surface_bit: i32) Error!?Config {
+        var list = attributes.config_list_for_surface(options, renderable, caveat_none, surface_bit);
         var configs: [max_configs]?*binding.Config = @splat(null);
         var found: binding.Int = 0;
         const request = list.terminated();
