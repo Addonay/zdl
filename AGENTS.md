@@ -33,7 +33,8 @@ has less functionality; the conversion ledger must distinguish these states.
 
 - `src/root.zig`: public module registered as `zdl`. Preserve this filename; the
   user renamed it from zdl.zig. It re-exports lazy native declarations.
-- `src/core/`: identifiers, owned diagnostics and typed dynamic properties.
+- `src/core/`: identifiers, owned diagnostics, typed dynamic properties, hints
+  (`hints.zig`, generated `hint_names.zig`) and the category logger (`log.zig`).
 - `src/core/casefold.zig`: Unicode full case folding and case-insensitive UTF-8
   ordering (generated tables from SDL_casefolding.h).
 - `src/input/keyboard.zig`: scancodes, keycodes, modifiers, names, default
@@ -72,8 +73,9 @@ has less functionality; the conversion ledger must distinguish these states.
   and remaining renderer integration are pending.
 - `src/platform/` (`zdl.linux`): unified Linux Platform/Window/event pump over
   the X11 and Wayland backends; requires libc.
-- `src/app/` (`zdl.app`): device registries, render coordinate conversion and
-  the main-callbacks loop.
+- `src/app/` (`zdl.app`): device registries, render coordinate conversion, the
+  main-callbacks loop, app metadata and the subsystem `Lifecycle`/`Services`.
+- `src/io/stream.zig` (`zdl.iostream`): memory streams and endian helpers.
 - `src/fs/` (`zdl.fs`): host folders, path info, directory iteration, glob,
   user-dirs parsing and Storage roots, with explicit `std.Io`/environment.
 - `src/events/` (`zdl.events`): Event tagged union, caller-owned typed Queue,

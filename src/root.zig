@@ -16,6 +16,11 @@
 pub const Guid = @import("core/guid.zig").Guid;
 /// An explicitly owned, optional human-readable diagnostic alongside Zig errors.
 pub const Diagnostic = @import("core/diagnostics.zig").Diagnostic;
+/// Configuration hints with priorities, environment overrides and observers
+/// (explicit owned table; `hints.names` lists every documented hint).
+pub const hints = @import("core/hints.zig");
+/// Categorized, prioritized logging with the SDL_LOGGING grammar over a pluggable output.
+pub const log = @import("core/log.zig");
 /// A short-critical-section lock with bounded spinning before yielding.
 pub const SpinLock = @import("thread/sync.zig").SpinLock;
 /// Signed Gregorian dates and checked nanosecond timestamp conversion.
@@ -250,6 +255,9 @@ pub const messagebox = struct {
     pub const zenity = @import("messagebox/zenity.zig");
 };
 
+/// In-memory seekable streams and endian-aware scalar read/write helpers.
+pub const iostream = @import("io/stream.zig");
+
 /// Asynchronous file reads, writes, closes and whole-file loads with a
 /// caller-typed completion queue over io_uring or a synchronous fallback.
 pub const asyncio = @import("io/async.zig");
@@ -278,6 +286,10 @@ pub const app = struct {
     pub const devices = @import("app/devices.zig");
     pub const render_coordinates = @import("app/render_coordinates.zig");
     pub const callbacks = @import("app/callbacks.zig");
+    /// Application name/version/identifier metadata (SDL_SetAppMetadata).
+    pub const metadata = @import("app/metadata.zig");
+    /// Reference-counted subsystem lifecycle (SDL_Init/Quit semantics) and core services.
+    pub const lifecycle = @import("app/lifecycle.zig");
 };
 
 /// JPEG and PNG decoding (stb_image behavior), PNG encoding and MJPG camera frame conversion. Pure Zig.
