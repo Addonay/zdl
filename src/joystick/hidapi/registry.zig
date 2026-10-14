@@ -43,9 +43,9 @@ const Output = common.Output;
 /// Driver order, matching SDL_HIDAPI_drivers: the first driver that accepts a
 /// device wins.
 pub const drivers = [_]device_mod.DriverId{
-    .gamecube, .ps4,      .ps5,        .xboxone, .switch_pro,
-    .xbox360,  .xbox360w, .xboxone_bt, .steam,   .steamdeck,
-    .joycon,   .ps3,
+    .gamecube,   .luna,    .shield,     .ps4,     .ps5,
+    .stadia,     .xboxone, .switch_pro, .xbox360, .xbox360w,
+    .xboxone_bt, .steam,   .steamdeck,  .joycon,  .ps3,
 };
 
 /// Errors from scanning and updating. Device-level read failures are reported
@@ -247,6 +247,9 @@ pub const Registry = struct {
             .joycon => .{ .joycon = .{} },
             .joycon_pair => .{ .joycon_pair = .{} },
             .gamecube => .{ .gamecube = .{} },
+            .luna => .{ .luna = .{} },
+            .shield => .{ .shield = .{} },
+            .stadia => .{ .stadia = .{} },
             .ps3 => .{ .ps3 = .{} },
         };
     }

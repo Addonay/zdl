@@ -69,6 +69,7 @@ pub fn main() !void {
     if (@import("builtin").target.os.tag == .linux) try @import("checks/render_gpu2.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/x11d.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/hidapi3.zig").check();
+    if (@import("builtin").target.os.tag == .linux) try @import("checks/hidapi4.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/platform3.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/graphics.zig").check();
     try @import("checks/lifecycle.zig").check();

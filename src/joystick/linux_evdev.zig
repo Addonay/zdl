@@ -93,6 +93,8 @@ const ff_max = 0x7f;
 const ff_rumble = 0x50;
 const ff_periodic = 0x51;
 const ff_sine = 0x5a;
+/// Effect codes that make a node haptic for SDL (EV_IsHaptic in SDL_syshaptic.c).
+const haptic_effect_codes = [_]u16{ 0x50, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x5b, 0x5c, 0x5d, 0x60, 0x61 };
 const prop_buttonpad = 0x02;
 const prop_semi_mt = 0x03;
 const prop_topbuttonpad = 0x04;
@@ -340,6 +342,9 @@ const HatCorrect = struct {
 pub const Device = struct {
     allocator: std.mem.Allocator,
     fd: i32,
+    /// Device node, for example "/dev/input/event5". Owned; empty for a device
+    /// built without `open_path`.
+    path: []u8 = &.{},
     name: []u8,
     guid: Guid,
     options: Options,
@@ -363,6 +368,9 @@ pub const Device = struct {
     ball_pending: [2]i32 = .{ 0, 0 },
     recovering_from_dropped: bool = false,
     fresh: bool = true,
+    /// True when the node advertises any force-feedback effect that SDL counts as
+    /// haptic (see `haptic_path`).
+    haptic: bool = false,
     /// True when the device advertises FF_RUMBLE, the preferred rumble effect.
     ff_rumble: bool = false,
     /// True when the device advertises FF_SINE; used only when FF_RUMBLE is absent.
@@ -378,7 +386,16 @@ pub const Device = struct {
         if (id >= 0) _ = linux.ioctl(self.fd, eviocrmff(), @intCast(id));
         _ = linux.close(self.fd);
         self.allocator.free(self.name);
+        self.allocator.free(self.path);
         self.* = undefined;
+    }
+
+    /// The node path for opening the same device as a haptic device
+    /// (`haptic.evdev.Device.open`), or null when it has no force-feedback
+    /// effects. SDL's SDL_IsJoystickHaptic and SDL_OpenHapticFromJoystick follow
+    /// the same rule: the haptic device is the joystick's own evdev node.
+    pub fn haptic_path(self: *const Device) ?[]const u8 {
+        return if (self.haptic) self.path else null;
     }
 
     /// True when `rumble` can drive this device (FF_RUMBLE or FF_SINE).
@@ -685,6 +702,8 @@ pub fn open_index(allocator: std.mem.Allocator, index: u32, options: Options) Er
 
 /// Opens an evdev node by path (NUL-terminated) and returns the configured device.
 pub fn open_path(allocator: std.mem.Allocator, path: [:0]const u8, options: Options) Error!Device {
+    const owned_path = try allocator.dupe(u8, path);
+    errdefer allocator.free(owned_path);
     // Read-write enables force feedback; fall back to read-only as SDL does.
     var rc = linux.open(path.ptr, .{ .ACCMODE = .RDWR, .NONBLOCK = true, .CLOEXEC = true }, 0);
     if (linux.errno(rc) != .SUCCESS) rc = linux.open(path.ptr, .{ .ACCMODE = .RDONLY, .NONBLOCK = true, .CLOEXEC = true }, 0);
@@ -715,6 +734,7 @@ pub fn open_path(allocator: std.mem.Allocator, path: [:0]const u8, options: Opti
     var device: Device = .{
         .allocator = allocator,
         .fd = fd,
+        .path = owned_path,
         .name = name,
         .guid = joystick.create_guid(.{
             .bus = bustype,
@@ -730,6 +750,9 @@ pub fn open_path(allocator: std.mem.Allocator, path: [:0]const u8, options: Opti
         if (ioctl_read(fd, eviocgbit(ev_ff, ff.bytes().len), ff.bytes())) |_| {
             device.ff_rumble = ff.test_bit(ff_rumble);
             device.ff_sine = ff.test_bit(ff_sine);
+            for (haptic_effect_codes) |code| {
+                if (ff.test_bit(code)) device.haptic = true;
+            }
         } else |_| {}
     }
     // Empty effect with id -1: the kernel assigns an id on the first upload.

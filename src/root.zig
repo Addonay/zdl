@@ -180,6 +180,9 @@ pub const joystick = struct {
         pub const joycon_pair = @import("joystick/hidapi/joycon_pair.zig");
         pub const ps3 = @import("joystick/hidapi/ps3.zig");
         pub const gamecube = @import("joystick/hidapi/gamecube.zig");
+        pub const luna = @import("joystick/hidapi/luna.zig");
+        pub const stadia = @import("joystick/hidapi/stadia.zig");
+        pub const shield = @import("joystick/hidapi/shield.zig");
     };
 };
 
@@ -329,4 +332,11 @@ test "windowing backend unit tests" {
     _ = @import("video/x11/keyboard.zig");
     _ = @import("video/x11/dnd.zig");
     _ = @import("video/x11/xinput.zig");
+}
+
+test "HIDAPI driver unit tests" {
+    _ = @import("joystick/hidapi/gamecube.zig");
+    _ = @import("joystick/hidapi/stadia.zig");
+    _ = @import("joystick/hidapi/luna.zig");
+    _ = @import("joystick/hidapi/shield.zig");
 }
