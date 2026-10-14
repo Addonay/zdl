@@ -1,0 +1,7 @@
+.{
+    .name = .zlay,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.17.0",
+    .paths = .{ "build.zig", "build.zig.zon", "src", "README.md", "LICENSE" },
+    .fingerprint = 0x31343edea2811a4d,
+}
