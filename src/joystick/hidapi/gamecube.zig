@@ -17,22 +17,39 @@
 //! 0x0337 and hosts four joysticks on one device (one slot per port,
 //! `Device.slot_count` is 4). Ports connect and disconnect as their status byte
 //! changes, as SDL's HIDAPI_JoystickConnected/Disconnected calls do. The
-//! driver hooks are `init`, `layout`, `update`, `rumble_slot` and
-//! `capabilities_slot`. `Adapter` stays usable on its own for callers that do
+//! driver hooks are `init`, `layout`, `update`, `rumble_slot`, `capabilities_slot`
+//! and `close`. `Adapter` stays usable on its own for callers that do
 //! not use the registry.
 //!
-//! Not ported: the third-party PC-mode packet formats (DragonRise and EVORETRO
-//! adapters, and the 10-byte older firmware), and the libusb step that sends the
-//! enable command to the adapter.
+//! PC mode (SDL's `pc_mode`): third-party DragonRise-based EVORETRO adapters
+//! (vendor 0x0079, products 0x1843, 0x1844 and 0x1846) use their own packets. A
+//! 9-byte packet is one controller on firmware 0x7 or newer; a 10-byte packet
+//! starts with the port number (1 to 4) and follows the 9-byte layout with the
+//! C stick inverted. The button bits differ from the Nintendo layout. Rumble is
+//! one motor state for every port, sent as the 3-byte report {0, m, m} and
+//! repeated every 16 ms while it runs. It is allowed only when the first packet
+//! after open has 9 bytes, as SDL checks.
+//!
+//! Reachability on Linux: `hid/filter.zig` ignores the Nintendo adapter
+//! (0x057e:0x0337) on hidraw, as SDL does, because SDL drives that device
+//! through libusb. The Nintendo-mode code here is therefore reached only by a
+//! caller that opens the node itself. PC mode (EVORETRO) is the path that
+//! enumerates on Linux.
+//!
+//! Not ported: the libusb step that sends the enable command to the adapter.
 //!
 //! Deliberate differences from SDL:
 //! - SDL's libusb step that sends the adapter enable command is not performed.
 //!   The init byte 0x13 is the only setup written here, and SDL's 10 ms wait
 //!   after it is not reproduced: the first status packets arrive in `update`.
-//! - Rumble brake (SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE_RUMBLE_BRAKE) is not
-//!   ported; motors are on or off.
 //! - The auto-calibration keeps the running minimum and maximum per axis, as SDL
 //!   does, and maps values with the same linear remap to the signed range.
+//! - PC-mode ports connect when their first packet arrives. SDL connects all four
+//!   joysticks at init, so a port with no controller is not listed here.
+//! - PC mode has no per-port rumble state. SDL keeps one motor flag for all ports,
+//!   and so does this driver; the stop report is sent from the close hook.
+//! - Rumble brake (SDL_HINT_JOYSTICK_HIDAPI_GAMECUBE_RUMBLE_BRAKE) is not ported in
+//!   PC mode either: the motors are on or off.
 const std = @import("std");
 const joystick = @import("../joystick.zig");
 const common = @import("common.zig");
@@ -46,6 +63,11 @@ pub const Context = Adapter;
 /// Nintendo vendor and the Wii U GameCube Controller Adapter (WUP-028).
 const vendor_nintendo: u16 = 0x057e;
 const product_gamecube_adapter: u16 = 0x0337;
+/// DragonRise vendor and the EVORETRO GameCube adapters that speak the PC-mode packets.
+const vendor_dragonrise: u16 = 0x0079;
+const product_evoretro_adapter1: u16 = 0x1843;
+const product_evoretro_adapter2: u16 = 0x1844;
+const product_evoretro_adapter3: u16 = 0x1846;
 
 pub const port_count = 4;
 const block_length = 9;
@@ -54,6 +76,9 @@ const input_length = 37;
 const init_byte: u8 = 0x13;
 const rumble_report_id: u8 = 0x11;
 const rumble_report_length = 5;
+const pc_rumble_report_length = 3;
+/// PC-mode rumble must be repeated while the motors run (PC_RUMBLE_REFRESH).
+const pc_rumble_refresh_ns: u64 = 16_000_000;
 
 /// Calibration limits at reset: the stick resting range is 128 plus or minus 88,
 /// and the triggers rest higher, at 40 (ResetAxisRange).
@@ -103,6 +128,16 @@ pub const Adapter = struct {
     /// Last buttons and axes sent to the joystick of each port, for emit().
     sent_buttons: [port_count][button_count]bool = @splat(@splat(false)),
     sent_axes: [port_count][common.axis.count]i16 = @splat(@splat(0)),
+    /// PC-mode adapter (third-party firmware). Set once by `init`.
+    pc_mode: bool = false,
+    /// PC mode: the first packet after open had 9 bytes (firmware 0x7 or newer
+    /// with the second USB cable), which allows rumble.
+    pc_rumble_allowed: bool = false,
+    /// PC mode: one motor state shared by every port (SDL's rumbleActive).
+    pc_rumble_active: bool = false,
+    /// PC mode: when the rumble report was last queued, in nanoseconds. Null
+    /// after a change, so the next refresh sends at once.
+    pc_rumble_sent_ns: ?u64 = null,
 
     /// Resets the calibration of one port (ResetAxisRange).
     pub fn reset_axes(self: *Adapter, index: usize) void {
@@ -213,22 +248,111 @@ pub const Adapter = struct {
         self.rumble_changed = false;
         return .{ rumble_report_id, self.rumble[0], self.rumble[1], self.rumble[2], self.rumble[3] };
     }
+
+    /// Decodes one PC-mode joystick packet for `slot` (HandleJoystickPacket).
+    /// `data` starts at the first button byte and has nine bytes. The C stick is
+    /// inverted on the older 10-byte firmware. The port is marked connected.
+    pub fn parse_pc(self: *Adapter, slot: usize, data: []const u8, invert_c_stick: bool) void {
+        const port = &self.ports[slot];
+        port.connected = true;
+        port.wireless = false;
+        port.rumble_allowed = self.pc_rumble_allowed;
+        port.buttons = pc_buttons(data);
+        const sources = [_]struct { axis: usize, offset: usize, invert: bool }{
+            .{ .axis = common.axis.left_x, .offset = 2, .invert = false },
+            .{ .axis = common.axis.left_y, .offset = 3, .invert = true },
+            .{ .axis = common.axis.right_x, .offset = 5, .invert = invert_c_stick },
+            .{ .axis = common.axis.right_y, .offset = 4, .invert = !invert_c_stick },
+            .{ .axis = common.axis.left_trigger, .offset = 6, .invert = false },
+            .{ .axis = common.axis.right_trigger, .offset = 7, .invert = false },
+        };
+        for (sources) |source| {
+            const raw = data[source.offset];
+            const value: u8 = if (source.invert) 0xff - raw else raw;
+            port.axes[source.axis] = self.calibrate(slot, source.axis, value);
+        }
+    }
+
+    /// Sets the shared PC-mode motor state from one port's rumble request. Returns
+    /// the rumble report to queue when the state changed. Without the second cable
+    /// (no rumble allowed) the result is Unsupported, as SDL reports.
+    pub fn set_pc_rumble(self: *Adapter, slot: usize, low: u16, high: u16) Error!?[pc_rumble_report_length]u8 {
+        if (slot >= port_count) return error.InvalidArgument;
+        if (!self.pc_rumble_allowed) return error.Unsupported;
+        const active = low > 0 or high > 0;
+        if (active == self.pc_rumble_active) return null;
+        self.pc_rumble_active = active;
+        self.pc_rumble_sent_ns = null;
+        return pc_rumble_report(active);
+    }
+
+    /// The PC-mode rumble report to send now: the first call after a change and
+    /// then once every 16 ms while the motors run. Null when no send is due.
+    pub fn pc_rumble_refresh(self: *Adapter, now_ns: u64) ?[pc_rumble_report_length]u8 {
+        if (!self.pc_rumble_active) return null;
+        if (self.pc_rumble_sent_ns) |sent| {
+            if (now_ns < sent +| pc_rumble_refresh_ns) return null;
+        }
+        self.pc_rumble_sent_ns = now_ns;
+        return pc_rumble_report(true);
+    }
 };
+
+/// The PC-mode rumble packet: report ID 0, then both motors at full or off.
+fn pc_rumble_report(active: bool) [pc_rumble_report_length]u8 {
+    const value: u8 = if (active) 0xff else 0;
+    return .{ 0x00, value, value };
+}
+
+/// Button levels from a PC-mode packet (HandleJoystickPacket): the face buttons
+/// and shoulders sit in byte 0, the D-pad and Start in byte 1.
+fn pc_buttons(data: []const u8) [button_count]bool {
+    var out: [button_count]bool = @splat(false);
+    out[button_south] = data[0] & 0x02 != 0;
+    out[button_east] = data[0] & 0x04 != 0;
+    out[button_west] = data[0] & 0x01 != 0;
+    out[button_north] = data[0] & 0x08 != 0;
+    out[button_dpad_left] = data[1] & 0x80 != 0;
+    out[button_dpad_right] = data[1] & 0x20 != 0;
+    out[button_dpad_down] = data[1] & 0x40 != 0;
+    out[button_dpad_up] = data[1] & 0x10 != 0;
+    out[button_start] = data[1] & 0x02 != 0;
+    out[button_right_shoulder] = data[0] & 0x80 != 0;
+    out[button_trigger_right] = data[0] & 0x20 != 0;
+    out[button_trigger_left] = data[0] & 0x10 != 0;
+    return out;
+}
 
 /// Adapter-level errors (device.Error).
 const Error = device.Error;
 
-/// Driver entry: the adapter is matched by vendor and product only.
+/// Driver entry: the adapter is matched by vendor and product only. The
+/// Nintendo adapter and the EVORETRO adapters are the two supported vendors.
 pub fn supports(probe: device.Probe) bool {
-    return probe.vendor_id == vendor_nintendo and probe.product_id == product_gamecube_adapter;
+    if (probe.vendor_id == vendor_nintendo and probe.product_id == product_gamecube_adapter) return true;
+    if (probe.vendor_id != vendor_dragonrise) return false;
+    return probe.product_id == product_evoretro_adapter1 or
+        probe.product_id == product_evoretro_adapter2 or
+        probe.product_id == product_evoretro_adapter3;
 }
 
-/// Sets the four-slot count, the device name and writes the init byte. Ports
-/// connect from `update` once their status bytes show a controller.
+/// Nintendo adapter: sets the four-slot count, the device name and writes the
+/// init byte. Ports connect from `update` once their status bytes show a
+/// controller. PC-mode adapters (any other vendor) read one packet to learn
+/// whether rumble is allowed and connect their ports from `update`.
 pub fn init(ctx: *Context, dev: *device.Device, env: device.Env) Error!bool {
     _ = env;
     ctx.* = .{};
     dev.slot_count = port_count;
+    if (dev.info.vendor_id != vendor_nintendo) {
+        ctx.pc_mode = true;
+        // SDL reads one packet without waiting. Nine bytes means firmware 0x7 or newer.
+        var buf: [64]u8 = undefined;
+        if (dev.poll_report(&buf) catch null) |first| {
+            ctx.pc_rumble_allowed = first.len == 9;
+        }
+        return false;
+    }
     try dev.set_name("Nintendo GameCube Controller");
     // A failed write leaves the adapter silent; the next read reports the node gone.
     _ = dev.write_report_now(&Adapter.init_packet()) catch return false;
@@ -244,7 +368,8 @@ pub fn layout(ctx: *const Context, dev: *const device.Device) joystick.Layout {
 
 /// Drains the input queue. Each 0x21 packet updates every port: a port that
 /// newly reports a controller is reset and attached, a port that goes quiet is
-/// detached with its inputs recentered, and the rest emit their changes.
+/// detached with its inputs recentered, and the rest emit their changes. PC-mode
+/// packets are handled by `handle_pc_packet`, and the rumble refresh is sent here.
 pub fn update(ctx: *Context, dev: *device.Device, out: *Output, env: device.Env) device.Error!device.Report {
     _ = env;
     var report: device.Report = .{};
@@ -254,8 +379,17 @@ pub fn update(ctx: *Context, dev: *device.Device, out: *Output, env: device.Env)
             report.read_failed = true;
             break;
         } orelse break;
+        if (ctx.pc_mode) {
+            try handle_pc_packet(ctx, dev, out, data);
+            continue;
+        }
         if (data.len < input_length or data[0] != input_report_id) continue;
         try handle_packet(ctx, dev, out, data);
+    }
+    if (ctx.pc_mode) {
+        if (ctx.pc_rumble_refresh(out.timestamp)) |rumble_packet| {
+            _ = dev.send_report(&rumble_packet, .report_id) catch {};
+        }
     }
     return report;
 }
@@ -284,18 +418,151 @@ fn handle_packet(ctx: *Context, dev: *device.Device, out: *Output, packet: []con
     }
 }
 
+/// Applies one PC-mode packet (HandleJoystickPacket via UpdateDevice). A 9-byte
+/// packet is the single controller of firmware 0x7 and newer. A 10-byte packet
+/// starts with the port number, 1 to 4, and has the C stick inverted.
+fn handle_pc_packet(ctx: *Context, dev: *device.Device, out: *Output, packet: []const u8) device.Error!void {
+    if (packet.len == 10) {
+        // Port 0 wraps to 255 here and is rejected by the range check below.
+        try handle_pc_port(ctx, dev, out, @as(usize, packet[0] -% 1), packet[1..], true);
+    } else if (packet.len == 9) {
+        try handle_pc_port(ctx, dev, out, 0, packet, false);
+    }
+}
+
+/// Decodes one port's PC-mode state, connecting the port on its first packet.
+/// Calibration is reset when the port connects, as SDL's ResetAxisRange does.
+fn handle_pc_port(ctx: *Context, dev: *device.Device, out: *Output, slot: usize, data: []const u8, invert_c_stick: bool) device.Error!void {
+    if (slot >= port_count) return;
+    if (!dev.slot_connected(slot)) {
+        ctx.reset_axes(slot);
+        ctx.sent_buttons[slot] = @splat(false);
+        ctx.sent_axes[slot] = @splat(0);
+        try dev.attach_slot(slot, out.updates);
+    }
+    ctx.parse_pc(slot, data, invert_c_stick);
+    var port_out = out.with_joystick(dev.joystick_slot(slot));
+    try ctx.emit(slot, &port_out);
+}
+
 /// Rumbles one port. A wireless port or one without the second USB cable
 /// returns Unsupported; the rumble report goes out on the next registry update.
 pub fn rumble_slot(ctx: *Context, dev: *device.Device, slot: usize, low: u16, high: u16) Error!void {
+    if (ctx.pc_mode) {
+        const packet = (try ctx.set_pc_rumble(slot, low, high)) orelse return;
+        _ = dev.send_report(&packet, .report_id) catch {};
+        return;
+    }
     try ctx.set_rumble(slot, low, high);
     if (ctx.take_rumble_report()) |report| {
         _ = dev.send_report(&report, .report_id) catch {};
     }
 }
 
-/// Rumble is available on a wired port whose adapter has the second cable.
+/// Rumble is available on a wired port whose adapter has the second cable. PC
+/// mode shares one motor state, so every port reports the same allowance.
 pub fn capabilities_slot(ctx: *const Context, dev: *const device.Device, slot: usize) device.Capabilities {
     _ = dev;
     if (slot >= port_count) return .{};
+    if (ctx.pc_mode) return .{ .rumble = ctx.pc_rumble_allowed };
     return .{ .rumble = ctx.ports[slot].rumble_allowed };
+}
+
+/// Close hook, run when the last port leaves (SDL's CloseJoystick). PC mode
+/// stops the motors. Nintendo mode writes any motor change that is still pending.
+pub fn close(ctx: *Context, dev: *device.Device) void {
+    if (ctx.pc_mode) {
+        if (!ctx.pc_rumble_active) return;
+        ctx.pc_rumble_active = false;
+        ctx.pc_rumble_sent_ns = null;
+        const stop = pc_rumble_report(false);
+        _ = dev.write_report_now(&stop) catch {};
+        return;
+    }
+    if (ctx.take_rumble_report()) |report| {
+        _ = dev.write_report_now(&report) catch {};
+    }
+}
+
+test "Nintendo adapter reports a wired port and calibrates its sticks" {
+    var adapter: Adapter = .{};
+    var packet: [input_length]u8 = @splat(0);
+    packet[0] = input_report_id;
+    packet[1] = 0x10; // port 0 wired
+    packet[2] = 0x01; // A
+    packet[4] = 216; // left X at the top of the resting range
+    const ports = adapter.parse(&packet).?;
+    try std.testing.expect(ports[0].connected);
+    try std.testing.expect(!ports[0].wireless);
+    try std.testing.expect(ports[0].buttons[button_south]);
+    try std.testing.expectEqual(@as(i16, 32767), ports[0].axes[common.axis.left_x]);
+    try std.testing.expect(!ports[1].connected);
+}
+
+test "Nintendo adapter ignores short or foreign reports" {
+    var adapter: Adapter = .{};
+    var packet: [input_length]u8 = @splat(0);
+    packet[0] = 0x20;
+    try std.testing.expect(adapter.parse(&packet) == null);
+    packet[0] = input_report_id;
+    try std.testing.expect(adapter.parse(packet[0 .. input_length - 1]) == null);
+}
+
+test "Nintendo rumble reports one motor byte per port" {
+    var adapter: Adapter = .{};
+    adapter.ports[2].rumble_allowed = true;
+    try adapter.set_rumble(2, 1000, 0);
+    const report = adapter.take_rumble_report().?;
+    try std.testing.expectEqualSlices(u8, &.{ 0x11, 0, 0, 1, 0 }, &report);
+    try std.testing.expect(adapter.take_rumble_report() == null);
+    adapter.ports[3].wireless = true;
+    adapter.ports[3].rumble_allowed = true;
+    try std.testing.expectError(error.Unsupported, adapter.set_rumble(3, 1000, 0));
+}
+
+test "PC-mode packets map buttons and calibrate the sticks" {
+    var adapter: Adapter = .{ .pc_mode = true };
+    // A, right shoulder and the D-pad up; then Start in the second byte.
+    const data = [_]u8{ 0x02 | 0x80, 0x10 | 0x02, 0, 128, 128, 128, 0, 0, 0 };
+    adapter.parse_pc(0, &data, false);
+    const port = adapter.ports[0];
+    try std.testing.expect(port.connected);
+    try std.testing.expect(port.buttons[button_south]);
+    try std.testing.expect(port.buttons[button_right_shoulder]);
+    try std.testing.expect(port.buttons[button_dpad_up]);
+    try std.testing.expect(port.buttons[button_start]);
+    try std.testing.expect(!port.buttons[button_east]);
+    try std.testing.expect(!port.buttons[button_trigger_left]);
+    // Raw 0 on a stick widens the range to the bottom, so it maps to the minimum.
+    try std.testing.expectEqual(@as(i16, -32768), port.axes[common.axis.left_x]);
+}
+
+test "PC-mode C stick is inverted only on the 10-byte firmware" {
+    // Raw 0 on the right stick X: inverted reads 255, the top of the range.
+    const data = [_]u8{ 0, 0, 128, 128, 128, 0, 0, 0, 0 };
+    var inverted: Adapter = .{ .pc_mode = true };
+    inverted.parse_pc(0, &data, true);
+    try std.testing.expectEqual(@as(i16, 32767), inverted.ports[0].axes[common.axis.right_x]);
+    var plain: Adapter = .{ .pc_mode = true };
+    plain.parse_pc(0, &data, false);
+    try std.testing.expectEqual(@as(i16, -32768), plain.ports[0].axes[common.axis.right_x]);
+}
+
+test "PC-mode rumble sends on change and refreshes every 16 ms" {
+    var adapter: Adapter = .{ .pc_mode = true, .pc_rumble_allowed = true };
+    const on = (try adapter.set_pc_rumble(0, 1000, 0)).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0xff, 0xff }, &on);
+    // Same state again: nothing to send.
+    try std.testing.expect((try adapter.set_pc_rumble(1, 5, 0)) == null);
+    try std.testing.expect(adapter.pc_rumble_refresh(1_000_000_000) != null);
+    try std.testing.expect(adapter.pc_rumble_refresh(1_015_000_000) == null);
+    try std.testing.expect(adapter.pc_rumble_refresh(1_016_000_000) != null);
+    const off = (try adapter.set_pc_rumble(0, 0, 0)).?;
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, &off);
+    try std.testing.expect(adapter.pc_rumble_refresh(2_000_000_000) == null);
+}
+
+test "PC-mode rumble needs the 9-byte firmware" {
+    var adapter: Adapter = .{ .pc_mode = true };
+    try std.testing.expectError(error.Unsupported, adapter.set_pc_rumble(0, 1000, 0));
 }

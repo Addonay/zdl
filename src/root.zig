@@ -289,4 +289,6 @@ pub const image = struct {
 
 test {
     @import("std").testing.refAllDecls(@This());
+    // Driver modules sit in nested namespaces, which refAllDecls does not reach.
+    _ = @import("joystick/hidapi/gamecube.zig");
 }
