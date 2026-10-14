@@ -52,6 +52,14 @@ pub const packed_formats = [_]Spec{
     .{ .name = "ABGR2101010", .bytes = 4, .masks = .{ .r = 0x000003FF, .g = 0x000FFC00, .b = 0x3FF00000, .a = 0xC0000000 } },
 };
 
+/// The descriptor for one of the SDL formats above, by SDL name without prefix.
+pub fn packed_format(name: []const u8) pixels.Format {
+    for (packed_formats) |spec| {
+        if (std.mem.eql(u8, spec.name, name)) return .{ .masked = pixels.Packed.from_masks(spec.bytes, .little, spec.masks) catch unreachable };
+    }
+    std.debug.panic("unknown pixel format {s}", .{name});
+}
+
 /// Every non-indexed, non-FOURCC format of the SDL list as a zdl descriptor.
 fn all_rgb_formats(buffer: *[packed_formats.len + 6]pixels.Format) []const pixels.Format {
     var n: usize = 0;
