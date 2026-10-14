@@ -50,6 +50,9 @@ pub fn check() !void {
     _ = try adapter.set_pc_rumble(0, 1, 0);
     _ = adapter.pc_rumble_refresh(0);
 
+    // Joystick haptics: the evdev node that `haptic.evdev.Device.open` takes.
+    _ = &zdl.joystick.linux_evdev.Device.haptic_path;
+
     // The fixture runs the decoders on a joystick model without any device.
     var sink = try hid.common.TestSink.init(allocator, .{ .axes = 6, .buttons = 13, .hats = 1 });
     defer sink.deinit();
