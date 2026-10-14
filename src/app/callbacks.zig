@@ -105,9 +105,18 @@ pub const Pacing = union(enum) {
 
     /// Nanoseconds between iteration deadlines, or zero for no rate limit. Matches
     /// SDL: `(Uint64)(SDL_NS_PER_SECOND / rate)`, so very high rates also become zero.
+    /// Periods exceeding u64 nanoseconds saturate instead of trapping.
     pub fn increment_ns(self: Pacing) u64 {
         return switch (self) {
-            .rate_hz => |hz| if (!(hz > 0) or !std.math.isFinite(hz)) 0 else @intFromFloat(1_000_000_000.0 / hz),
+            .rate_hz => |hz| blk: {
+                if (!(hz > 0) or !std.math.isFinite(hz)) break :blk 0;
+                const period = 1_000_000_000.0 / hz;
+                // maxInt(u64) rounds to 2^64 as f64; equality is also outside
+                // the conversion range. A subnormal rate can produce infinity.
+                if (period >= @as(f64, @floatFromInt(std.math.maxInt(u64))))
+                    break :blk std.math.maxInt(u64);
+                break :blk @intFromFloat(period);
+            },
             else => 0,
         };
     }
@@ -208,7 +217,7 @@ fn loop(comptime App: type, app: *App, context: *Context, options: Options) Erro
     var next_deadline_ns: u64 = 0;
     var hint_watch = HintPacing.init(options.hints, context.pacing);
     const first_increment = applied.increment_ns();
-    if (first_increment != 0) next_deadline_ns = context.now_ns() + first_increment;
+    if (first_increment != 0) next_deadline_ns = deadline_after(context.now_ns(), first_increment);
 
     while (context.result == .@"continue") {
         if (options.hints) |table| {
@@ -315,6 +324,10 @@ const HintPacing = struct {
     }
 };
 
+fn deadline_after(now: u64, increment: u64) u64 {
+    return now +| increment;
+}
+
 /// Sleeps until the next deadline, as SDL's generic loop does: the first iteration
 /// after a rate is set is not delayed, a late iteration moves the deadline to now, and
 /// the deadline advances by one increment each step.
@@ -330,7 +343,7 @@ fn pace(context: *Context, next_deadline_ns: *u64) Error!void {
     } else {
         next_deadline_ns.* = now;
     }
-    next_deadline_ns.* += increment;
+    next_deadline_ns.* = deadline_after(next_deadline_ns.*, increment);
 }
 
 test "pacing hint parsing and increments" {
@@ -366,4 +379,15 @@ test "rate hint changes are detected through the table revision" {
     try testing.expect(watch.poll(&hints).? == .wait_event);
     _ = try hints.reset(main_callback_rate_hint);
     try testing.expect(watch.poll(&hints).? == .unlimited);
+}
+
+test "tiny pacing rates and large deadlines saturate safely" {
+    const testing = std.testing;
+    const maximum = std.math.maxInt(u64);
+    try testing.expectEqual(@as(u64, maximum), Pacing.from_hint("1e-100").increment_ns());
+    try testing.expectEqual(@as(u64, maximum), (Pacing{ .rate_hz = 5e-324 }).increment_ns());
+    try testing.expectEqual(@as(u64, maximum), (Pacing{ .rate_hz = 1_000_000_000.0 / 18446744073709551616.0 }).increment_ns());
+    try testing.expectEqual(@as(u64, maximum), deadline_after(100, maximum));
+    try testing.expectEqual(@as(u64, maximum), deadline_after(maximum - 10, 20));
+    try testing.expectEqual(@as(u64, 150), deadline_after(100, 50));
 }
