@@ -140,7 +140,8 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8, channels: Channel
     const n = channels.count(decoder.img_n);
     const width = decoder.img_x;
     const height = decoder.img_y;
-    const size = try std.math.mul(usize, try std.math.mul(usize, width, height), n);
+    const pixels = std.math.mul(usize, width, height) catch return error.ImageTooLarge;
+    const size = std.math.mul(usize, pixels, n) catch return error.ImageTooLarge;
     const data = try allocator.alloc(u8, size);
     errdefer allocator.free(data);
     try decoder.write_channels(data, n);
@@ -787,7 +788,7 @@ const Decoder = struct {
             if (!mul_short_fits(dc, @intCast(scale))) return error.CorruptJpeg;
             data[0] = @intCast(dc * scale);
         } else {
-            if (self.get_bit()) data[0] +%= @as(i16, 1) << self.succ_low;
+            if (self.get_bit()) data[0] +%= @as(i16, 1) << @as(u4, @intCast(self.succ_low));
         }
     }
 
@@ -839,7 +840,7 @@ const Decoder = struct {
         } else {
             // Refinement scan: correct already-nonzero coefficients by one bit and
             // place newly nonzero coefficients (+/-bit) at the requested run.
-            const bit: i16 = @as(i16, 1) << self.succ_low;
+            const bit: i16 = @as(i16, 1) << @as(u4, @intCast(self.succ_low));
             if (self.eob_run != 0) {
                 self.eob_run -= 1;
                 var k = self.spec_start;

@@ -300,5 +300,21 @@ pub const image = struct {
 };
 
 test {
-    @import("std").testing.refAllDecls(@This());
+    reference_namespaces(@This(), 4);
+}
+
+/// `std.testing.refAllDecls` is not recursive, so files re-exported through
+/// namespace structs (`app.lifecycle`, `audio.pulse.context`, ...) would never
+/// have their tests collected. Recurse only into field-less structs; any
+/// referenced file is analyzed, which is what collects its `test` blocks.
+fn reference_namespaces(comptime T: type, comptime depth: comptime_int) void {
+    const std = @import("std");
+    inline for (comptime std.meta.declarations(T)) |name| {
+        const value = &@field(T, name);
+        if (depth > 0 and @TypeOf(value.*) == type) {
+            const Child = value.*;
+            if (@typeInfo(Child) == .@"struct" and @typeInfo(Child).@"struct".field_names.len == 0)
+                reference_namespaces(Child, depth - 1);
+        }
+    }
 }

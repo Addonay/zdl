@@ -199,11 +199,13 @@ become `builtin.target.*`; `@bitCast` on extern types is gone; bit sets are
 are removed; `ArrayList.getLast` becomes `last()`. Local langrefs:
 `/home/addo/.zvm/{0.17.0,master}/doc/langref.html`.
 
-The build compiles existing tests and a consumer; it does not run them. The user
-has requested no new tests or runtime testing yet. Do not run `zig build test`,
-consumer executables, GUI windows, audio capture/playback, or device probes without
-new authorization. Backend call bodies in the compile consumer are protected by
-the impossible user PID zero, and checks still compile/link their methods.
+The default build compiles tests and a consumer without executing them. The user
+authorized porting and running SDL automation tests and examples on 2026-10-14,
+as well as parallel branch work, integration, commits and pushing this independent
+repository. Run `zig build test` for integration validation and exercise relevant
+examples. Keep hardware-dependent validation explicitly distinguished from unit
+tests. Backend call bodies in the compile consumer are protected by the impossible
+user PID zero; do not execute that consumer as a runtime smoke test.
 
 Compile-only Xlib layout validation used both Zig guards and a C-header static
 assert object under `.cache`; it did not execute native code. Core-only
@@ -222,5 +224,6 @@ changes. The broad deleted-file Git diff reflects migration out of the product
 source tree; references under `.ref` are ignored but present on disk.
 
 No upstream SDL contribution is being made. Follow the independent port's scope
-and preserve SDL's license/origin notice in this repository. Do not publish,
-commit, or send messages to others unless the user asks.
+and preserve SDL's license/origin notice in this repository. The user authorized
+local integration commits and GitHub pushes on 2026-10-14; sending messages to
+others still requires explicit instructions.
