@@ -66,7 +66,7 @@ pub const State = struct {
     version: c_long = 0,
     /// True while an INCR transfer is delivering chunks to `target_window`.
     incremental: bool = false,
-    /// Receiving window of the transfer in progress.
+    /// Receiving window of the drag and any transfer in progress.
     target_window: xlib.Window = 0,
     /// Start of a line whose end has not arrived yet (INCR chunk boundaries).
     carry: std.ArrayList(u8) = .empty,
@@ -98,11 +98,13 @@ pub fn advertise(connection: *window.Connection, id: xlib.Window) void {
 pub fn translate_client(connection: *window.Connection, raw: *xlib.Event) window.Error!?window.Event {
     const message = raw.client.message_type;
     const target: window.WindowId = @fromBackingInt(@intCast(raw.any.window));
+    if (raw.client.format != 32) return null;
     const words: [5]c_ulong = @bitCast(raw.client.data.longs);
     if (message == connection.atom(.XdndEnter)) {
         const state = &connection.drop;
         state.reset(connection.library.allocator);
         state.source = words[0];
+        state.target_window = raw.any.window;
         state.version = @intCast(words[1] >> 24);
         const use_list = words[1] & 1 != 0;
         state.request = if (use_list)
@@ -113,8 +115,10 @@ pub fn translate_client(connection: *window.Connection, raw: *xlib.Event) window
     }
     if (message == connection.atom(.XdndPosition)) {
         const state = &connection.drop;
-        const root_x: c_int = @intCast((words[2] >> 16) & 0xffff);
-        const root_y: c_int = @intCast(words[2] & 0xffff);
+        if (!matches_drag(state, words[0], raw.any.window)) return null;
+        const position = unpack_position(words[2]);
+        const root_x: c_int = position.x;
+        const root_y: c_int = position.y;
         const api = &connection.library.functions;
         var x: c_int = 0;
         var y: c_int = 0;
@@ -128,11 +132,13 @@ pub fn translate_client(connection: *window.Connection, raw: *xlib.Event) window
         return .{ .window = target, .payload = .{ .drop_position = .{ .x = x, .y = y } } };
     }
     if (message == connection.atom(.XdndLeave)) {
+        if (!matches_drag(&connection.drop, words[0], raw.any.window)) return null;
         connection.drop.reset(connection.library.allocator);
         return .{ .window = target, .payload = .drop_left };
     }
     if (message == connection.atom(.XdndDrop)) {
         const state = &connection.drop;
+        if (!matches_drag(state, words[0], raw.any.window)) return null;
         if (state.request == 0) {
             // Not interested: XdndFinished with the failure marker (None) tells the source.
             try send_message(connection, state.source, connection.atom(.XdndFinished), .{
@@ -163,7 +169,10 @@ pub fn translate_client(connection: *window.Connection, raw: *xlib.Event) window
 pub fn translate_selection(connection: *window.Connection, raw: *xlib.Event) window.Error!?window.Event {
     const state = &connection.drop;
     if (state.source == 0 or state.request == 0) return null;
-    if (raw.selection.target != state.request) return null;
+    if (raw.selection.selection != connection.atom(.XdndSelection) or
+        raw.selection.target != state.request or raw.any.window != state.target_window) return null;
+    if (raw.selection.property == xlib.none) return try finish(connection, raw.any.window);
+    if (raw.selection.property != connection.atom(.PRIMARY)) return null;
     const target: window.WindowId = @fromBackingInt(@intCast(raw.any.window));
     const allocator = connection.library.allocator;
     const xid = raw.any.window;
@@ -269,6 +278,7 @@ fn pick_target(connection: *window.Connection, offered: []const xlib.Atom) xlib.
 fn pick_from_property(connection: *window.Connection, source: xlib.Window) window.Error!xlib.Atom {
     const reply = (try read_property(connection, source, connection.atom(.XdndTypeList), false)) orelse return 0;
     defer connection.library.allocator.free(reply.bytes);
+    if (reply.kind != xlib.xa_atom or reply.format != 32) return 0;
     // Format 32 items are longs (8 bytes on LP64), read in native order.
     const count = reply.bytes.len / @sizeOf(c_ulong);
     const offered = try connection.library.allocator.alloc(xlib.Atom, count);
@@ -293,7 +303,7 @@ fn read_property(connection: *window.Connection, id: xlib.Window, property: xlib
     const allocator = connection.library.allocator;
     const api = &connection.library.functions;
     var bytes: std.ArrayList(u8) = .empty;
-    errdefer bytes.deinit(allocator);
+    defer bytes.deinit(allocator);
     var kind: xlib.Atom = 0;
     var format: c_int = 0;
     var offset: c_long = 0;
@@ -322,13 +332,17 @@ fn read_property(connection: *window.Connection, id: xlib.Window, property: xlib
         const raw = data orelse return null;
         defer _ = api.XFree(raw);
         if (status != 0 or actual_type == 0) return null;
+        if (actual_format != 8 and actual_format != 16 and actual_format != 32) return null;
+        // A property replaced between requests must not join different types.
+        if (offset != 0 and (actual_type != kind or actual_format != format)) return null;
         kind = actual_type;
         format = actual_format;
         const item_bytes: usize = if (actual_format == 32) @sizeOf(c_long) else @intCast(@divExact(actual_format, 8));
         const size = @as(usize, @intCast(count)) * item_bytes;
         try bytes.appendSlice(allocator, raw[0..size]);
         if (after == 0) break;
-        offset += @intCast((size + 3) / 4);
+        if (count == 0) return null;
+        offset += property_units(count, actual_format);
     }
     return .{ .bytes = try bytes.toOwnedSlice(allocator), .kind = kind, .format = format };
 }
@@ -346,4 +360,62 @@ fn send_message(connection: *window.Connection, target: xlib.Window, message: xl
     const api = &connection.library.functions;
     _ = api.XSendEvent(connection.display, target, 0, 0, &event);
     _ = api.XFlush(connection.display);
+}
+
+fn matches_drag(state: *const State, source: xlib.Window, target: xlib.Window) bool {
+    return state.source != 0 and state.source == source and state.target_window == target;
+}
+
+fn unpack_position(word: c_ulong) struct { x: i16, y: i16 } {
+    return .{ .x = @bitCast(@as(u16, @truncate(word >> 16))), .y = @bitCast(@as(u16, @truncate(word))) };
+}
+
+// XGetWindowProperty offsets count protocol 32-bit units, even though Xlib
+// expands format-32 values to native longs in the returned memory.
+fn property_units(count: c_ulong, format: c_int) c_long {
+    return @intCast((count * @as(c_ulong, @intCast(@divExact(format, 8))) + 3) / 4);
+}
+
+test "XDND packed positions preserve negative desktop coordinates" {
+    const position = unpack_position(0xffecfff6);
+    try std.testing.expectEqual(@as(i16, -20), position.x);
+    try std.testing.expectEqual(@as(i16, -10), position.y);
+}
+
+test "property pagination uses protocol units on LP64" {
+    try std.testing.expectEqual(@as(c_long, 10), property_units(10, 32));
+    try std.testing.expectEqual(@as(c_long, 5), property_units(10, 16));
+    try std.testing.expectEqual(@as(c_long, 3), property_units(10, 8));
+}
+
+test "XDND messages belong to both the active source and receiving window" {
+    const state: State = .{ .source = 10, .target_window = 20 };
+    try std.testing.expect(matches_drag(&state, 10, 20));
+    try std.testing.expect(!matches_drag(&state, 11, 20));
+    try std.testing.expect(!matches_drag(&state, 10, 21));
+    try std.testing.expect(!matches_drag(&.{}, 0, 0));
+}
+
+test "streamed drops carry fragmented lines and skip CRLF empty lines" {
+    var library: window.Library = undefined;
+    library.allocator = std.testing.allocator;
+    var connection: window.Connection = undefined;
+    connection.library = &library;
+    connection.drop = .{};
+    connection.queue = .empty;
+    defer connection.drop.reset(std.testing.allocator);
+    defer connection.queue.deinit(std.testing.allocator);
+    const target: window.WindowId = @fromBackingInt(20);
+    try feed(&connection, target, false, "hel", false);
+    try std.testing.expectEqual(@as(usize, 0), connection.queue.items.len);
+    try feed(&connection, target, false, "lo\r", false);
+    try feed(&connection, target, false, "\nworld", false);
+    try std.testing.expectEqual(@as(usize, 1), connection.queue.items.len);
+    try feed(&connection, target, false, "", true);
+    try std.testing.expectEqual(@as(usize, 2), connection.queue.items.len);
+    const first = connection.queue.items[0].payload.drop_text;
+    const second = connection.queue.items[1].payload.drop_text;
+    try std.testing.expectEqualStrings("hello", first.bytes[0..first.length]);
+    try std.testing.expectEqualStrings("world", second.bytes[0..second.length]);
+    try std.testing.expectEqual(@as(usize, 0), connection.drop.carry.items.len);
 }

@@ -35,7 +35,9 @@
 //! Tip and buttons: the tip is button 1 and pen buttons are 2 and up (SDL reports
 //! them as button - 1). Button events are selected only on pen devices, so ordinary
 //! mice keep delivering core button presses. SDL selects them for every device and
-//! handles mice through XI2; this layer keeps the core path for mice.
+//! handles mice through XI2; this layer keeps the core path for mice. Pen selection
+//! also selects motion. Sparse motion samples preserve prior axes, and tip contact
+//! follows button 1 independently of pressure.
 //!
 //! Additions beyond SDL's pressure and tilt axes: "Abs Distance", rotation
 //! ("Abs Rotation Z" or "Abs Z", scaled to plus or minus 180 degrees) and slider
@@ -173,6 +175,15 @@ const Pen = struct {
     eraser: bool = false,
     wacom_id: u32 = 0,
     buttons: u32 = 0,
+    down: bool = false,
+    // XI_Motion only carries changed valuators. Retain the last sample for
+    // absent axes rather than reporting a spurious zero between their updates.
+    pressure_value: f32 = 0,
+    tilt_x_value: f32 = 0,
+    tilt_y_value: f32 = 0,
+    distance_value: f32 = 0,
+    rotation_value: f32 = 0,
+    slider_value: f32 = 0,
     /// Owned copy of the device name.
     name: []u8 = &.{},
 };
@@ -390,7 +401,7 @@ pub fn select_window(connection: *window.Connection, id: xlib.Window, events: Ev
     if (events.touch and !state.supports_touch()) return error.TouchUnsupported;
     if (events.gesture and !state.supports_gesture()) return error.TouchUnsupported;
     var bits: [4]u8 = @splat(0);
-    if (events.motion) set_bit(&bits, xlib.xi_motion);
+    if (events.motion or events.pen) set_bit(&bits, xlib.xi_motion);
     if (events.touch) {
         set_bit(&bits, xlib.xi_touch_begin);
         set_bit(&bits, xlib.xi_touch_update);
@@ -403,15 +414,19 @@ pub fn select_window(connection: *window.Connection, id: xlib.Window, events: Ev
         set_bit(&bits, xlib.xi_gesture_pinch_end);
     }
     var button_bits: [4]u8 = @splat(0);
-    set_bit(&button_bits, xlib.xi_button_press);
-    set_bit(&button_bits, xlib.xi_button_release);
-    const pen_count = if (events.pen) state.pen_ids.items.len else 0;
+    if (events.pen) {
+        set_bit(&button_bits, xlib.xi_button_press);
+        set_bit(&button_bits, xlib.xi_button_release);
+    }
+    // Explicit device masks survive replacement of XIAllDevices selections.
+    // Send zero masks too, so turning pens off also stops their button events.
+    const pen_count = state.pen_ids.items.len;
     const masks = try state.allocator.alloc(xlib.XIEventMask, 1 + pen_count);
     defer state.allocator.free(masks);
     masks[0] = .{ .deviceid = all_devices, .mask_len = bits.len, .mask = &bits };
-    if (events.pen) for (state.pen_ids.items, masks[1..]) |pen_id, *mask| {
+    for (state.pen_ids.items, masks[1..]) |pen_id, *mask| {
         mask.* = .{ .deviceid = pen_id, .mask_len = button_bits.len, .mask = &button_bits };
-    };
+    }
     if (xi.XISelectEvents(connection.display, id, masks.ptr, @intCast(masks.len)) != 0) return error.WindowFailure;
     const any = events.motion or events.touch or events.pen or events.gesture;
     if (any) {
@@ -566,27 +581,30 @@ fn motion(connection: *window.Connection, state: *State, data: *const xlib.XIDev
     }
     // Pen samples arrive from the tablet's own device (deviceid equal to sourceid).
     if (device_for(connection, state, data.sourceid)) |device| {
-        if (device.pen) |pen| return pen_sample(data, pen);
+        if (device.pen) |*pen| return pen_sample(data, pen);
     }
     return scroll(connection, state, data, target);
 }
 
 /// A pen sample from a device with pressure: position, pressure, tilt and the
 /// optional distance, rotation and slider axes.
-fn pen_sample(data: *const xlib.XIDeviceEvent, pen: Pen) window.Event {
-    const pressure = if (pen.pressure) |range| normalized(data.valuators, range, 1.0) else 0;
-    const tilt_x = if (pen.tilt_x) |range| normalized(data.valuators, range, 90.0) else 0;
-    const tilt_y = if (pen.tilt_y) |range| normalized(data.valuators, range, 90.0) else 0;
+fn pen_sample(data: *const xlib.XIDeviceEvent, pen: *Pen) window.Event {
+    update_axis(data.valuators, pen.pressure, 1, &pen.pressure_value);
+    update_axis(data.valuators, pen.tilt_x, 90, &pen.tilt_x_value);
+    update_axis(data.valuators, pen.tilt_y, 90, &pen.tilt_y_value);
+    update_axis(data.valuators, pen.distance, 1, &pen.distance_value);
+    update_axis(data.valuators, pen.rotation, 180, &pen.rotation_value);
+    update_axis(data.valuators, pen.slider, 1, &pen.slider_value);
     return .{ .window = window_id(data.event), .payload = .{ .pen_motion = .{
         .device = data.sourceid,
         .eraser = pen.eraser,
-        .down = pressure > 0,
+        .down = pen.down,
         .position = .{ .x = @floatCast(data.event_x), .y = @floatCast(data.event_y) },
-        .pressure = pressure,
-        .tilt = .{ .x = tilt_x, .y = tilt_y },
-        .distance = if (pen.distance) |range| normalized(data.valuators, range, 1.0) else null,
-        .rotation = if (pen.rotation) |range| normalized(data.valuators, range, 180.0) else null,
-        .slider = if (pen.slider) |range| normalized(data.valuators, range, 1.0) else null,
+        .pressure = pen.pressure_value,
+        .tilt = .{ .x = pen.tilt_x_value, .y = pen.tilt_y_value },
+        .distance = if (pen.distance != null) pen.distance_value else null,
+        .rotation = if (pen.rotation != null) pen.rotation_value else null,
+        .slider = if (pen.slider != null) pen.slider_value else null,
         .timestamp = @truncate(data.time),
     } } };
 }
@@ -634,14 +652,14 @@ fn read_int_property(connection: *window.Connection, id: c_int, property: xlib.A
     if (xi.XIGetProperty(connection.display, id, property, 0, @intCast(out.len), 0, xlib.xa_integer, &actual_type, &format, &count, &after, &data) != 0) return 0;
     const bytes = data orelse return 0;
     defer _ = api.XFree(bytes);
-    if (actual_type != xlib.xa_integer or count == 0) return 0;
+    if (actual_type != xlib.xa_integer or count == 0 or (format != 8 and format != 16 and format != 32)) return 0;
     const n = @min(out.len, @as(usize, @intCast(count)));
     for (out[0..n], 0..) |*item, index| {
         item.* = switch (format) {
             8 => @as(i8, @bitCast(bytes[index])),
             16 => std.mem.readInt(i16, bytes[index * 2 ..][0..2], .native),
             // XIGetProperty hands 32-bit items back as C longs, as XGetWindowProperty does.
-            else => @truncate(std.mem.readInt(i64, bytes[index * 8 ..][0..8], .native)),
+            else => @truncate(std.mem.readInt(c_long, bytes[index * @sizeOf(c_long) ..][0..@sizeOf(c_long)], .native)),
         };
     }
     return n;
@@ -666,7 +684,7 @@ fn read_tool_type(connection: *window.Connection, state: *const State, id: c_int
     const bytes = data orelse return null;
     defer _ = api.XFree(bytes);
     if (count == 0) return null;
-    if (actual_type == xlib.xa_atom) {
+    if (actual_type == xlib.xa_atom and format == 32) {
         const atom: xlib.Atom = std.mem.readInt(c_ulong, bytes[0..@sizeOf(c_ulong)], .native);
         if (atom == 0) return null;
         const name_ptr = api.XGetAtomName(connection.display, atom) orelse return null;
@@ -685,7 +703,8 @@ fn pen_button(connection: *window.Connection, state: *State, data: *const xlib.X
     if (data.deviceid != data.sourceid) return null;
     if (!is_pen(state, data.sourceid)) return null;
     const device = device_for(connection, state, data.sourceid) orelse return null;
-    const pen = device.pen orelse return null;
+    const pen = if (device.pen) |*pen| pen else return null;
+    if (data.detail == 1) pen.down = pressed;
     return .{ .window = window_id(data.event), .payload = .{ .pen_button = .{
         .device = data.sourceid,
         .button = std.math.cast(u8, data.detail) orelse return null,
@@ -935,4 +954,52 @@ test "axis values normalize over their range" {
     try std.testing.expectEqual(@as(f32, -45), normalized(state, .{ .number = 2, .min = -90, .max = 90 }, 90.0));
     // An unreported valuator reads as zero.
     try std.testing.expectEqual(@as(f32, 0), normalized(state, .{ .number = 1, .min = 0, .max = 10 }, 1.0));
+}
+
+fn update_axis(valuators: xlib.XIValuatorState, maybe_range: ?Range, scale: f32, value: *f32) void {
+    const range = maybe_range orelse return;
+    if (valuator_value(valuators, range.number) != null) value.* = normalized(valuators, range, scale);
+}
+
+test "sparse pen samples retain axes and tip contact independently of pressure" {
+    var pen: Pen = .{
+        .pressure = .{ .number = 0, .min = 0, .max = 10 },
+        .tilt_x = .{ .number = 2, .min = -90, .max = 90 },
+        .down = true,
+    };
+    var mask = [_]u8{0b101};
+    var values = [_]f64{ 5, -45 };
+    var event: xlib.XIDeviceEvent = undefined;
+    event.event = 20;
+    event.sourceid = 10;
+    event.event_x = 1;
+    event.event_y = 2;
+    event.time = 0;
+    event.valuators = .{ .mask_len = 1, .mask = &mask, .values = &values };
+    _ = pen_sample(&event, &pen);
+    mask[0] = 0;
+    var result = pen_sample(&event, &pen).payload.pen_motion;
+    try std.testing.expectEqual(@as(f32, 0.5), result.pressure);
+    try std.testing.expectEqual(@as(f32, -45), result.tilt.x);
+    try std.testing.expect(result.down);
+    // A pressure-only sample does not reset tilt, and zero pressure does not
+    // release the tip: XI_ButtonRelease supplies contact changes.
+    mask[0] = 1;
+    values[0] = 0;
+    result = pen_sample(&event, &pen).payload.pen_motion;
+    try std.testing.expectEqual(@as(f32, 0), result.pressure);
+    try std.testing.expectEqual(@as(f32, -45), result.tilt.x);
+    try std.testing.expect(result.down);
+}
+
+test "forgetting a window updates the connection selection state" {
+    var connection: window.Connection = undefined;
+    var state: State = undefined;
+    state.allocator = std.testing.allocator;
+    state.selections = .empty;
+    connection.xi = state;
+    defer connection.xi.?.selections.deinit(std.testing.allocator);
+    try connection.xi.?.selections.put(std.testing.allocator, 20, .{ .pen = true });
+    forget_window(&connection, 20);
+    try std.testing.expectEqual(@as(usize, 0), connection.xi.?.selections.count());
 }
