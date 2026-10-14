@@ -14,6 +14,8 @@
 //! probed once at init with a zero-strength write, as SDL does.
 //!
 //! Deliberate differences from SDL:
+//! - Hats are applied on every state report and deduplicated by the joystick,
+//!   so an initial D-pad Up (code zero) is not lost against zeroed raw state.
 //! - SDL's joystick model is filled through `SDL_SendJoystick*`, which ignores
 //!   unchanged values. Here the byte comparisons come first, as in SDL, and the
 //!   joystick model dedupes the rest.
@@ -104,11 +106,12 @@ pub fn stick_axis(raw: u8) i16 {
 }
 
 /// Decodes one state report. Groups of bytes are compared with the last report
-/// and only the changed groups are sent, as in SDL.
+/// and changed button groups are sent, as in SDL. The hat uses joystick-level
+/// deduplication so the first report is always applied.
 pub fn decode_report(ctx: *Context, out: *Output, data: []const u8) Error!void {
     if (data.len < min_state_length or data[0] != state_report_id) return;
     const last = &ctx.last_state;
-    if (last[1] != data[1]) try out.hat(common.hat_from_dpad(data[1]));
+    try out.hat(common.hat_from_dpad(data[1]));
     if (last[2] != data[2]) {
         try out.button(common.button.back, data[2] & 0x40 != 0);
         try out.button(common.button.guide, data[2] & 0x10 != 0);
@@ -195,4 +198,13 @@ test "Stadia ignores reports with another ID or a short length" {
     try decode_report(&ctx, &out, &[_]u8{ 0x04, 0, 0x40, 0, 0x80, 0x80, 0x80, 0x80, 0, 0 });
     try decode_report(&ctx, &out, &[_]u8{ 0x03, 0, 0x40, 0, 0x80, 0x80, 0x80, 0x80, 0 });
     try std.testing.expect(!sink.js.button_down(common.button.back));
+}
+
+test "Stadia first report with D-pad Up is applied" {
+    var sink = try common.TestSink.init(std.testing.allocator, .{ .axes = 6, .buttons = button_count, .hats = 1 });
+    defer sink.deinit();
+    var ctx: Context = .{};
+    var out = sink.output(1);
+    try decode_report(&ctx, &out, &.{ 0x03, 0, 0, 0, 0x80, 0x80, 0x80, 0x80, 0, 0 });
+    try std.testing.expectEqual(@as(u8, 1), sink.js.hat_value(0).bits());
 }

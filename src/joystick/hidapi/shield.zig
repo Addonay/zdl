@@ -18,6 +18,8 @@
 //! sent about half a second after the change.
 //!
 //! Deliberate differences from SDL:
+//! - Hats are applied on every state report and deduplicated by the joystick,
+//!   so an initial D-pad Up (code zero) is not lost against zeroed raw state.
 //! - SDL's macOS-only guard for command writes is not compiled for Linux.
 //! - The battery percentage is clamped to 100. SDL multiplies the raw level by
 //!   20 without a clamp.
@@ -130,7 +132,9 @@ fn send_command(ctx: *Context, dev: *Device, command: u8, payload: []const u8) E
     packet[2] = ctx.seq_num;
     ctx.seq_num +%= 1;
     @memcpy(packet[3..][0..payload.len], payload);
-    _ = try dev.send_report(&packet, .report_id);
+    // Commands share a report ID but carry different operations and sequence
+    // numbers; preserving every command is necessary for battery queries.
+    _ = try dev.send_report(&packet, .none);
 }
 
 /// Sends the current motor amplitudes as a rumble command (SendNextRumble).
@@ -177,7 +181,7 @@ fn hat_from_code(code: u8) joystick.Hat {
 /// V103 state report (HandleStatePacketV103, 16 bytes).
 fn decode_state_v103(ctx: *Context, out: *Output, data: []const u8) Error!void {
     const last = &ctx.last_state;
-    if (last[3] != data[3]) try out.hat(hat_from_code(data[3]));
+    try out.hat(hat_from_code(data[3]));
     if (last[1] != data[1]) {
         try out.button(common.button.south, data[1] & 0x01 != 0);
         try out.button(common.button.east, data[1] & 0x02 != 0);
@@ -218,7 +222,7 @@ fn decode_touch_v103(out: *Output, data: []const u8) Error!void {
 fn decode_state_v104(ctx: *Context, out: *Output, data: []const u8) Error!void {
     if (data.len < 23) return;
     const last = &ctx.last_state;
-    if (last[2] != data[2]) try out.hat(hat_from_code(data[2]));
+    try out.hat(hat_from_code(data[2]));
     if (last[3] != data[3]) {
         try out.button(common.button.south, data[3] & 0x01 != 0);
         try out.button(common.button.east, data[3] & 0x02 != 0);
@@ -448,4 +452,33 @@ fn testing_device(allocator: std.mem.Allocator) Error!Device {
         .interface_number = null,
     };
     return Device.from_record(allocator, record);
+}
+
+test "SHIELD open and rumble preserve distinct command requests" {
+    var ctx: Context = .{};
+    var dev = try testing_device(std.testing.allocator);
+    defer dev.deinit();
+    try open(&ctx, &dev);
+    try rumble(&ctx, &dev, 0xffff, 0);
+    try std.testing.expectEqual(@as(usize, 3), dev.rumble.pending.items.len);
+    const commands = [_]u8{ command_charge_state, command_battery_state, command_rumble };
+    for (dev.rumble.pending.items, commands, 0..) |packet, command, sequence| {
+        try std.testing.expectEqual(command, packet.data[1]);
+        try std.testing.expectEqual(@as(u8, @intCast(sequence)), packet.data[2]);
+    }
+}
+
+test "SHIELD initial D-pad Up is applied on both controller versions" {
+    var sink = try common.TestSink.init(std.testing.allocator, .{ .axes = 6, .buttons = button_count_v103, .hats = 1 });
+    defer sink.deinit();
+    var ctx: Context = .{};
+    var out = sink.output(1);
+    var v103: [16]u8 = @splat(0);
+    try decode_state_v103(&ctx, &out, &v103);
+    try std.testing.expectEqual(@as(u8, 1), sink.js.hat_value(0).bits());
+    try out.hat(joystick.Hat.centered);
+    ctx = .{};
+    var v104: [23]u8 = @splat(0);
+    try decode_state_v104(&ctx, &out, &v104);
+    try std.testing.expectEqual(@as(u8, 1), sink.js.hat_value(0).bits());
 }

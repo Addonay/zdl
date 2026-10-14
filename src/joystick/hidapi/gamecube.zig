@@ -28,7 +28,8 @@
 //! C stick inverted. The button bits differ from the Nintendo layout. Rumble is
 //! one motor state for every port, sent as the 3-byte report {0, m, m} and
 //! repeated every 16 ms while it runs. It is allowed only when the first packet
-//! after open has 9 bytes, as SDL checks.
+//! has 9 bytes. Detection happens while decoding the first valid input, instead
+//! of discarding a packet during init as SDL does.
 //!
 //! Reachability on Linux: `hid/filter.zig` ignores the Nintendo adapter
 //! (0x057e:0x0337) on hidraw, as SDL does, because SDL drives that device
@@ -130,7 +131,9 @@ pub const Adapter = struct {
     sent_axes: [port_count][common.axis.count]i16 = @splat(@splat(0)),
     /// PC-mode adapter (third-party firmware). Set once by `init`.
     pc_mode: bool = false,
-    /// PC mode: the first packet after open had 9 bytes (firmware 0x7 or newer
+    /// PC mode: whether a valid input packet has established the firmware layout.
+    pc_packet_seen: bool = false,
+    /// PC mode: the first valid packet had 9 bytes (firmware 0x7 or newer
     /// with the second USB cable), which allows rumble.
     pc_rumble_allowed: bool = false,
     /// PC mode: one motor state shared by every port (SDL's rumbleActive).
@@ -338,19 +341,16 @@ pub fn supports(probe: device.Probe) bool {
 
 /// Nintendo adapter: sets the four-slot count, the device name and writes the
 /// init byte. Ports connect from `update` once their status bytes show a
-/// controller. PC-mode adapters (any other vendor) read one packet to learn
-/// whether rumble is allowed and connect their ports from `update`.
+/// controller. PC-mode adapters (any other vendor) learn the packet layout
+/// and rumble allowance from the first valid report in `update`.
 pub fn init(ctx: *Context, dev: *device.Device, env: device.Env) Error!bool {
     _ = env;
     ctx.* = .{};
     dev.slot_count = port_count;
     if (dev.info.vendor_id != vendor_nintendo) {
         ctx.pc_mode = true;
-        // SDL reads one packet without waiting. Nine bytes means firmware 0x7 or newer.
-        var buf: [64]u8 = undefined;
-        if (dev.poll_report(&buf) catch null) |first| {
-            ctx.pc_rumble_allowed = first.len == 9;
-        }
+        // Detect the packet layout when update decodes it, so probing does not
+        // discard the initial button/axis state or depend on a packet being ready.
         return false;
     }
     try dev.set_name("Nintendo GameCube Controller");
@@ -422,9 +422,14 @@ fn handle_packet(ctx: *Context, dev: *device.Device, out: *Output, packet: []con
 /// packet is the single controller of firmware 0x7 and newer. A 10-byte packet
 /// starts with the port number, 1 to 4, and has the C stick inverted.
 fn handle_pc_packet(ctx: *Context, dev: *device.Device, out: *Output, packet: []const u8) device.Error!void {
+    if (packet.len != 9 and packet.len != 10) return;
+    if (packet.len == 10 and (packet[0] == 0 or packet[0] > port_count)) return;
+    if (!ctx.pc_packet_seen) {
+        ctx.pc_packet_seen = true;
+        ctx.pc_rumble_allowed = packet.len == 9;
+    }
     if (packet.len == 10) {
-        // Port 0 wraps to 255 here and is rejected by the range check below.
-        try handle_pc_port(ctx, dev, out, @as(usize, packet[0] -% 1), packet[1..], true);
+        try handle_pc_port(ctx, dev, out, @as(usize, packet[0] - 1), packet[1..], true);
     } else if (packet.len == 9) {
         try handle_pc_port(ctx, dev, out, 0, packet, false);
     }
@@ -565,4 +570,37 @@ test "PC-mode rumble sends on change and refreshes every 16 ms" {
 test "PC-mode rumble needs the 9-byte firmware" {
     var adapter: Adapter = .{ .pc_mode = true };
     try std.testing.expectError(error.Unsupported, adapter.set_pc_rumble(0, 1000, 0));
+}
+
+test "PC-mode first input establishes rumble and preserves button state" {
+    const allocator = std.testing.allocator;
+    const record: @import("../../hid/sysfs.zig").DeviceInfo = .{
+        .path = try allocator.dupe(u8, "/dev/null"),
+        .manufacturer = try allocator.dupe(u8, ""),
+        .product = try allocator.dupe(u8, ""),
+        .serial_number = try allocator.dupe(u8, ""),
+        .vendor_id = vendor_dragonrise,
+        .product_id = product_evoretro_adapter1,
+        .release_number = 0,
+        .bus = .usb,
+        .usage_page = 0,
+        .usage = 0,
+        .interface_number = null,
+    };
+    var dev = try device.Device.from_record(allocator, record);
+    defer dev.deinit();
+    dev.driver = .{ .gamecube = .{} };
+    const ctx = &dev.driver.?.gamecube;
+    _ = try init(ctx, &dev, .{ .devices = &.{} });
+    var sink = try common.TestSink.init(allocator, .{ .axes = 6, .buttons = button_count });
+    defer sink.deinit();
+    var out = sink.output(1);
+    // Foreign/invalid reports must not decide the layout.
+    try handle_pc_packet(ctx, &dev, &out, &.{0});
+    try handle_pc_packet(ctx, &dev, &out, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try std.testing.expect(!ctx.pc_packet_seen);
+    try handle_pc_packet(ctx, &dev, &out, &.{ 0x02, 0, 128, 128, 128, 128, 0, 0, 0 });
+    try std.testing.expect(ctx.pc_rumble_allowed);
+    try std.testing.expect(dev.slot_connected(0));
+    try std.testing.expect(dev.joystick_slot(0).?.button_down(button_south));
 }

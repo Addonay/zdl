@@ -23,6 +23,8 @@
 //! of 1..100 (SDL's 655 scale).
 //!
 //! Deliberate differences from SDL:
+//! - Hats are applied on every state report and deduplicated by the joystick,
+//!   so an initial D-pad Up (code zero) is not lost against zeroed raw state.
 //! - SDL's macOS-only guard is not compiled for Linux, and its Bluetooth rumble
 //!   switch is always on. This port keeps both.
 //! - Luna exposes 12 buttons: 11 gamepad buttons plus the microphone.
@@ -131,6 +133,7 @@ fn bluetooth_hat(code: u8) joystick.Hat {
 
 /// Decodes a USB state report (HandleUSBStatePacket).
 pub fn decode_usb(ctx: *Context, out: *Output, data: []const u8) Error!void {
+    if (data.len != usb_state_length) return;
     const last = &ctx.last_state;
     if (last[1] != data[1]) {
         try out.button(common.button.south, data[1] & 0x01 != 0);
@@ -148,7 +151,7 @@ pub fn decode_usb(ctx: *Context, out: *Output, data: []const u8) Error!void {
         try out.button(common.button.left_stick, data[2] & 0x04 != 0);
         try out.button(common.button.right_stick, data[2] & 0x08 != 0);
     }
-    if (last[3] != data[3]) try out.hat(common.hat_from_dpad(data[3] & 0x0f));
+    try out.hat(common.hat_from_dpad(data[3] & 0x0f));
     try out.axis(common.axis.left_x, stick_axis(data[4]));
     try out.axis(common.axis.left_y, stick_axis(data[5]));
     try out.axis(common.axis.right_x, stick_axis(data[6]));
@@ -266,4 +269,16 @@ test "Luna Bluetooth battery and guide reports" {
     try decode_bluetooth(&ctx, &out, &[_]u8{ 0x04, 255 });
     try std.testing.expectEqual(@as(u8, 100), sink.state.battery_percent);
     try std.testing.expectEqual(common.PowerState.on_battery, sink.state.battery);
+}
+
+test "Luna USB rejects truncated packets and applies initial D-pad Up" {
+    var sink = try common.TestSink.init(std.testing.allocator, .{ .axes = 6, .buttons = button_count, .hats = 1 });
+    defer sink.deinit();
+    var ctx: Context = .{};
+    var out = sink.output(1);
+    const packet = [_]u8{ 0x03, 0, 0, 0, 0x7f, 0x7f, 0x7f, 0x7f, 0, 0 };
+    for (0..packet.len) |length| try decode_usb(&ctx, &out, packet[0..length]);
+    try std.testing.expectEqual(@as(u8, 0), sink.js.hat_value(0).bits());
+    try decode_usb(&ctx, &out, &packet);
+    try std.testing.expectEqual(@as(u8, 1), sink.js.hat_value(0).bits());
 }
