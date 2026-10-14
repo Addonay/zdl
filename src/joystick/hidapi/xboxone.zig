@@ -259,9 +259,9 @@ pub const Context = struct {
     product_id: u16 = 0,
     init_state: InitState = .complete,
     /// Time of the last protocol packet, in nanoseconds; drives the init timeouts.
-    send_time_ns: u64 = 0,
+    send_time_ns: common.Timestamp = 0,
     /// Timestamp of the current update pass; rumble and protocol sends use it.
-    now_ns: u64 = 0,
+    now_ns: common.Timestamp = 0,
     sequence: u8 = 0,
     has_color_led: bool = false,
     has_paddles: bool = false,
@@ -273,7 +273,7 @@ pub const Context = struct {
     left_trigger_rumble: u8 = 0,
     right_trigger_rumble: u8 = 0,
     rumble_state: RumbleState = .idle,
-    rumble_time_ns: u64 = 0,
+    rumble_time_ns: common.Timestamp = 0,
     rumble_pending: bool = false,
     /// Raw copy of the last input body, compared bytewise as SDL does.
     last_state: [usb_packet_length]u8 = @splat(0),

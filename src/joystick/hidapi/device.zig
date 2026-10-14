@@ -454,7 +454,7 @@ pub const Device = struct {
     /// Reports `slot`'s inputs at rest, then closes it (SDL's force recentering
     /// before SDL_PrivateJoystickRemoved). Records `slot_removed`, and `removed`
     /// when it was the device's last joystick.
-    pub fn detach_slot(self: *Device, slot: usize, updates: *Updates, now: u64) Allocator.Error!void {
+    pub fn detach_slot(self: *Device, slot: usize, updates: *Updates, now: joystick.Timestamp) Allocator.Error!void {
         if (!self.slot_connected(slot)) return;
         try self.slots[slot].?.recenter(self.allocator, &updates.changes, now);
         const last = self.connected_count() == 1;
@@ -464,7 +464,7 @@ pub const Device = struct {
     }
 
     /// Detaches every connected slot with its inputs recentered.
-    pub fn disconnect_with_recenter(self: *Device, updates: *Updates, now: u64) Allocator.Error!void {
+    pub fn disconnect_with_recenter(self: *Device, updates: *Updates, now: joystick.Timestamp) Allocator.Error!void {
         for (0..max_joystick_slots) |slot| try self.detach_slot(slot, updates, now);
     }
 

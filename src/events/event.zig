@@ -4,15 +4,19 @@
 //! (the value SDL_EventType assigns) so queues can select ranges as SDL does.
 //!
 //! Conventions:
-//! - Timestamps are caller-supplied nanoseconds. Zero means "unset". Nothing in
-//!   this module reads a clock, so event streams are reproducible.
+//! - Timestamps use `Timestamp`: nanoseconds in the host monotonic clock domain
+//!   (`std.Io.Clock.awake`, CLOCK_MONOTONIC on Linux). Producers replace or
+//!   rebase timestamps from another clock before constructing an event. Zero is
+//!   reserved for manually initialized, unstamped values.
 //! - Ids are distinct enum types (`WindowId`, `MouseId`, ...). Non-exhaustive
 //!   enums keep arbitrary backend values representable, as SDL's integers do.
 //! - Keyboard payloads use `keyboard.Scancode`, `keyboard.Keycode` and
 //!   `keyboard.Modifiers` from `../input/keyboard.zig`.
-//! - Events that carry text (text input, IME editing, drops, clipboard MIME
-//!   types) borrow their slices. Borrowed text must stay valid until the event
-//!   has been consumed; the queue never copies it.
+//! - Event values own no memory. Any payload slice borrows from the producer's
+//!   queue or payload store and is valid until that producer's next pump/poll
+//!   call. Copy payloads that must outlive that boundary. `Queue` shallow-copies
+//!   events and does not extend payload lifetimes; producers can use
+//!   `events.payload.Store` to copy payloads before queuing.
 //! - Only event families with a native model are present. Joystick, gamepad,
 //!   sensor, audio, camera and notification events are not ported yet, and no
 //!   variant stands in for them.
@@ -20,6 +24,13 @@ const std = @import("std");
 const keyboard = @import("../input/keyboard.zig");
 const mouse = @import("mouse.zig");
 const pen = @import("pen.zig");
+const time = @import("timestamp.zig");
+
+/// Nanoseconds in the host monotonic clock domain.
+pub const Timestamp = time.Timestamp;
+
+/// Reads the host monotonic clock used for event timestamps.
+pub const now_ns = time.now_ns;
 
 /// Window identifier. `none` is SDL's 0 (no window).
 pub const WindowId = enum(u32) { none = 0, _ };
@@ -50,7 +61,7 @@ pub const PenId = enum(u32) { none = 0, _ };
 
 /// Payload shared by events that only carry a timestamp.
 pub const Common = struct {
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
 };
 
 /// SDL_EVENT_TERMINATING through SDL_EVENT_SYSTEM_THEME_CHANGED.
@@ -68,7 +79,7 @@ pub const AppKind = enum(u32) {
 /// Application lifecycle notification.
 pub const App = struct {
     kind: AppKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
 };
 
 /// Display state change. `data1`/`data2` are kind-dependent, as in SDL.
@@ -85,7 +96,7 @@ pub const DisplayKind = enum(u32) {
 
 pub const Display = struct {
     kind: DisplayKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     display_id: DisplayId = .none,
     data1: i32 = 0,
     data2: i32 = 0,
@@ -124,7 +135,7 @@ pub const WindowKind = enum(u32) {
 
 pub const Window = struct {
     kind: WindowKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     data1: i32 = 0,
     data2: i32 = 0,
@@ -139,7 +150,7 @@ pub const RenderKind = enum(u32) {
 
 pub const Render = struct {
     kind: RenderKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
 };
 
@@ -153,7 +164,7 @@ pub const KeyKind = enum(u32) {
 /// `keyboard.event_keycode`). `raw` is the platform-specific code.
 pub const Key = struct {
     kind: KeyKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     keyboard_id: KeyboardId = .unknown,
     scancode: keyboard.Scancode = .unknown,
@@ -163,27 +174,30 @@ pub const Key = struct {
     repeat: bool = false,
 };
 
-/// IME composition text. A `start` or `length` of -1 means "not set".
+/// IME composition text. `text` borrows from the event producer's payload store;
+/// a `start` or `length` of -1 means "not set".
 pub const TextEditing = struct {
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     text: []const u8 = "",
     start: i32 = -1,
     length: i32 = -1,
 };
 
-/// IME candidate list. `selected` is -1 when no candidate is selected.
+/// IME candidate list. `candidates` and its strings borrow from the event
+/// producer's payload store. `selected` is -1 when no candidate is selected.
 pub const TextEditingCandidates = struct {
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     candidates: []const []const u8 = &.{},
     selected: i32 = -1,
     horizontal: bool = false,
 };
 
-/// Committed UTF-8 text. Delivered only while text input is active.
+/// Committed UTF-8 text. Delivered only while text input is active. `text`
+/// borrows from the event producer's payload store.
 pub const TextInput = struct {
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     text: []const u8 = "",
 };
@@ -195,7 +209,7 @@ pub const KeyboardDeviceKind = enum(u32) {
 
 pub const KeyboardDevice = struct {
     kind: KeyboardDeviceKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     keyboard_id: KeyboardId = .unknown,
 };
 
@@ -206,14 +220,14 @@ pub const ScreenKeyboardKind = enum(u32) {
 
 pub const ScreenKeyboard = struct {
     kind: ScreenKeyboardKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
 };
 
 /// Pointer motion. `x`/`y` are window coordinates (or the accumulated position
 /// in relative mode); `xrel`/`yrel` is the motion since the previous event.
 pub const MouseMotion = struct {
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     mouse_id: MouseId = .global,
     buttons: mouse.Buttons = .none,
@@ -232,7 +246,7 @@ pub const MouseButtonKind = enum(u32) {
 /// so on, counted per button and per mouse.
 pub const MouseButton = struct {
     kind: MouseButtonKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     mouse_id: MouseId = .global,
     /// One-based button index (`mouse.button`).
@@ -251,7 +265,7 @@ pub const WheelDirection = enum(u32) {
 };
 
 pub const MouseWheel = struct {
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     mouse_id: MouseId = .global,
     /// Scroll amounts, or the whole-tick amounts when integer wheel mode is on.
@@ -271,7 +285,7 @@ pub const MouseDeviceKind = enum(u32) {
 
 pub const MouseDevice = struct {
     kind: MouseDeviceKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     mouse_id: MouseId = .global,
 };
 
@@ -286,7 +300,7 @@ pub const FingerKind = enum(u32) {
 /// `dx`/`dy` are normalized deltas and are zero for down, up and canceled.
 pub const Finger = struct {
     kind: FingerKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     touch_id: TouchId = .none,
     finger_id: FingerId = .none,
@@ -307,7 +321,7 @@ pub const PinchKind = enum(u32) {
 /// the platform does not provide them.
 pub const Pinch = struct {
     kind: PinchKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     scale: f32 = 1,
     span_x: f32 = -1,
@@ -316,9 +330,10 @@ pub const Pinch = struct {
     focus_y: f32 = -1,
 };
 
-/// Clipboard change. `mime_types` is borrowed.
+/// Clipboard change. `mime_types` and its strings borrow from the event
+/// producer's payload store.
 pub const Clipboard = struct {
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     owner: bool = false,
     mime_types: []const []const u8 = &.{},
 };
@@ -331,11 +346,12 @@ pub const DropKind = enum(u32) {
     position,
 };
 
-/// Drag-and-drop event. `source` and `data` are borrowed; `data` carries the
-/// file name or dropped text and is null for begin, complete and position.
+/// Drag-and-drop event. `source` and `data` borrow from the event producer's
+/// payload store; `data` carries the file name or dropped text and is null for
+/// begin, complete and position.
 pub const Drop = struct {
     kind: DropKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     x: f32 = 0,
     y: f32 = 0,
@@ -351,7 +367,7 @@ pub const PenProximityKind = enum(u32) {
 /// A pen entering or leaving sensing range (SDL_EVENT_PEN_PROXIMITY_IN/OUT).
 pub const PenProximity = struct {
     kind: PenProximityKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     pen_id: PenId = .none,
     state: pen.InputFlags = .{},
@@ -359,7 +375,7 @@ pub const PenProximity = struct {
 };
 
 pub const PenMotion = struct {
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     pen_id: PenId = .none,
     state: pen.InputFlags = .{},
@@ -376,7 +392,7 @@ pub const PenTouchKind = enum(u32) {
 /// Pen tip contact changes. `eraser` is true when the eraser end is in use.
 pub const PenTouch = struct {
     kind: PenTouchKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     pen_id: PenId = .none,
     state: pen.InputFlags = .{},
@@ -394,7 +410,7 @@ pub const PenButtonKind = enum(u32) {
 /// Barrel or side button on the pen. Buttons are numbered from 1.
 pub const PenButton = struct {
     kind: PenButtonKind,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     pen_id: PenId = .none,
     state: pen.InputFlags = .{},
@@ -405,7 +421,7 @@ pub const PenButton = struct {
 };
 
 pub const PenAxisEvent = struct {
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     pen_id: PenId = .none,
     state: pen.InputFlags = .{},
@@ -421,7 +437,7 @@ pub const PenAxisEvent = struct {
 /// application, typically via `Queue.registerUserEvents`.
 pub const User = struct {
     code: u32,
-    timestamp: u64 = 0,
+    timestamp: Timestamp = 0,
     window_id: WindowId = .none,
     value: i32 = 0,
     /// Opaque application tokens, for example indices into the application's own
@@ -497,8 +513,8 @@ pub const Event = union(enum) {
         };
     }
 
-    /// Caller-supplied timestamp in nanoseconds (zero when unset).
-    pub fn timestamp(self: Event) u64 {
+    /// Caller-supplied monotonic timestamp in nanoseconds (zero when unset).
+    pub fn timestamp(self: Event) Timestamp {
         return switch (self) {
             inline else => |payload| payload.timestamp,
         };

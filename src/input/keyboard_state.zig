@@ -6,9 +6,11 @@
 //!
 //! There is no global keyboard, event queue, clock or window: each input call
 //! returns the transition SDL would have posted (or null where SDL drops it) and
-//! the caller turns it into an event. Times are caller-supplied nanoseconds.
+//! the caller turns it into an event. Time values use the shared monotonic
+//! nanosecond domain and are supplied by the caller.
 //! Upstream's re-entrant release loops become explicit iterators.
 const std = @import("std");
+const timestamp = @import("../events/timestamp.zig");
 const keyboard = @import("keyboard.zig");
 const Scancode = keyboard.Scancode;
 const Keycode = keyboard.Keycode;
@@ -55,7 +57,7 @@ pub const KeyInput = struct {
     /// Leave modifier state untouched (backends that track it themselves).
     ignore_modifiers: bool = false,
     /// Caller clock in nanoseconds, used for hardware-activity tracking.
-    now_ns: u64 = 0,
+    now_ns: timestamp.Timestamp = 0,
     focus: ?Focus = null,
 };
 
@@ -121,7 +123,7 @@ pub const KeyboardState = struct {
     }
 
     /// True while a hardware key was seen within Options.hardware_active_ns.
-    pub fn hardware_active(self: *const KeyboardState, now_ns: u64) bool {
+    pub fn hardware_active(self: *const KeyboardState, now_ns: timestamp.Timestamp) bool {
         const until = self.hardware_until_ns orelse return false;
         return now_ns < until;
     }
@@ -216,7 +218,7 @@ pub const KeyboardState = struct {
     /// key press, key release, Shift release as needed) into `out` and returns
     /// the filled prefix. Characters the keymap lacks are assigned a reserved
     /// scancode in the keymap, as upstream; that requires a keymap.
-    pub fn unicode_key(self: *KeyboardState, character: u21, now_ns: u64, out: *[4]KeyTransition) error{ OutOfMemory, NoKeymap }![]KeyTransition {
+    pub fn unicode_key(self: *KeyboardState, character: u21, now_ns: timestamp.Timestamp, out: *[4]KeyTransition) error{ OutOfMemory, NoKeymap }![]KeyTransition {
         const point: u32 = if (character == '\n') @backingInt(Keycode.@"return") else character;
         const key_value: Keycode = @fromBackingInt(point);
         var chord = if (self.keymap) |map| map.chord(key_value) else keyboard.default_chord(key_value);
@@ -246,7 +248,7 @@ pub const KeyboardState = struct {
     /// Iterates releases of keys held only by the auto-release source. Call
     /// once per frame, like SDL_ReleaseAutoReleaseKeys; it also expires the
     /// hardware-activity window.
-    pub fn release_autoreleased(self: *KeyboardState, now_ns: u64) Releases {
+    pub fn release_autoreleased(self: *KeyboardState, now_ns: timestamp.Timestamp) Releases {
         if (self.hardware_until_ns) |until| if (now_ns >= until) {
             self.hardware_until_ns = null;
         };
@@ -258,7 +260,7 @@ pub const KeyboardState = struct {
     /// Iterates releases of every pressed key (SDL_ResetKeyboard), for example
     /// when focus is lost.
     /// Releases are reported as hardware input at `now_ns`, as upstream.
-    pub fn reset(self: *KeyboardState, now_ns: u64) Releases {
+    pub fn reset(self: *KeyboardState, now_ns: timestamp.Timestamp) Releases {
         return .{ .state = self, .only_autorelease = false, .index = 0, .now_ns = now_ns };
     }
 
@@ -266,7 +268,7 @@ pub const KeyboardState = struct {
         state: *KeyboardState,
         only_autorelease: bool,
         index: usize,
-        now_ns: u64,
+        now_ns: timestamp.Timestamp,
 
         pub fn next(self: *Releases) ?KeyTransition {
             while (self.index < 512) {

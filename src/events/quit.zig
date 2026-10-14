@@ -72,10 +72,11 @@ pub const Signals = struct {
     }
 
     /// Reads every pending signal without blocking. Returns a `quit` event stamped
-    /// with `timestamp` when at least one SIGINT or SIGTERM was pending, and null
-    /// otherwise. Several signals give one event, as SDL's pending flag does. Queue
-    /// the result with `queue.Queue.send_app_event` (a quit is never a lifecycle kind).
-    pub fn poll(self: *Signals, timestamp: u64) ?event.Event {
+    /// with host monotonic nanoseconds in `timestamp` when at least one SIGINT or
+    /// SIGTERM was pending, and null otherwise. Several signals give one event,
+    /// as SDL's pending flag does. Queue the result with
+    /// `queue.Queue.send_app_event` (a quit is never a lifecycle kind).
+    pub fn poll(self: *Signals, timestamp: event.Timestamp) ?event.Event {
         var records: [8]linux.signalfd_siginfo = undefined;
         const bytes = std.mem.sliceAsBytes(records[0..]);
         var quit = false;

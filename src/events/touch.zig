@@ -41,11 +41,12 @@ pub const Finger = struct {
     pressure: f32,
 };
 
-/// One finger contact transition or motion. `viewport` supplies the window
+/// One finger contact transition or motion. `timestamp` is host monotonic
+/// nanoseconds. `viewport` supplies the window
 /// the coordinates refer to and its size for emulated pointer events; null
 /// means no window (no emulation, and the event reports `WindowId.none`).
 pub const Input = struct {
-    timestamp: u64 = 0,
+    timestamp: event.Timestamp = 0,
     touch_id: event.TouchId,
     finger_id: event.FingerId,
     viewport: ?mouse.Viewport = null,
@@ -303,7 +304,7 @@ pub const Touches = struct {
 /// viewport, span and focus are also reported as -1.
 pub fn pinch(
     kind: event.PinchKind,
-    timestamp: u64,
+    timestamp: event.Timestamp,
     viewport: ?mouse.Viewport,
     scale: f32,
     span_x: f32,
@@ -352,7 +353,7 @@ fn clamped_pixels(input: Input, vp: mouse.Viewport) struct { x: f32, y: f32 } {
 
 /// Left-button transition for emulated pointer input. The button index is a
 /// constant in range, so `InvalidButton` cannot occur.
-fn press_left(m: *mouse.Mouse, timestamp: u64, down: bool) error{OutOfMemory}!?event.Event {
+fn press_left(m: *mouse.Mouse, timestamp: event.Timestamp, down: bool) error{OutOfMemory}!?event.Event {
     return m.button(timestamp, .touch, mouse.button.left, down, null) catch |err| switch (err) {
         error.OutOfMemory => error.OutOfMemory,
         error.InvalidButton => unreachable,

@@ -7,8 +7,8 @@
 //! - No cursors, windows, global mouse list or hint callbacks. The caller passes
 //!   `Options` at init and a `Viewport` per motion call (window size and an
 //!   optional confine rectangle). Focus is set explicitly with `set_focus`.
-//! - Click counting uses the caller's event timestamps (nanoseconds) rather than
-//!   SDL_GetTicks, so sequences replay identically.
+//! - Click counting uses caller-supplied monotonic `event.Timestamp` values
+//!   rather than SDL_GetTicks, so sequences replay identically.
 //! - Buttons are one-based indices 1 to 32, the range of SDL_BUTTON_MASK.
 //!   Other indices are rejected with `error.InvalidButton`.
 //! - SDL's mouse-to-touch and touch-to-mouse emulation, pen emulation, warp
@@ -213,7 +213,7 @@ pub const Mouse = struct {
     /// the current mode.
     pub fn motion(
         self: *Mouse,
-        timestamp: u64,
+        timestamp: event.Timestamp,
         viewport: ?Viewport,
         mouse_id: event.MouseId,
         relative: bool,
@@ -307,7 +307,7 @@ pub const Mouse = struct {
     /// a new source cannot be recorded.
     pub fn button(
         self: *Mouse,
-        timestamp: u64,
+        timestamp: event.Timestamp,
         mouse_id: event.MouseId,
         button_index: u8,
         down: bool,
@@ -345,7 +345,7 @@ pub const Mouse = struct {
     /// reports whole ticks in `integer_x`/`integer_y`. Zero scrolls are dropped.
     pub fn wheel(
         self: *Mouse,
-        timestamp: u64,
+        timestamp: event.Timestamp,
         mouse_id: event.MouseId,
         input_x: f32,
         input_y: f32,
@@ -439,7 +439,7 @@ pub const Mouse = struct {
     /// it follows the previous press of the same button within the configured
     /// time and travel radius, and otherwise starts a new sequence at one. Releases
     /// report the current count.
-    fn count_click(self: *Mouse, source: *Source, button_index: u8, down: bool, timestamp: u64) u8 {
+    fn count_click(self: *Mouse, source: *Source, button_index: u8, down: bool, timestamp: event.Timestamp) u8 {
         const click = &source.clicks[button_index - 1];
         if (down) {
             const now_ms = timestamp / std.time.ns_per_ms;

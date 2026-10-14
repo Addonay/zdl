@@ -15,8 +15,9 @@
 //! - Touch names are borrowed from the caller's `touch.Touches` and follow its lifetime.
 //!
 //! Events: SDL pushes its added/removed events itself. Here `add_*` and `remove_*`
-//! return the device event for the caller to publish, stamped with the caller's
-//! timestamp. `deinit` tears the lists down silently, as SDL's quit paths do.
+//! return the device event for the caller to publish, stamped with a caller
+//! supplied monotonic nanosecond timestamp. `deinit` tears the lists down
+//! silently, as SDL's quit paths do.
 //!
 //! Deliberate differences from SDL:
 //! - Lists are returned as slices in registration order. SDL returns malloc'd,
@@ -135,7 +136,7 @@ pub const Registry = struct {
     /// when the keyboard was already registered (SDL then pushes nothing).
     pub fn add_keyboard(
         self: *Registry,
-        timestamp: u64,
+        timestamp: event.Timestamp,
         id: event.KeyboardId,
         name: ?[]const u8,
     ) error{OutOfMemory}!?event.Event {
@@ -145,7 +146,7 @@ pub const Registry = struct {
     }
 
     /// SDL_RemoveKeyboard. Returns the removed event, or null for an unknown id.
-    pub fn remove_keyboard(self: *Registry, timestamp: u64, id: event.KeyboardId) ?event.Event {
+    pub fn remove_keyboard(self: *Registry, timestamp: event.Timestamp, id: event.KeyboardId) ?event.Event {
         if (!self.keyboards.remove(self.allocator, id)) return null;
         return .{ .keyboard_device = .{ .kind = .removed, .timestamp = timestamp, .keyboard_id = id } };
     }
@@ -166,7 +167,7 @@ pub const Registry = struct {
     /// the mouse was already registered. The merged id `global` cannot be added.
     pub fn add_mouse(
         self: *Registry,
-        timestamp: u64,
+        timestamp: event.Timestamp,
         id: event.MouseId,
         name: ?[]const u8,
     ) error{OutOfMemory}!?event.Event {
@@ -176,7 +177,7 @@ pub const Registry = struct {
     }
 
     /// SDL_RemoveMouse. Returns the removed event, or null for an unknown id.
-    pub fn remove_mouse(self: *Registry, timestamp: u64, id: event.MouseId) ?event.Event {
+    pub fn remove_mouse(self: *Registry, timestamp: event.Timestamp, id: event.MouseId) ?event.Event {
         if (!self.mice.remove(self.allocator, id)) return null;
         return .{ .mouse_device = .{ .kind = .removed, .timestamp = timestamp, .mouse_id = id } };
     }

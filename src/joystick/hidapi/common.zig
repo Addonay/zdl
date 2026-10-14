@@ -17,8 +17,11 @@ const std = @import("std");
 const hidraw = @import("../../hid/hidraw.zig");
 const gamepad = @import("../gamepad.zig");
 const joystick = @import("../joystick.zig");
+const timestamp = @import("../../events/timestamp.zig");
 
 pub const Allocator = std.mem.Allocator;
+/// Nanoseconds in the host monotonic clock domain.
+pub const Timestamp = joystick.Timestamp;
 
 /// Gamepad button numbers used as raw joystick button indices (SDL_GamepadButton).
 pub const button = struct {
@@ -169,8 +172,10 @@ pub const State = struct {
     accel: [3]f32 = @splat(0),
     gyro_rate_hz: f32 = 0,
     accel_rate_hz: f32 = 0,
-    /// Sensor timestamp in nanoseconds, from the device's own clock.
-    sensor_timestamp_ns: u64 = 0,
+    /// Sensor sample timestamp rebased to the host monotonic clock.
+    sensor_timestamp_ns: timestamp.Timestamp = 0,
+    /// Device sensor-clock offset used to rebase sample times.
+    sensor_clock: timestamp.SourceClock = .{},
     battery: PowerState = .unknown,
     battery_percent: u8 = 0,
 
@@ -259,9 +264,9 @@ pub const DeviceEvent = union(enum) {
     removed,
     slot_added: u8,
     slot_removed: u8,
-    touchpad: struct { timestamp: u64, touchpad: u8, finger: u8, down: bool, x: f32, y: f32, pressure: f32 },
-    sensor: struct { timestamp: u64, sensor: Sensor, data: [3]f32, sensor_timestamp_ns: u64 },
-    battery: struct { timestamp: u64, state: PowerState, percent: u8 },
+    touchpad: struct { timestamp: joystick.Timestamp, touchpad: u8, finger: u8, down: bool, x: f32, y: f32, pressure: f32 },
+    sensor: struct { timestamp: joystick.Timestamp, sensor: Sensor, data: [3]f32, sensor_timestamp_ns: timestamp.Timestamp },
+    battery: struct { timestamp: joystick.Timestamp, state: PowerState, percent: u8 },
 };
 
 /// Events produced by one update pass. The caller owns both lists and clears
@@ -284,7 +289,7 @@ pub const Updates = struct {
 };
 
 /// Sink a driver writes one packet's input into. Each method corresponds to an
-/// SDL_SendJoystick* call and carries the packet timestamp (nanoseconds).
+/// SDL_SendJoystick* call and carries the host monotonic packet timestamp.
 /// `joystick` is null while the device is not connected; then every method is a
 /// no-op, as SDL ignores SDL_SendJoystick* calls for a NULL joystick.
 pub const Output = struct {
@@ -292,7 +297,7 @@ pub const Output = struct {
     joystick: ?*joystick.Joystick,
     updates: *Updates,
     state: *State,
-    timestamp: u64,
+    timestamp: joystick.Timestamp,
 
     /// A copy of this sink that writes to `js` instead, for drivers that host
     /// several joysticks (one per slot). Null makes every write a no-op.
@@ -333,20 +338,21 @@ pub const Output = struct {
         } });
     }
 
-    /// Records one three-axis sensor sample. `sensor_timestamp_ns` is the
-    /// device's clock, which can differ from the host timestamp.
-    pub fn sensor(self: *Output, kind: Sensor, data: [3]f32, sensor_timestamp_ns: u64) Allocator.Error!void {
+    /// Records one three-axis sample. The driver's nanosecond clock is rebased
+    /// onto the host monotonic domain before it is exposed in state or events.
+    pub fn sensor(self: *Output, kind: Sensor, data: [3]f32, sensor_clock_ns: u64) Allocator.Error!void {
         if (self.joystick == null) return;
+        const sample_timestamp = self.state.sensor_clock.rebase(sensor_clock_ns, self.timestamp);
         switch (kind) {
             .gyro => self.state.gyro = data,
             .accel => self.state.accel = data,
         }
-        self.state.sensor_timestamp_ns = sensor_timestamp_ns;
+        self.state.sensor_timestamp_ns = sample_timestamp;
         try self.updates.device.append(self.allocator, .{ .sensor = .{
             .timestamp = self.timestamp,
             .sensor = kind,
             .data = data,
-            .sensor_timestamp_ns = sensor_timestamp_ns,
+            .sensor_timestamp_ns = sample_timestamp,
         } });
     }
 

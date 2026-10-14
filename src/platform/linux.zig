@@ -21,7 +21,13 @@
 //!   Consume events before pumping again.
 //!
 //! Clock: every event timestamp comes from the `std.Io` monotonic clock passed
-//! in at `open`, in nanoseconds. Backend timestamps (milliseconds) are not used.
+//! in at `open`, in nanoseconds. X server times and Wayland millisecond times
+//! remain protocol metadata in their backend events; the Linux platform replaces
+//! them with the current monotonic timestamp when it creates `events.Event`s.
+//!
+//! Payloads: `emit` copies every event slice into platform-owned payload storage.
+//! Those borrowed payloads remain valid until the next `pump` after the event
+//! queue has drained. Queues and event values do not own those slices.
 //!
 //! Window state: on X11 the window manager is the authority for maximized,
 //! minimized and fullscreen. Requests are sent and the change is published when
@@ -53,6 +59,7 @@
 //!   uninstalls it; a pending SIGINT or SIGTERM becomes a quit event on the next pump.
 const std = @import("std");
 const event = @import("../events/event.zig");
+const payload = @import("../events/payload.zig");
 const queue = @import("../events/queue.zig");
 const mouse = @import("../events/mouse.zig");
 const touch = @import("../events/touch.zig");
@@ -306,8 +313,8 @@ pub const Platform = struct {
     /// reset when a drop completes.
     drop_x: f32 = 0,
     drop_y: f32 = 0,
-    /// Event text copied out of backend storage, freed once the queue drains.
-    texts: std.ArrayList([]u8) = .empty,
+    /// Copies of all strings and nested lists referenced by queued event values.
+    payloads: payload.Store,
     displays_list: std.ArrayList(DisplayEntry) = .empty,
     primary_display: usize = 0,
     /// The X11 output mode to restore when the exclusive fullscreen ends.
@@ -336,6 +343,7 @@ pub const Platform = struct {
             .touches = touch.Touches.init(allocator),
             .pens = pen.Pens.init(allocator),
             .events = queue.Queue(void).init(allocator, .{ .max_events = options.max_events }),
+            .payloads = payload.Store.init(allocator),
             .signals = options.signals,
         };
         errdefer self.allocator.destroy(self);
@@ -373,8 +381,7 @@ pub const Platform = struct {
         self.records.deinit(self.allocator);
         self.graphics.deinit(self.allocator);
         if (self.x11) |session| self.restore_x11_mode(session) catch {};
-        for (self.texts.items) |text| self.allocator.free(text);
-        self.texts.deinit(self.allocator);
+        self.payloads.deinit();
         for (self.displays_list.items) |*entry| entry.deinit(self.allocator);
         self.displays_list.deinit(self.allocator);
         self.touches.deinit();
@@ -394,9 +401,8 @@ pub const Platform = struct {
     }
 
     /// Monotonic time in nanoseconds from the clock passed to `open`.
-    pub fn now_ns(self: *const Platform) u64 {
-        const ns = std.Io.Clock.awake.now(self.io).toNanoseconds();
-        return std.math.cast(u64, ns) orelse 0;
+    pub fn now_ns(self: *const Platform) event.Timestamp {
+        return event.now_ns(self.io);
     }
 
     /// Displays as last reported by the backend. Re-read after a display event.
@@ -414,8 +420,8 @@ pub const Platform = struct {
         return self.events.len();
     }
 
-    /// Takes the oldest pending event. Text inside it stays valid until the
-    /// next `pump` that finds the queue empty.
+    /// Takes the oldest pending event. Borrowed payloads stay valid until the
+    /// next `pump` call after the event queue has drained.
     pub fn next_event(self: *Platform) ?event.Event {
         var out: [1]event.Event = undefined;
         if (self.events.get(&out, 0, std.math.maxInt(u32)) == 0) return null;
@@ -577,9 +583,9 @@ pub const Platform = struct {
     }
 
     /// Reads every event the backends have, translates it and queues it. Never
-    /// waits. Frees event text from the previous drain when the queue is empty.
+    /// waits. Frees payload storage from the previous drain when the queue is empty.
     pub fn pump(self: *Platform) Error!void {
-        if (self.events.len() == 0) self.clear_texts();
+        if (self.events.len() == 0) self.clear_payloads();
         if (self.x11) |session| try x11_backend.pump(self, session);
         for (self.records.items) |record| switch (record.native) {
             .wayland => |*window| {
@@ -633,23 +639,20 @@ pub const Platform = struct {
         return self.events.len() > 0;
     }
 
-    fn clear_texts(self: *Platform) void {
-        for (self.texts.items) |text| self.allocator.free(text);
-        self.texts.clearRetainingCapacity();
+    fn clear_payloads(self: *Platform) void {
+        self.payloads.clear();
     }
 
     /// Copies text into platform storage so an event can borrow it.
     pub fn copy_text(self: *Platform, text: []const u8) Error![]const u8 {
-        const copy = try self.allocator.dupe(u8, text);
-        errdefer self.allocator.free(copy);
-        try self.texts.append(self.allocator, copy);
-        return copy;
+        return self.payloads.copy_text(text);
     }
 
     /// Queues an event, dropping it silently when the queue rejects it by filter
-    /// or type enablement (see `queue.Queue.push`).
+    /// or type enablement (see `queue.Queue.push`). Borrowed payloads are copied
+    /// before queue dispatch and live through the next pump after the queue drains.
     pub fn emit(self: *Platform, ev: event.Event) Error!void {
-        _ = try self.events.push(ev);
+        _ = try self.events.push(try self.payloads.copy_event(ev));
     }
 
     /// Queues the window event that `window_state` decided to publish, stamped
@@ -677,14 +680,13 @@ pub const Platform = struct {
             self.drop_x = x;
             self.drop_y = y;
         }
-        const copy: ?[]const u8 = if (data) |text| try self.copy_text(text) else null;
         try self.emit(.{ .drop = .{
             .kind = kind,
             .timestamp = self.now_ns(),
             .window_id = window_id,
             .x = self.drop_x,
             .y = self.drop_y,
-            .data = copy,
+            .data = data,
         } });
         if (kind == .complete) {
             if (record) |found| found.dropping = false;
@@ -858,15 +860,13 @@ pub const Platform = struct {
     /// Committed text input for a window.
     pub fn text_input_event(self: *Platform, window_id: event.WindowId, text: []const u8) Error!void {
         if (text.len == 0) return;
-        const copy = try self.copy_text(text);
-        try self.emit(.{ .text_input = .{ .timestamp = self.now_ns(), .window_id = window_id, .text = copy } });
+        try self.emit(.{ .text_input = .{ .timestamp = self.now_ns(), .window_id = window_id, .text = text } });
     }
 
     /// Input-method composition for a window: `start` is the caret and `length`
     /// the selected span, both in UTF-8 bytes.
     pub fn text_editing_event(self: *Platform, window_id: event.WindowId, text: []const u8, start: i32, length: i32) Error!void {
-        const copy = try self.copy_text(text);
-        try self.emit(.{ .text_editing = .{ .timestamp = self.now_ns(), .window_id = window_id, .text = copy, .start = start, .length = length } });
+        try self.emit(.{ .text_editing = .{ .timestamp = self.now_ns(), .window_id = window_id, .text = text, .start = start, .length = length } });
     }
 
     /// Touch input for a finger on the platform's touch device. Coordinates are

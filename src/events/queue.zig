@@ -5,8 +5,9 @@
 //!
 //! Ownership and synchronization:
 //! - A `Queue` is an ordinary value created with `init` and released with
-//!   `deinit`. There is no global queue. Pending events are copied into the
-//!   queue's own storage, but borrowed text inside them (see event.zig) is not.
+//!   `deinit`. There is no global queue. Pending events are shallow-copied into
+//!   the queue's own storage; payload slices still borrow from their producer
+//!   and remain valid only through that producer's next pump/poll call.
 //! - Not synchronized. The owner serializes all calls, for example with a
 //!   `std.Io.Mutex` held around each call when producers and consumers run on
 //!   different threads.
@@ -17,8 +18,9 @@
 //!   from inside a callback is not supported.
 //!
 //! Differences from SDL:
-//! - Timestamps are not stamped on push. The caller supplies them (see
-//!   event.zig). The queue never reads a clock and never pumps input.
+//! - Timestamps are not stamped on push. The caller supplies nanoseconds in the
+//!   shared monotonic clock domain (see `event.Timestamp`). The queue never
+//!   reads a clock and never pumps input.
 //! - Producers in this library return events rather than pushing them, so the
 //!   enablement check is applied by `push`. This drops a disabled type on the
 //!   way in, which is the observable effect of SDL_SetEventEnabled.
@@ -26,6 +28,7 @@
 //!   within one queue only (`register_user_events`).
 const std = @import("std");
 const event = @import("event.zig");
+const payload = @import("payload.zig");
 
 /// Default cap on pending events, matching SDL_MAX_QUEUED_EVENTS.
 pub const default_max_events = 65535;
@@ -335,4 +338,21 @@ pub fn Queue(comptime Context: type) type {
 
 fn in_range(code: u32, min_code: u32, max_code: u32) bool {
     return min_code <= code and code <= max_code;
+}
+
+test "queue shallow-copies payloads backed by producer storage" {
+    var store = payload.Store.init(std.testing.allocator);
+    defer store.deinit();
+    var queue = Queue(void).init(std.testing.allocator, .{});
+    defer queue.deinit();
+
+    const source = event.Event{ .text_input = .{ .text = "queued" } };
+    const stored = try store.copy_event(source);
+    try std.testing.expect(try queue.push(stored));
+
+    var out: [1]event.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), queue.get(&out, 0, std.math.maxInt(u32)));
+    try std.testing.expect(out[0].text_input.text.ptr == stored.text_input.text.ptr);
+    try std.testing.expectEqualStrings("queued", out[0].text_input.text);
+    store.clear();
 }

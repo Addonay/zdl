@@ -20,13 +20,17 @@
 //! Otherwise the buffer uses an integer wl_surface buffer scale: the largest
 //! scale of any bound output.
 //!
-//! Lifetime: `Event.keyboard_keymap` borrows a read-only mapping that stays valid
-//! until the next keymap event or `deinit`. Text payloads (`text_commit`,
-//! `text_preedit`, `selection`-related strings) borrow window storage that is
-//! reclaimed only when the event queue is empty at the start of a later
-//! `dispatch`, so consume events before dispatching again. Events are FIFO;
-//! `poll_event` returns null when empty. The window keeps its libwayland state
-//! behind heap pointers, so `open`'s return value may be moved freely.
+//! Event payloads that borrow memory (keymap and text) point into the window's
+//! event payload store. They remain valid until the next `dispatch` after its
+//! event queue has been drained. Copy them before that boundary if they need to
+//! live longer. Events are FIFO; `poll_event` returns null when empty. The window
+//! keeps its libwayland state behind heap pointers, so `open`'s return value may
+//! be moved freely.
+//!
+//! Timestamp fields named `time_ms` or `time_us` preserve their Wayland wire
+//! units for protocol-specific grouping and animation. The Linux platform
+//! replaces those values with its monotonic nanosecond clock when it creates
+//! `events.Event`s; they are never copied into public event timestamps.
 //!
 //! Cursors (wp_cursor_shape_v1 when offered, else the XCursor theme through
 //! libwayland-cursor): see `cursor.zig`. Relative mouse mode uses a persistent
@@ -379,7 +383,8 @@ pub const Event = union(enum) {
     frame_done,
     /// Preferred scale changed; re-query `buffer_size`.
     scale_changed,
-    /// Borrowed XKB keymap text (xkb_v1). Valid until the next keymap event or deinit.
+    /// Borrowed XKB keymap text (xkb_v1), valid until the next dispatch after
+    /// this window's event queue has been drained.
     keyboard_keymap: []const u8,
     keyboard_focus: bool,
     key: Key,
@@ -1853,7 +1858,10 @@ pub const Window = struct {
                 } else {
                     _ = linux.close(map.fd);
                 }
-                if (self.keymap) |bytes| try self.push(.{ .keyboard_keymap = bytes });
+                if (self.keymap) |bytes| {
+                    const copy = try self.allocator.dupe(u8, bytes);
+                    try self.push(.{ .keyboard_keymap = try self.adopt_text(copy) });
+                }
             },
             .keyboard_enter => |serial| {
                 self.keyboard_serial = serial;

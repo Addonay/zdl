@@ -82,22 +82,22 @@ pub fn Virtual(comptime Owner: type) type {
         }
 
         /// Sets an axis value. See `joystick.Joystick.set_axis`.
-        pub fn set_axis(self: *Self, out: *std.ArrayList(joystick.Change), timestamp: u64, index: usize, value: i16) std.mem.Allocator.Error!void {
+        pub fn set_axis(self: *Self, out: *std.ArrayList(joystick.Change), timestamp: joystick.Timestamp, index: usize, value: i16) std.mem.Allocator.Error!void {
             try self.state.set_axis(self.allocator, out, timestamp, index, value);
         }
 
         /// Sets a button state. See `joystick.Joystick.set_button`.
-        pub fn set_button(self: *Self, out: *std.ArrayList(joystick.Change), timestamp: u64, index: usize, down: bool) std.mem.Allocator.Error!void {
+        pub fn set_button(self: *Self, out: *std.ArrayList(joystick.Change), timestamp: joystick.Timestamp, index: usize, down: bool) std.mem.Allocator.Error!void {
             try self.state.set_button(self.allocator, out, timestamp, index, down);
         }
 
         /// Sets a hat position. See `joystick.Joystick.set_hat`.
-        pub fn set_hat(self: *Self, out: *std.ArrayList(joystick.Change), timestamp: u64, index: usize, value: joystick.Hat) std.mem.Allocator.Error!void {
+        pub fn set_hat(self: *Self, out: *std.ArrayList(joystick.Change), timestamp: joystick.Timestamp, index: usize, value: joystick.Hat) std.mem.Allocator.Error!void {
             try self.state.set_hat(self.allocator, out, timestamp, index, value);
         }
 
         /// Adds relative ball motion. See `joystick.Joystick.set_ball`.
-        pub fn set_ball(self: *Self, out: *std.ArrayList(joystick.Change), timestamp: u64, index: usize, dx: i16, dy: i16) std.mem.Allocator.Error!void {
+        pub fn set_ball(self: *Self, out: *std.ArrayList(joystick.Change), timestamp: joystick.Timestamp, index: usize, dx: i16, dy: i16) std.mem.Allocator.Error!void {
             try self.state.set_ball(self.allocator, out, timestamp, index, dx, dy);
         }
 

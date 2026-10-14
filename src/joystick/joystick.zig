@@ -11,8 +11,8 @@
 //! into a caller-owned `std.ArrayList(Change)`; the model never keeps a queue.
 //!
 //! Numeric conventions: axes are `i16` in the SDL range `[axis_min, axis_max]`
-//! (-32768..32767). Timestamps are nanoseconds on the same clock the input source
-//! reports; a zero timestamp is a programming error (SDL asserts on it).
+//! (-32768..32767). Change timestamps use `Timestamp` in the host monotonic
+//! domain; a zero timestamp is a programming error (SDL asserts on it).
 //!
 //! Deliberate differences from SDL:
 //! - SDL keeps one global "keyboard focus / background events" flag. Here each
@@ -22,9 +22,13 @@
 //! - Events are appended to a caller list instead of being pushed onto SDL's
 //!   global event queue.
 const std = @import("std");
+const event_time = @import("../events/timestamp.zig");
 const guid_mod = @import("../core/guid.zig");
 const controller_type = @import("controller_type.zig");
 const controller_table = @import("controller_table.zig");
+
+/// Nanoseconds in the host monotonic clock domain, used by joystick changes.
+pub const Timestamp = event_time.Timestamp;
 
 pub const Guid = guid_mod.Guid;
 pub const ControllerType = controller_type.ControllerType;
@@ -99,7 +103,7 @@ pub const Ball = struct {
 
 /// One input change with the timestamp of the source sample.
 pub const Change = struct {
-    timestamp: u64,
+    timestamp: Timestamp,
     event: Event,
 };
 
@@ -218,7 +222,7 @@ pub const Joystick = struct {
         self: *Joystick,
         allocator: std.mem.Allocator,
         out: *std.ArrayList(Change),
-        timestamp: u64,
+        timestamp: Timestamp,
         index: usize,
         value: i16,
     ) std.mem.Allocator.Error!void {
@@ -274,7 +278,7 @@ pub const Joystick = struct {
         self: *Joystick,
         allocator: std.mem.Allocator,
         out: *std.ArrayList(Change),
-        timestamp: u64,
+        timestamp: Timestamp,
         index: usize,
         value: Hat,
     ) std.mem.Allocator.Error!void {
@@ -297,7 +301,7 @@ pub const Joystick = struct {
         self: *Joystick,
         allocator: std.mem.Allocator,
         out: *std.ArrayList(Change),
-        timestamp: u64,
+        timestamp: Timestamp,
         index: usize,
         down: bool,
     ) std.mem.Allocator.Error!void {
@@ -329,7 +333,7 @@ pub const Joystick = struct {
         self: *Joystick,
         allocator: std.mem.Allocator,
         out: *std.ArrayList(Change),
-        timestamp: u64,
+        timestamp: Timestamp,
         index: usize,
         dx: i16,
         dy: i16,
@@ -353,7 +357,7 @@ pub const Joystick = struct {
         self: *Joystick,
         allocator: std.mem.Allocator,
         out: *std.ArrayList(Change),
-        timestamp: u64,
+        timestamp: Timestamp,
     ) std.mem.Allocator.Error!void {
         for (self.axes, 0..) |axis, i| {
             if (axis.has_initial_value) try self.set_axis(allocator, out, timestamp, i, axis.zero);

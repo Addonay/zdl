@@ -1,6 +1,8 @@
 //! XInput2 (libXi, loaded at runtime): raw relative motion for relative pointer
 //! modes, touch events with their source device ids, and smooth scrolling from
 //! per-device scroll valuators. SDL_x11xinput2.c is the reference.
+//! `server_time_ms` fields are raw X server times for protocol correlation; the
+//! Linux platform replaces them with its monotonic clock for public events.
 //!
 //! Setup: `enable` checks the extension and protocol version (2.0 minimum,
 //! 2.2 for touch). Selection is explicit: `select_window` picks motion and touch
@@ -49,7 +51,7 @@ pub const Touch = struct {
     /// Touch id, unique among the touches currently down on that device.
     finger: u32,
     position: geometry.Point(f32),
-    timestamp: u32,
+    server_time_ms: u32,
 };
 
 /// Unaccelerated relative motion from one device, in device units. Only
@@ -58,7 +60,7 @@ pub const RawMotion = struct {
     device: i32,
     dx: f64,
     dy: f64,
-    timestamp: u32,
+    server_time_ms: u32,
 };
 
 /// Smooth scroll deltas from one device's scroll valuators, in the same
@@ -67,7 +69,7 @@ pub const SmoothScroll = struct {
     device: i32,
     x: f32,
     y: f32,
-    timestamp: u32,
+    server_time_ms: u32,
 };
 
 /// Events selected on one window by `select_window`.
@@ -255,7 +257,7 @@ fn motion(connection: *window.Connection, state: *State, data: *const xlib.XIDev
         return .{ .window = target, .payload = .{ .motion = .{
             .position = .{ .x = @intFromFloat(data.event_x), .y = @intFromFloat(data.event_y) },
             .modifiers = connection.modifiers_for_state(@bitCast(data.mods.effective)),
-            .timestamp = @truncate(data.time),
+            .server_time_ms = @truncate(data.time),
         } } };
     }
     // Pen samples arrive from the tablet's own device (deviceid equal to sourceid).
@@ -277,7 +279,7 @@ fn pen_sample(data: *const xlib.XIDeviceEvent, pen: Pen) window.Event {
         .position = .{ .x = @floatCast(data.event_x), .y = @floatCast(data.event_y) },
         .pressure = pressure,
         .tilt = .{ .x = tilt_x, .y = tilt_y },
-        .timestamp = @truncate(data.time),
+        .server_time_ms = @truncate(data.time),
     } } };
 }
 
@@ -332,7 +334,7 @@ fn touch(data: *const xlib.XIDeviceEvent, phase: TouchPhase) window.Event {
         .device = data.sourceid,
         .finger = @bitCast(data.detail),
         .position = .{ .x = @floatCast(data.event_x), .y = @floatCast(data.event_y) },
-        .timestamp = @truncate(data.time),
+        .server_time_ms = @truncate(data.time),
     } } };
 }
 
@@ -363,7 +365,7 @@ fn raw_motion(connection: *window.Connection, state: *State, data: *const xlib.X
         .device = data.sourceid,
         .dx = deltas[0],
         .dy = deltas[1],
-        .timestamp = @truncate(data.time),
+        .server_time_ms = @truncate(data.time),
     } } };
 }
 
@@ -398,7 +400,7 @@ fn scroll(connection: *window.Connection, state: *State, data: *const xlib.XIDev
         .device = data.sourceid,
         .x = @floatCast(x),
         .y = @floatCast(y),
-        .timestamp = @truncate(data.time),
+        .server_time_ms = @truncate(data.time),
     } } };
 }
 
