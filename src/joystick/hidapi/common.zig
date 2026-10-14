@@ -412,13 +412,13 @@ pub const TestSink = struct {
     }
 
     /// An output that writes to the fixture's joystick. Timestamps must be nonzero.
-    pub fn output(self: *TestSink, timestamp: u64) Output {
+    pub fn output(self: *TestSink, time_ns: u64) Output {
         return .{
             .allocator = self.allocator,
             .joystick = &self.js,
             .updates = &self.updates,
             .state = &self.state,
-            .timestamp = timestamp,
+            .timestamp = time_ns,
         };
     }
 };
