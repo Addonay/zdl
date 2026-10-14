@@ -3,5 +3,6 @@
 comptime {
     _ = @import("video/geometry_test.zig");
     _ = @import("core/guid_test.zig");
+    _ = @import("video/pixels_test.zig");
     _ = @import("core/properties_test.zig");
 }

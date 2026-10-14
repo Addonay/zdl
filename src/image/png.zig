@@ -22,8 +22,9 @@ const std = @import("std");
 const pixels = @import("../video/pixels.zig");
 const surface = @import("../video/surface.zig");
 
-/// Decoder and encoder failures.
-pub const Error = std.mem.Allocator.Error || error{
+/// Decoder and encoder failures. Encoding reads a surface view, so its pixel
+/// access errors are included.
+pub const Error = std.mem.Allocator.Error || surface.Error || error{
     /// The bytes do not start with the 8-byte PNG signature.
     NotPng,
     /// Malformed chunk, header, filter or compressed stream.
@@ -471,13 +472,15 @@ pub fn encode(allocator: std.mem.Allocator, view: surface.View) Error![]u8 {
         offset += width * bpp;
     }
 
-    var compressed: std.Io.Writer.Allocating = .init(allocator);
+    // Compress requires a sink with real buffer capacity (it asserts > 8 bytes).
+    var compressed: std.Io.Writer.Allocating = try .initCapacity(allocator, 4096);
     defer compressed.deinit();
     const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
     defer allocator.free(window);
-    var compress = try std.compress.flate.Compress.init(&compressed.writer, window, .zlib, std.compress.flate.Compress.Options.default);
-    try compress.writer.writeAll(raw);
-    try compress.finish();
+    // The sink is an allocating writer, so a write failure means allocation failed.
+    var compress = std.compress.flate.Compress.init(&compressed.writer, window, .zlib, std.compress.flate.Compress.Options.default) catch return error.OutOfMemory;
+    compress.writer.writeAll(raw) catch return error.OutOfMemory;
+    compress.finish() catch return error.OutOfMemory;
     const idat = compressed.written();
 
     var out: std.ArrayList(u8) = .empty;
