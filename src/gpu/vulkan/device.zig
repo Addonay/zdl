@@ -50,6 +50,7 @@ const pass = @import("pass.zig");
 const pipeline = @import("pipeline.zig");
 const window = @import("window.zig");
 const debug = @import("debug.zig");
+const memory_ranges = @import("memory.zig");
 
 /// Failures from device, resource and swapchain operations. Validation errors
 /// come from `types.validate_texture_create_info`; `vk.Error` covers loader and
@@ -191,8 +192,8 @@ const Pending = struct {
 
 /// Vulkan objects destroyed by the deferred-release list.
 pub const Resource = union(enum) {
-    buffer: struct { handle: vk.Handle, memory: vk.Handle },
-    image: struct { handle: vk.Handle, view: vk.Handle, memory: vk.Handle },
+    buffer: struct { handle: vk.Handle, allocation: MemoryAllocation },
+    image: struct { handle: vk.Handle, view: vk.Handle, allocation: MemoryAllocation },
     image_view: vk.Handle,
     sampler: vk.Handle,
     shader: vk.Handle,
@@ -201,6 +202,36 @@ pub const Resource = union(enum) {
     pipeline_layout: vk.Handle,
     descriptor_set_layout: vk.Handle,
 };
+
+/// Separates buffers from optimal-tiled images in a block so neighboring
+/// bindings cannot violate `bufferImageGranularity` on devices that require it.
+pub const MemoryKind = enum { buffer, image };
+
+/// One Vulkan device-memory block and its currently free byte ranges.
+pub const MemoryBlock = struct {
+    memory: vk.Handle,
+    size: u64,
+    memory_type_index: u32,
+    kind: MemoryKind,
+    dedicated: bool,
+    free: memory_ranges.FreeList,
+};
+
+/// A suballocation held by a Vulkan resource backing. The block pointer remains
+/// stable until this allocation is released; resource release is deferred until
+/// the last GPU submission that references it has completed.
+pub const MemoryAllocation = struct {
+    block: *MemoryBlock,
+    offset: u64,
+    size: u64,
+
+    pub fn memory(self: MemoryAllocation) vk.Handle {
+        return self.block.memory;
+    }
+};
+
+const small_allocation_threshold: u64 = 2 * 1024 * 1024;
+const small_block_size: u64 = 16 * 1024 * 1024;
 
 /// Handle for a submitted command buffer. It is valid for waiting until the
 /// device that produced it is destroyed.
@@ -222,6 +253,8 @@ pub const Device = struct {
     queue_family: u32,
     command_pool: vk.Handle,
     memory: vk.PhysicalDeviceMemoryProperties,
+    /// Vulkan blocks, grouped by memory type and resource kind.
+    memory_blocks: std.ArrayList(*MemoryBlock) = .empty,
     limits: vk.PhysicalDeviceLimits,
     name_buf: [256]u8,
     extensions: DeviceExtensions,
@@ -358,6 +391,8 @@ pub const Device = struct {
         // The device is idle, so every deferred release is now safe.
         for (self.pending.items) |done| self.destroy_now(done.resource);
         self.pending.deinit(self.allocator);
+        for (self.memory_blocks.items) |block| self.destroy_memory_block(block);
+        self.memory_blocks.deinit(self.allocator);
         self.fns.vkDestroyCommandPool(self.device, self.command_pool, null);
         self.fns.vkDestroyDevice(self.device, null);
         self.instance_fns.vkDestroyInstance(self.instance, null);
@@ -495,17 +530,6 @@ pub const Device = struct {
         var handle: vk.Handle = 0;
         _ = try vk.check(self.fns.vkCreateBuffer(self.device, &info, null, &handle));
         return handle;
-    }
-
-    fn bind_buffer_memory(self: *Device, buffer: vk.Handle, class: MemoryClass) Error!vk.Handle {
-        var requirements: vk.MemoryRequirements = undefined;
-        self.fns.vkGetBufferMemoryRequirements(self.device, buffer, &requirements);
-        const memory = try self.allocate_memory(requirements, class);
-        _ = vk.check(self.fns.vkBindBufferMemory(self.device, buffer, memory, 0)) catch |err| {
-            self.fns.vkFreeMemory(self.device, memory, null);
-            return err;
-        };
-        return memory;
     }
 
     // -----------------------------------------------------------------------
@@ -692,27 +716,108 @@ pub const Device = struct {
     // Memory selection and retirement
     // -----------------------------------------------------------------------
 
-    /// Picks the memory type and allocates a dedicated block for `requirements`.
-    /// Candidates are tried in SDL's tier order; an out-of-memory result moves
-    /// on to the next candidate.
-    pub fn allocate_memory(self: *Device, requirements: vk.MemoryRequirements, class: MemoryClass) Error!vk.Handle {
+    /// Suballocates a Vulkan memory block using SDL's four-tier memory-type
+    /// preference. Small resources share 16 MiB blocks; resources larger than
+    /// SDL's 2 MiB small-allocation threshold receive their own allocation.
+    /// Buffers and images use separate blocks to honor buffer-image granularity.
+    pub fn allocate_memory(self: *Device, requirements: vk.MemoryRequirements, class: MemoryClass, kind: MemoryKind) Error!MemoryAllocation {
         const props = memory_properties(class);
         var candidates: [vk.VK_MAX_MEMORY_TYPES]u32 = undefined;
         const list = self.find_memory_types(requirements.memoryTypeBits, props, &candidates);
         if (list.len == 0) return error.NoMemoryType;
+        const map_alignment: u64 = if (props.required & vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT != 0)
+            @intCast(@max(self.limits.minMemoryMapAlignment, 1))
+        else
+            1;
+        const alignment = @max(requirements.alignment, map_alignment);
+        const dedicated = requirements.size > small_allocation_threshold;
+        const block_size = if (dedicated) requirements.size else small_block_size;
         for (list) |index| {
-            var alloc_info = std.mem.zeroes(vk.MemoryAllocateInfo);
-            alloc_info.sType = vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-            alloc_info.allocationSize = requirements.size;
-            alloc_info.memoryTypeIndex = index;
-            var memory: vk.Handle = 0;
-            _ = vk.check(self.fns.vkAllocateMemory(self.device, &alloc_info, null, &memory)) catch |err| switch (err) {
+            if (!dedicated) {
+                for (self.memory_blocks.items) |block| {
+                    if (block.dedicated or block.memory_type_index != index or block.kind != kind) continue;
+                    const offset = try block.free.allocate(requirements.size, alignment) orelse continue;
+                    return .{ .block = block, .offset = offset, .size = requirements.size };
+                }
+            }
+
+            const block = self.create_memory_block(index, kind, block_size, dedicated) catch |err| switch (err) {
                 error.OutOfDeviceMemory, error.OutOfHostMemory => continue,
                 else => return err,
             };
-            return memory;
+            const offset = block.free.allocate(requirements.size, alignment) catch |err| {
+                self.remove_memory_block(block);
+                self.destroy_memory_block(block);
+                return err;
+            } orelse {
+                self.remove_memory_block(block);
+                self.destroy_memory_block(block);
+                continue;
+            };
+            return .{ .block = block, .offset = offset, .size = requirements.size };
         }
         return error.OutOfDeviceMemory;
+    }
+
+    fn create_memory_block(self: *Device, memory_type_index: u32, kind: MemoryKind, size: u64, dedicated: bool) Error!*MemoryBlock {
+        var info = std.mem.zeroes(vk.MemoryAllocateInfo);
+        info.sType = vk.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        info.allocationSize = size;
+        info.memoryTypeIndex = memory_type_index;
+        var handle: vk.Handle = 0;
+        _ = try vk.check(self.fns.vkAllocateMemory(self.device, &info, null, &handle));
+        errdefer self.fns.vkFreeMemory(self.device, handle, null);
+
+        var free = try memory_ranges.FreeList.init(self.allocator, size);
+        errdefer free.deinit();
+        const block = try self.allocator.create(MemoryBlock);
+        errdefer self.allocator.destroy(block);
+        block.* = .{
+            .memory = handle,
+            .size = size,
+            .memory_type_index = memory_type_index,
+            .kind = kind,
+            .dedicated = dedicated,
+            .free = free,
+        };
+        try self.memory_blocks.append(self.allocator, block);
+        return block;
+    }
+
+    /// Returns a resource range after its Vulkan object has been destroyed.
+    /// An extra empty pooled block is released; one remains available for reuse.
+    pub fn release_memory(self: *Device, allocation: MemoryAllocation) void {
+        const block = allocation.block;
+        block.free.release(allocation.offset, allocation.size);
+        if (block.dedicated) {
+            self.remove_memory_block(block);
+            self.destroy_memory_block(block);
+            return;
+        }
+        if (block.free.live_allocations != 0) return;
+        for (self.memory_blocks.items) |other| {
+            if (other == block or other.dedicated) continue;
+            if (other.memory_type_index == block.memory_type_index and other.kind == block.kind and other.free.live_allocations == 0) {
+                self.remove_memory_block(block);
+                self.destroy_memory_block(block);
+                return;
+            }
+        }
+    }
+
+    fn remove_memory_block(self: *Device, block: *MemoryBlock) void {
+        for (self.memory_blocks.items, 0..) |candidate, index| {
+            if (candidate == block) {
+                _ = self.memory_blocks.swapRemove(index);
+                return;
+            }
+        }
+    }
+
+    fn destroy_memory_block(self: *Device, block: *MemoryBlock) void {
+        self.fns.vkFreeMemory(self.device, block.memory, null);
+        block.free.deinit();
+        self.allocator.destroy(block);
     }
 
     /// The four-pass SDL search: required+preferred+not-tolerable first, then
@@ -769,12 +874,12 @@ pub const Device = struct {
         switch (resource) {
             .buffer => |b| {
                 self.fns.vkDestroyBuffer(self.device, b.handle, null);
-                self.fns.vkFreeMemory(self.device, b.memory, null);
+                self.release_memory(b.allocation);
             },
             .image => |i| {
                 if (i.view != 0) self.fns.vkDestroyImageView(self.device, i.view, null);
                 self.fns.vkDestroyImage(self.device, i.handle, null);
-                self.fns.vkFreeMemory(self.device, i.memory, null);
+                self.release_memory(i.allocation);
             },
             .image_view => |v| self.fns.vkDestroyImageView(self.device, v, null),
             .sampler => |s| self.fns.vkDestroySampler(self.device, s, null),
@@ -896,7 +1001,7 @@ fn free_object(dev: *Device, backing: *ObjectBacking) void {
 /// use it. A backing with `refs > 0` is never written by a cycling write.
 pub const BufferBacking = struct {
     handle: vk.Handle,
-    memory: vk.Handle,
+    allocation: MemoryAllocation,
     refs: u32 = 0,
     /// Set when the owning container was released while `refs` was positive;
     /// the last `unref` frees the backing.
@@ -959,7 +1064,8 @@ pub const TransferBuffer = struct {
         const dev = self.buffer.device;
         if (cycle and self.buffer.active().refs > 0) try cycle_buffer(dev, self.buffer.container);
         var ptr: ?*anyopaque = null;
-        _ = try vk.check(dev.fns.vkMapMemory(dev.device, self.buffer.active().memory, 0, vk.VK_WHOLE_SIZE, 0, &ptr));
+        const allocation = self.buffer.active().allocation;
+        _ = try vk.check(dev.fns.vkMapMemory(dev.device, allocation.memory(), allocation.offset, allocation.size, 0, &ptr));
         self.mapped = true;
         const bytes: [*]u8 = @ptrCast(ptr orelse return error.MemoryMapFailed);
         return bytes[0..self.buffer.size];
@@ -967,7 +1073,7 @@ pub const TransferBuffer = struct {
 
     pub fn unmap(self: *TransferBuffer) void {
         if (!self.mapped) return;
-        self.buffer.device.fns.vkUnmapMemory(self.buffer.device.device, self.buffer.active().memory);
+        self.buffer.device.fns.vkUnmapMemory(self.buffer.device.device, self.buffer.active().allocation.memory());
         self.mapped = false;
     }
 
@@ -984,7 +1090,7 @@ pub const TransferBuffer = struct {
 pub const TextureBacking = struct {
     image: vk.Handle,
     view: vk.Handle,
-    memory: vk.Handle,
+    allocation: MemoryAllocation,
     /// Layout per subresource, indexed by `layer * num_levels + mip`.
     layouts: []i32,
     refs: u32 = 0,
@@ -1122,11 +1228,18 @@ pub fn unref(dev: *Device, ref: Ref) void {
 
 fn create_buffer_backing(dev: *Device, size: u32, usage: vk.Flags, class: MemoryClass) Error!*BufferBacking {
     const handle = try dev.create_buffer_handle(size, usage);
-    errdefer dev.fns.vkDestroyBuffer(dev.device, handle, null);
-    const memory = try dev.bind_buffer_memory(handle, class);
-    errdefer dev.fns.vkFreeMemory(dev.device, memory, null);
+    var allocation: ?MemoryAllocation = null;
+    errdefer {
+        dev.fns.vkDestroyBuffer(dev.device, handle, null);
+        if (allocation) |value| dev.release_memory(value);
+    }
+    var requirements: vk.MemoryRequirements = undefined;
+    dev.fns.vkGetBufferMemoryRequirements(dev.device, handle, &requirements);
+    allocation = try dev.allocate_memory(requirements, class, .buffer);
+    const memory = allocation.?;
+    _ = try vk.check(dev.fns.vkBindBufferMemory(dev.device, handle, memory.memory(), memory.offset));
     const backing = try dev.allocator.create(BufferBacking);
-    backing.* = .{ .handle = handle, .memory = memory };
+    backing.* = .{ .handle = handle, .allocation = memory };
     return backing;
 }
 
@@ -1141,7 +1254,7 @@ fn release_buffer_backing(dev: *Device, backing: *BufferBacking) void {
 }
 
 fn free_buffer_backing(dev: *Device, backing: *BufferBacking) void {
-    dev.retire(.{ .buffer = .{ .handle = backing.handle, .memory = backing.memory } });
+    dev.retire(.{ .buffer = .{ .handle = backing.handle, .allocation = backing.allocation } });
     dev.allocator.destroy(backing);
 }
 
@@ -1190,23 +1303,29 @@ fn create_texture_backing(dev: *Device, info: types.TextureCreateInfo, layers: u
 
     var image: vk.Handle = 0;
     _ = try vk.check(dev.fns.vkCreateImage(dev.device, &image_info, null, &image));
-    errdefer dev.fns.vkDestroyImage(dev.device, image, null);
+    var allocation: ?MemoryAllocation = null;
+    var view: ?vk.Handle = null;
+    var layouts: ?[]i32 = null;
+    errdefer {
+        if (layouts) |values| dev.allocator.free(values);
+        if (view) |handle| dev.fns.vkDestroyImageView(dev.device, handle, null);
+        dev.fns.vkDestroyImage(dev.device, image, null);
+        if (allocation) |value| dev.release_memory(value);
+    }
 
     var requirements: vk.MemoryRequirements = undefined;
     dev.fns.vkGetImageMemoryRequirements(dev.device, image, &requirements);
-    const memory = try dev.allocate_memory(requirements, .texture);
-    errdefer dev.fns.vkFreeMemory(dev.device, memory, null);
-    _ = try vk.check(dev.fns.vkBindImageMemory(dev.device, image, memory, 0));
+    allocation = try dev.allocate_memory(requirements, .texture, .image);
+    const memory = allocation.?;
+    _ = try vk.check(dev.fns.vkBindImageMemory(dev.device, image, memory.memory(), memory.offset));
 
-    const view = try dev.create_image_view(image, info.texture_type, tables.texture_format(info.format), aspect, info.num_levels, layers, tables.format_swizzle(info.format));
-    errdefer dev.fns.vkDestroyImageView(dev.device, view, null);
+    view = try dev.create_image_view(image, info.texture_type, tables.texture_format(info.format), aspect, info.num_levels, layers, tables.format_swizzle(info.format));
 
-    const layouts = try dev.allocator.alloc(i32, @as(usize, info.num_levels) * layers);
-    errdefer dev.allocator.free(layouts);
-    @memset(layouts, vk.VK_IMAGE_LAYOUT_UNDEFINED);
+    layouts = try dev.allocator.alloc(i32, @as(usize, info.num_levels) * layers);
+    @memset(layouts.?, vk.VK_IMAGE_LAYOUT_UNDEFINED);
 
     const backing = try dev.allocator.create(TextureBacking);
-    backing.* = .{ .image = image, .view = view, .memory = memory, .layouts = layouts, .owned = true };
+    backing.* = .{ .image = image, .view = view.?, .allocation = memory, .layouts = layouts.?, .owned = true };
     return backing;
 }
 
@@ -1223,7 +1342,7 @@ fn release_texture_backing(dev: *Device, backing: *TextureBacking) void {
 fn free_texture_backing(dev: *Device, backing: *TextureBacking) void {
     if (backing.owned) {
         pass.evict_image(dev, backing.image);
-        dev.retire(.{ .image = .{ .handle = backing.image, .view = backing.view, .memory = backing.memory } });
+        dev.retire(.{ .image = .{ .handle = backing.image, .view = backing.view, .allocation = backing.allocation } });
     } else if (backing.view != 0) {
         dev.retire(.{ .image_view = backing.view });
     }
@@ -1246,7 +1365,7 @@ fn wrap_swapchain_image(dev: *Device, image: vk.Handle, view: vk.Handle, info: t
     layouts[0] = vk.VK_IMAGE_LAYOUT_UNDEFINED;
     const backing = try dev.allocator.create(TextureBacking);
     errdefer dev.allocator.destroy(backing);
-    backing.* = .{ .image = image, .view = view, .memory = 0, .layouts = layouts, .owned = false };
+    backing.* = .{ .image = image, .view = view, .allocation = undefined, .layouts = layouts, .owned = false };
     const container = try dev.allocator.create(TextureContainer);
     errdefer dev.allocator.destroy(container);
     container.* = .{ .info = info, .aspect = vk.VK_IMAGE_ASPECT_COLOR_BIT, .layers = 1, .can_cycle = false, .active = backing };

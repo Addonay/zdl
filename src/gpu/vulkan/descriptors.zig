@@ -53,6 +53,7 @@ const max_compute_write_bindings = max_compute_write_textures + max_compute_writ
 pub const UniformBuffer = struct {
     buffer: vk.Handle,
     memory: vk.Handle,
+    allocation: device_mod.MemoryAllocation,
     mapped: [*]u8,
 };
 
@@ -251,25 +252,33 @@ pub fn create_uniform_buffer(dev: *Device) Error!UniformBuffer {
     info.sharingMode = vk.VK_SHARING_MODE_EXCLUSIVE;
     var buffer: vk.Handle = 0;
     _ = try vk.check(dev.fns.vkCreateBuffer(dev.device, &info, null, &buffer));
-    errdefer dev.fns.vkDestroyBuffer(dev.device, buffer, null);
+    var allocation: ?device_mod.MemoryAllocation = null;
+    var mapped = false;
+    errdefer {
+        if (mapped) dev.fns.vkUnmapMemory(dev.device, allocation.?.memory());
+        dev.fns.vkDestroyBuffer(dev.device, buffer, null);
+        if (allocation) |value| dev.release_memory(value);
+    }
 
     var requirements: vk.MemoryRequirements = undefined;
     dev.fns.vkGetBufferMemoryRequirements(dev.device, buffer, &requirements);
-    const memory = try dev.allocate_memory(requirements, .uniform_buffer);
-    errdefer dev.fns.vkFreeMemory(dev.device, memory, null);
-    _ = try vk.check(dev.fns.vkBindBufferMemory(dev.device, buffer, memory, 0));
+    allocation = try dev.allocate_memory(requirements, .uniform_buffer, .buffer);
+    const memory_allocation = allocation.?;
+    const memory = memory_allocation.memory();
+    _ = try vk.check(dev.fns.vkBindBufferMemory(dev.device, buffer, memory, memory_allocation.offset));
 
     var ptr: ?*anyopaque = null;
-    _ = try vk.check(dev.fns.vkMapMemory(dev.device, memory, 0, vk.VK_WHOLE_SIZE, 0, &ptr));
+    _ = try vk.check(dev.fns.vkMapMemory(dev.device, memory, memory_allocation.offset, memory_allocation.size, 0, &ptr));
+    mapped = true;
     const bytes: [*]u8 = @ptrCast(ptr orelse return error.MemoryMapFailed);
-    return .{ .buffer = buffer, .memory = memory, .mapped = bytes };
+    return .{ .buffer = buffer, .memory = memory, .allocation = memory_allocation, .mapped = bytes };
 }
 
 /// Destroys a uniform buffer and its memory. Only for buffers no submission uses.
 pub fn destroy_uniform_buffer(dev: *Device, buffer: UniformBuffer) void {
     dev.fns.vkUnmapMemory(dev.device, buffer.memory);
     dev.fns.vkDestroyBuffer(dev.device, buffer.buffer, null);
-    dev.fns.vkFreeMemory(dev.device, buffer.memory, null);
+    dev.release_memory(buffer.allocation);
 }
 
 /// Returns a uniform buffer for a command buffer, reusing a free one when possible.
