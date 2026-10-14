@@ -289,4 +289,5 @@ pub const image = struct {
 
 test {
     @import("std").testing.refAllDecls(@This());
+    _ = @import("tests.zig");
 }
