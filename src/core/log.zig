@@ -239,13 +239,22 @@ pub const Logger = struct {
     }
 
     /// SDL_ResetLogPriorities from explicit inputs: the SDL_LOGGING text (if any)
-    /// and whether `DEBUG_INVOCATION` requests debug output.
+    /// and whether `DEBUG_INVOCATION` requests debug output. Allocation failure
+    /// preserves the previous built-in, custom and default thresholds.
     pub fn reset(self: *Logger, logging: ?[]const u8, debug_invocation: bool) Allocator.Error!void {
-        self.custom_thresholds.clearRetainingCapacity();
-        self.thresholds = @splat(null);
+        // Parse into independent storage: observers swallow allocation errors,
+        // so failure must leave every previous category threshold intact.
+        var staged: Logger = .{ .allocator = self.allocator };
+        defer staged.deinit();
         var default: ?Threshold = null;
-        if (logging) |text| try self.parse(text, &default);
-        self.apply_defaults_with(default, debug_invocation);
+        if (logging) |text| try staged.parse(text, &default);
+        staged.apply_defaults_with(default, debug_invocation);
+
+        self.custom_thresholds.deinit(self.allocator);
+        self.custom_thresholds = staged.custom_thresholds;
+        staged.custom_thresholds = .empty;
+        self.thresholds = staged.thresholds;
+        self.default_threshold = staged.default_threshold;
     }
 
     fn apply_defaults(self: *Logger, debug_invocation: bool) void {
@@ -633,4 +642,26 @@ test "priority and category helpers" {
     try testing.expectEqualStrings("APP", Category.application.label());
     try testing.expectEqualStrings("RESERVED", (@as(Category, @fromBackingInt(@intCast(12)))).label());
     try testing.expectEqualStrings("CUSTOM", Category.custom(0).label());
+}
+
+test "failed logging reset preserves built-in custom and default thresholds" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var logger = Logger.init(failing.allocator());
+    defer logger.deinit();
+    logger.set_all(.critical);
+    try logger.set_threshold(.application, .trace);
+    try logger.set_threshold(Category.custom(3), .warn);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, logger.reset("app=debug,100=info", false));
+    try testing.expectEqual(Threshold.trace, logger.threshold(.application));
+    try testing.expectEqual(Threshold.warn, logger.threshold(Category.custom(3)));
+    try testing.expectEqual(Threshold.critical, logger.threshold(Category.custom(7)));
+
+    // The logger remains usable and successful replacement discards old custom
+    // overrides while retaining output and prefix configuration.
+    failing.fail_index = std.math.maxInt(usize);
+    try logger.reset("app=debug,100=info", false);
+    try testing.expectEqual(Threshold.debug, logger.threshold(.application));
+    try testing.expectEqual(Threshold.err, logger.threshold(Category.custom(3)));
+    try testing.expectEqual(Threshold.info, logger.threshold(@fromBackingInt(100)));
 }

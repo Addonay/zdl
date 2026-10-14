@@ -160,12 +160,18 @@ pub const Hints = struct {
         if (changed) {
             // Copy before touching state so allocation failure changes nothing.
             const owned: ?[]u8 = if (value) |text| try self.allocator.dupe(u8, text) else null;
+            errdefer if (owned) |text| self.allocator.free(text);
+            // `value` may borrow another hint an observer changes, and observers
+            // may replace this hint again. Keep an independent dispatch snapshot.
+            const notification: ?[]u8 = if (value) |text| try self.allocator.dupe(u8, text) else null;
+            defer if (notification) |text| self.allocator.free(text);
+            const stable_name = self.entries.getKey(name).?;
             const old = entry.value;
             entry.value = owned;
             entry.priority = priority;
             self.revision +%= 1;
             // `entry` may dangle if an observer inserts hints; do not touch it after.
-            self.notify(name, old, value);
+            self.notify(stable_name, old, notification);
             if (old) |text| self.allocator.free(text);
         } else {
             entry.priority = priority;
@@ -198,6 +204,7 @@ pub const Hints = struct {
 
     fn reset_known(self: *Hints, name: []const u8) Allocator.Error!void {
         const env = self.environment_value(name);
+        const stable_name = self.entries.getKey(name).?;
         const entry = self.entries.getPtr(name).?;
         const old = entry.value;
         // Detach first so observers read a consistent table.
@@ -205,7 +212,7 @@ pub const Hints = struct {
         entry.priority = .default;
         if (!optional_equal(old, env)) {
             self.revision +%= 1;
-            self.notify(name, old, env);
+            self.notify(stable_name, old, env);
         }
         if (old) |text| self.allocator.free(text);
     }
@@ -214,13 +221,20 @@ pub const Hints = struct {
     /// registration of the same pair, and calls it once with the current value.
     pub fn add_observer(self: *Hints, name: []const u8, observer: *Observer) Error!void {
         if (name.len == 0) return error.InvalidName;
-        self.remove_observer(name, observer);
         _ = try self.entry_for(name);
         const owned = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned);
-        try self.registrations.append(self.allocator, .{ .name = owned, .observer = observer });
-        const current = self.get(name);
-        observer.on_change(observer, name, current, current);
+        const current = if (self.get(name)) |value| try self.allocator.dupe(u8, value) else null;
+        defer if (current) |value| self.allocator.free(value);
+        // All fallible preparation precedes removal of an existing registration.
+        try self.registrations.ensureUnusedCapacity(self.allocator, 1);
+        self.remove_observer(owned, observer);
+        self.registrations.appendAssumeCapacity(.{ .name = owned, .observer = observer });
+        // Protect the registration name even if the initial callback removes
+        // itself, and protect its current-value snapshot from recursive sets.
+        self.dispatch_depth += 1;
+        observer.on_change(observer, owned, current, current);
+        self.finish_dispatch();
     }
 
     /// SDL_RemoveHintCallback. Safe to call from inside an observer.
@@ -266,6 +280,10 @@ pub const Hints = struct {
             if (!std.mem.eql(u8, registration.name, name)) continue;
             observer.on_change(observer, name, old, new);
         }
+        self.finish_dispatch();
+    }
+
+    fn finish_dispatch(self: *Hints) void {
         self.dispatch_depth -= 1;
         if (self.dispatch_depth == 0 and self.needs_compaction) {
             self.needs_compaction = false;
@@ -515,4 +533,71 @@ test "boolean and integer lookups use the effective value" {
     try testing.expect(!hints.get_boolean("B", true));
     _ = try hints.set("I", "12");
     try testing.expectEqual(@as(i32, 12), hints.get_integer("I", 0));
+}
+
+test "initial observer payloads survive self-removal and same-hint mutation" {
+    var hints = Hints.init(testing.allocator, null);
+    defer hints.deinit();
+    _ = try hints.set("H", "before");
+    const Reentrant = struct {
+        observer: Observer = .{ .on_change = change },
+        hints: *Hints,
+        valid: bool = false,
+        fn change(obs: *Observer, name: []const u8, old: ?[]const u8, new: ?[]const u8) void {
+            const self: *@This() = @fieldParentPtr("observer", obs);
+            self.hints.remove_observer(name, obs);
+            _ = self.hints.set(name, "after") catch unreachable;
+            self.valid = std.mem.eql(u8, name, "H") and
+                std.mem.eql(u8, old.?, "before") and std.mem.eql(u8, new.?, "before");
+        }
+    };
+    var observer: Reentrant = .{ .hints = &hints };
+    try hints.add_observer("H", &observer.observer);
+    try testing.expect(observer.valid);
+    try testing.expectEqualStrings("after", hints.get("H").?);
+    try testing.expectEqual(@as(usize, 0), hints.registrations.items.len);
+}
+
+test "notification payload survives mutation of the hint it was borrowed from" {
+    var hints = Hints.init(testing.allocator, null);
+    defer hints.deinit();
+    _ = try hints.set("SOURCE", "before");
+    const Reentrant = struct {
+        observer: Observer = .{ .on_change = change },
+        hints: *Hints,
+        armed: bool = false,
+        valid: bool = false,
+        fn change(obs: *Observer, _: []const u8, _: ?[]const u8, new: ?[]const u8) void {
+            const self: *@This() = @fieldParentPtr("observer", obs);
+            if (!self.armed) return;
+            self.armed = false;
+            _ = self.hints.set("SOURCE", "after") catch unreachable;
+            self.valid = std.mem.eql(u8, "before", new.?);
+        }
+    };
+    var observer: Reentrant = .{ .hints = &hints };
+    try hints.add_observer("DEST", &observer.observer);
+    observer.armed = true;
+    _ = try hints.set("DEST", hints.get("SOURCE"));
+    try testing.expect(observer.valid);
+}
+
+test "failed observer re-registration preserves its previous registration" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var hints = Hints.init(failing.allocator(), null);
+    defer hints.deinit();
+    _ = try hints.set("H", "before");
+    var observer: Recorder = .{};
+    try hints.add_observer("H", &observer.observer);
+    const before = observer.calls;
+    // Exercise failure copying either the name or the current-value snapshot.
+    for (0..2) |successful_allocations| {
+        failing.fail_index = failing.alloc_index + successful_allocations;
+        try testing.expectError(error.OutOfMemory, hints.add_observer("H", &observer.observer));
+        try testing.expectEqual(before, observer.calls);
+        try testing.expectEqual(@as(usize, 1), hints.registrations.items.len);
+    }
+    failing.fail_index = std.math.maxInt(usize);
+    _ = try hints.set("H", "after");
+    try testing.expectEqual(before + 1, observer.calls);
 }
