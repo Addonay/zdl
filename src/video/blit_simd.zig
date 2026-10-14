@@ -158,17 +158,14 @@ fn channel_mask(comptime pixel_bytes: usize, comptime offset: usize) @Vector(lan
 fn store(comptime kind: Kind, row: []u8, first: usize, planes: Planes) void {
     const pixel_bytes = comptime kind.bytes();
     const offsets = comptime kind.offsets();
-    // Vectors cannot be indexed by a runtime lane, so the bytes move as arrays.
-    const red: [lanes]u8 = @as(@Vector(lanes, u8), @intCast(planes.r));
-    const green: [lanes]u8 = @as(@Vector(lanes, u8), @intCast(planes.g));
-    const blue: [lanes]u8 = @as(@Vector(lanes, u8), @intCast(planes.b));
-    const alpha: [lanes]u8 = @as(@Vector(lanes, u8), @intCast(planes.a));
-    for (0..lanes) |lane| {
+    // Extract lanes at comptime, avoiding an implicit vector-to-array narrowing
+    // followed by a runtime scatter loop.
+    inline for (0..lanes) |lane| {
         const at = (first + lane) * pixel_bytes;
-        row[at + offsets.r] = red[lane];
-        row[at + offsets.g] = green[lane];
-        row[at + offsets.b] = blue[lane];
-        if (comptime offsets.a) |offset| row[at + offset] = alpha[lane];
+        row[at + offsets.r] = @intCast(planes.r[lane]);
+        row[at + offsets.g] = @intCast(planes.g[lane]);
+        row[at + offsets.b] = @intCast(planes.b[lane]);
+        if (comptime offsets.a) |offset| row[at + offset] = @intCast(planes.a[lane]);
     }
 }
 

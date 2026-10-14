@@ -426,6 +426,7 @@ pub fn ycbcr_matrix(colorspace: Colorspace, height: usize, bits_per_pixel: u8) ?
 /// (2^bits - 1) / (2^table - 1) * 2^(table - bits), the ratio of the two ranges.
 /// Full-range coefficients are depth-independent. Returns null as `ycbcr_matrix`.
 pub fn ycbcr_matrix_for_depth(colorspace: Colorspace, height: usize, sample_bits: u8) ?YcbcrToRgb {
+    if (sample_bits != 8 and sample_bits != 10 and sample_bits != 16) return null;
     const selected = family(colorspace, height, sample_bits) orelse return null;
     const table = ycbcr_matrix(colorspace, height, sample_bits) orelse return null;
     const table_bits: u8 = if (selected == .bt2020) 10 else 8;
@@ -445,4 +446,14 @@ pub fn ycbcr_matrix_for_depth(colorspace: Colorspace, height: usize, sample_bits
         };
     }
     return result;
+}
+
+test "depth-aware YCbCr matrices reject unsupported sample depths" {
+    for ([_]u8{ 0, 1, 7, 9, 12, 17, 255 }) |bits| {
+        try std.testing.expect(ycbcr_matrix_for_depth(bt709_limited, 480, bits) == null);
+        try std.testing.expect(ycbcr_matrix_for_depth(bt709_full, 480, bits) == null);
+    }
+    for ([_]u8{ 8, 10, 16 }) |bits| {
+        try std.testing.expect(ycbcr_matrix_for_depth(bt709_limited, 480, bits) != null);
+    }
 }
