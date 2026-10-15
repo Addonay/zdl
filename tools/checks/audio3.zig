@@ -33,6 +33,8 @@ pub fn check() !void {
         _ = device.class;
         _ = device.name.len;
         _ = device.description.len;
+        _ = device.monitor;
+        _ = try connection.node_capabilities(device.class, device.name);
     }
     if (try connection.default_device(allocator, .sink)) |name| allocator.free(name);
     var events = try connection.poll_events(allocator);
@@ -53,6 +55,8 @@ pub fn check() !void {
     _ = output.endpoint_name();
     _ = output.buffer_frames();
     _ = output.period_frames();
+    _ = try output.latency();
+    _ = try output.migrate_default(null);
 
     var mixer = try zdl.audio_stream.Stream(.stereo, .stereo).init(allocator, .{
         .format = output.spec().format,
@@ -61,7 +65,7 @@ pub fn check() !void {
     defer mixer.deinit();
     try output.bind(.{ .stereo = &mixer });
     try output.set_gain(0.5);
-    output.set_paused(false);
+    try output.set_paused(false);
     _ = output.bound_count();
     _ = try output.pump();
     _ = try output.wait(0);
@@ -80,6 +84,9 @@ pub fn check() !void {
     defer input.deinit();
     _ = input.spec();
     _ = input.endpoint_name();
+    try input.set_paused(false);
+    _ = try input.latency();
+    _ = try input.migrate_default(null);
     var sink = try zdl.audio_stream.Stream(.stereo, .stereo).init(allocator, .{
         .format = .float32_le,
         .sample_rate = 48000,
@@ -113,6 +120,8 @@ pub fn check() !void {
     defer alsa_input.deinit();
     _ = alsa_input.spec();
     _ = alsa_input.endpoint_name();
+    _ = alsa_input.opened_as_default();
+    _ = try alsa_input.migrate_default(null);
     _ = alsa_input.buffer_frames();
     _ = alsa_input.period_frames();
     try alsa_input.bind(.{ .stereo = &sink });

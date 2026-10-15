@@ -61,10 +61,16 @@ pub fn spa_format(format: audio.Format) u32 {
         .signed8 => 257,
         .signed16_le => 259,
         .signed16_be => 260,
+        .signed24_32_le => 263,
+        .signed24_32_be => 264,
         .signed32_le => 267,
         .signed32_be => 268,
+        .signed24_le => 271,
+        .signed24_be => 272,
         .float32_le => 283,
         .float32_be => 284,
+        .mulaw => 287,
+        .alaw => 288,
     };
 }
 
@@ -75,10 +81,16 @@ pub fn native_format(value: u32) Error!audio.Format {
         257 => .signed8,
         259 => .signed16_le,
         260 => .signed16_be,
+        263 => .signed24_32_le,
+        264 => .signed24_32_be,
         267 => .signed32_le,
         268 => .signed32_be,
+        271 => .signed24_le,
+        272 => .signed24_be,
         283 => .float32_le,
         284 => .float32_be,
+        287 => .mulaw,
+        288 => .alaw,
         else => error.UnsupportedFormat,
     };
 }
@@ -158,6 +170,20 @@ pub const Writer = struct {
         try self.end(at);
     }
 
+    /// Writes an SPA_CHOICE_Range of nonnegative integers (default, min, max).
+    pub fn int_range(self: *Writer, default: u32, minimum: u32, maximum: u32) Error!void {
+        if (minimum > default or default > maximum) return error.MalformedPod;
+        const at = try self.begin(Type.choice);
+        try self.word(1);
+        try self.word(0);
+        try self.word(4);
+        try self.word(Type.int);
+        try self.word(default);
+        try self.word(minimum);
+        try self.word(maximum);
+        try self.end(at);
+    }
+
     /// Writes an Array of Ids (used for channel positions).
     pub fn id_array(self: *Writer, values: []const u32) Error!void {
         const at = try self.begin(Type.array);
@@ -181,7 +207,7 @@ pub const Writer = struct {
         try self.property(format_media_subtype);
         try self.id(media_subtype_raw);
 
-        var ids: [8]u32 = undefined;
+        var ids: [14]u32 = undefined;
         if (formats.len > ids.len) return error.UnsupportedFormat;
         for (formats, ids[0..formats.len]) |format, *slot| slot.* = spa_format(format);
         try self.property(format_audio_format);
@@ -191,6 +217,33 @@ pub const Writer = struct {
         try self.int(@intCast(sample_rate));
         try self.property(format_audio_channels);
         try self.int(@intCast(channels));
+        if (positions.len != 0) {
+            try self.property(format_audio_position);
+            try self.id_array(positions);
+        }
+        try self.end(at);
+    }
+
+    /// Writes an EnumFormat object with SPA rate and channel ranges.
+    pub fn enum_format_ranges(self: *Writer, formats: []const audio.Format, sample_rate: IntegerRange, channels: IntegerRange, positions: []const u32) Error!void {
+        std.debug.assert(formats.len != 0);
+        const at = try self.begin(Type.object);
+        try self.word(object_format);
+        try self.word(param_enum_format);
+        try self.property(format_media_type);
+        try self.id(media_type_audio);
+        try self.property(format_media_subtype);
+        try self.id(media_subtype_raw);
+
+        var ids: [14]u32 = undefined;
+        if (formats.len > ids.len) return error.UnsupportedFormat;
+        for (formats, ids[0..formats.len]) |format, *slot| slot.* = spa_format(format);
+        try self.property(format_audio_format);
+        try self.id_enum(ids[0..formats.len]);
+        try self.property(format_audio_rate);
+        try self.int_range(sample_rate.preferred, sample_rate.minimum, sample_rate.maximum);
+        try self.property(format_audio_channels);
+        try self.int_range(channels.preferred, channels.minimum, channels.maximum);
         if (positions.len != 0) {
             try self.property(format_audio_position);
             try self.id_array(positions);
@@ -214,12 +267,166 @@ pub fn build_enum_format(storage: []u8, formats: []const audio.Format, sample_ra
     return storage[0..writer.len];
 }
 
+/// Writes an EnumFormat pod carrying node-advertised rate and channel ranges.
+pub fn build_enum_format_ranges(storage: []u8, formats: []const audio.Format, sample_rate: IntegerRange, channels: IntegerRange, positions: []const u32) Error![]const u8 {
+    var writer: Writer = .{ .bytes = storage };
+    try writer.enum_format_ranges(formats, sample_rate, channels, positions);
+    return storage[0..writer.len];
+}
+
 /// Sample format, rate and channels read from a negotiated Format param.
 pub const Negotiated = struct {
     format: audio.Format,
     sample_rate: u32,
     channels: u16,
 };
+
+/// An integer SPA choice. `values` is populated for Enum choices; Range uses
+/// `minimum`/`maximum`. `preferred` is SPA's first/default value.
+pub const IntegerRange = struct {
+    preferred: u32,
+    minimum: u32,
+    maximum: u32,
+    has_range: bool = true,
+    values: [8]u32 = @splat(0),
+    value_count: u8 = 0,
+
+    /// Chooses the closest advertised value, preferring SPA's default on ties.
+    pub fn choose(self: IntegerRange, requested: u32) u32 {
+        var best = if (self.has_range) std.math.clamp(requested, self.minimum, self.maximum) else self.preferred;
+        var distance = abs_difference(best, requested);
+        for (self.values[0..self.value_count]) |candidate| {
+            const candidate_distance = abs_difference(candidate, requested);
+            if (candidate_distance < distance) {
+                best = candidate;
+                distance = candidate_distance;
+            }
+        }
+        return best;
+    }
+
+    /// Adds choices from another EnumFormat param for the same property.
+    pub fn merge(self: *IntegerRange, other: IntegerRange) void {
+        if (other.has_range) {
+            if (self.has_range) {
+                self.minimum = @min(self.minimum, other.minimum);
+                self.maximum = @max(self.maximum, other.maximum);
+            } else {
+                self.minimum = other.minimum;
+                self.maximum = other.maximum;
+                self.has_range = true;
+            }
+        }
+        for (other.values[0..other.value_count]) |value| {
+            var found = false;
+            for (self.values[0..self.value_count]) |old| found = found or old == value;
+            if (!found and self.value_count < self.values.len) {
+                self.values[self.value_count] = value;
+                self.value_count += 1;
+            }
+        }
+    }
+};
+
+/// Parsed SPA_PARAM_EnumFormat capabilities for one node. The pod parser keeps
+/// the default and allowed format/rate/channel choices so stream negotiation
+/// can select the closest device-supported spec before connecting.
+pub const Capabilities = struct {
+    formats: [14]audio.Format = undefined,
+    format_count: u8 = 0,
+    sample_rate: IntegerRange,
+    channels: IntegerRange,
+
+    /// Merges another parameter alternative from the same node.
+    pub fn merge(self: *Capabilities, other: Capabilities) void {
+        for (other.formats[0..other.format_count]) |format| {
+            var found = false;
+            for (self.formats[0..self.format_count]) |old| found = found or old == format;
+            if (!found and self.format_count < self.formats.len) {
+                self.formats[self.format_count] = format;
+                self.format_count += 1;
+            }
+        }
+        self.sample_rate.merge(other.sample_rate);
+        self.channels.merge(other.channels);
+    }
+
+    /// Reconciles a caller's preferred spec with the node's advertised choices.
+    pub fn negotiate(self: Capabilities, preferred: audio.Spec) (Error || audio.Error)!audio.Spec {
+        try preferred.validate();
+        if (self.format_count == 0) return error.MalformedPod;
+        const preferences = audio.closest_formats(preferred.format);
+        var selected: ?audio.Format = null;
+        for (preferences.slice()) |candidate| {
+            for (self.formats[0..self.format_count]) |supported| {
+                if (candidate == supported) {
+                    selected = candidate;
+                    break;
+                }
+            }
+            if (selected != null) break;
+        }
+        const result: audio.Spec = .{
+            .format = selected orelse return error.UnsupportedFormat,
+            .sample_rate = self.sample_rate.choose(preferred.sample_rate),
+            .channels = std.math.cast(u16, self.channels.choose(preferred.channels)) orelse return error.MalformedPod,
+        };
+        try result.validate();
+        return result;
+    }
+};
+
+/// Reads a raw-audio SPA_PARAM_EnumFormat pod. Format choices accept Id Enum
+/// values; rate and channels accept Int values, Range choices or Enum choices.
+pub fn read_enum_format(bytes: []const u8) Error!Capabilities {
+    if (bytes.len < 16 or read_word(bytes, 4) != Type.object) return error.MalformedPod;
+    const body = pod_body(bytes) orelse return error.MalformedPod;
+    if (body.len < 8 or read_word(body, 0) != object_format or read_word(body, 4) != param_enum_format) return error.MalformedPod;
+
+    var formats: [14]audio.Format = undefined;
+    var format_count: usize = 0;
+    var rate: ?IntegerRange = null;
+    var channels: ?IntegerRange = null;
+    var media_ok = false;
+    var raw_ok = false;
+    var cursor: usize = 8;
+    while (cursor < body.len) {
+        if (body.len - cursor < 16) return error.MalformedPod;
+        const key = read_word(body, cursor);
+        const value_at = cursor + 8;
+        const value = pod_at(body, value_at) orelse return error.MalformedPod;
+        switch (key) {
+            format_media_type => media_ok = (default_id(value) orelse 0) == media_type_audio,
+            format_media_subtype => raw_ok = (default_id(value) orelse 0) == media_subtype_raw,
+            format_audio_format => {
+                var values: [14]u32 = undefined;
+                const count = try choice_values(value, Type.id, &values);
+                for (values[0..count]) |id| {
+                    const format = try native_format(id);
+                    var duplicate = false;
+                    for (formats[0..format_count]) |old| duplicate = duplicate or old == format;
+                    if (!duplicate) {
+                        if (format_count == formats.len) return error.UnsupportedFormat;
+                        formats[format_count] = format;
+                        format_count += 1;
+                    }
+                }
+            },
+            format_audio_rate => rate = try integer_range(value),
+            format_audio_channels => channels = try integer_range(value),
+            else => {},
+        }
+        const value_size = std.mem.alignForward(usize, value.value.len, 8);
+        cursor = std.math.add(usize, value_at + 8, value_size) catch return error.MalformedPod;
+    }
+    if (!media_ok or !raw_ok or format_count == 0) return error.UnsupportedFormat;
+    return .{
+        .formats = formats,
+        .format_count = @intCast(format_count),
+        .sample_rate = rate orelse return error.MalformedPod,
+        .channels = channels orelse return error.MalformedPod,
+    };
+}
 
 /// Decodes a Format object as delivered by a stream's `param_changed` event.
 /// Only raw audio is accepted. Choice values use their default (first) entry.
@@ -307,7 +514,80 @@ fn default_word(pod: PodView, expected: u32) ?u32 {
     return read_word(pod.value, 16);
 }
 
+fn choice_values(pod: PodView, expected: u32, output: []u32) Error!usize {
+    if (pod.type == expected) {
+        if (pod.value.len < 4 or output.len == 0) return error.MalformedPod;
+        output[0] = read_word(pod.value, 0);
+        return 1;
+    }
+    if (pod.type != Type.choice or pod.value.len < 20) return error.MalformedPod;
+    const child_size = read_word(pod.value, 8);
+    if (child_size != 4 or read_word(pod.value, 12) != expected) return error.MalformedPod;
+    const payload = pod.value[16..];
+    if (payload.len % child_size != 0) return error.MalformedPod;
+    const count = payload.len / child_size;
+    if (count == 0 or count > output.len) return error.MalformedPod;
+    for (0..count) |index| output[index] = read_word(payload, index * child_size);
+    return count;
+}
+
+fn integer_range(pod: PodView) Error!IntegerRange {
+    var values: [8]u32 = undefined;
+    const count = try choice_values(pod, Type.int, &values);
+    const choice_kind = if (pod.type == Type.choice) read_word(pod.value, 0) else 0;
+    const preferred = signed_nonnegative(values[0]) orelse return error.MalformedPod;
+    if (choice_kind == 1) {
+        if (count != 3) return error.MalformedPod;
+        const minimum = signed_nonnegative(values[1]) orelse return error.MalformedPod;
+        const maximum = signed_nonnegative(values[2]) orelse return error.MalformedPod;
+        if (minimum > preferred or preferred > maximum) return error.MalformedPod;
+        return .{ .preferred = preferred, .minimum = minimum, .maximum = maximum };
+    }
+    if (choice_kind == 3) {
+        var minimum = preferred;
+        var maximum = preferred;
+        for (values[0..count]) |value| {
+            const positive = signed_nonnegative(value) orelse return error.MalformedPod;
+            minimum = @min(minimum, positive);
+            maximum = @max(maximum, positive);
+        }
+        return .{
+            .preferred = preferred,
+            .minimum = minimum,
+            .maximum = maximum,
+            .has_range = false,
+            .values = values,
+            .value_count = @intCast(count),
+        };
+    }
+    return .{ .preferred = preferred, .minimum = preferred, .maximum = preferred };
+}
+
+fn signed_nonnegative(value: u32) ?u32 {
+    const signed: i32 = @bitCast(value);
+    return if (signed >= 0) @intCast(signed) else null;
+}
+
+fn abs_difference(a: u32, b: u32) u64 {
+    return if (a >= b) @as(u64, a - b) else @as(u64, b - a);
+}
+
 test "format round trip through the spa table" {
     try std.testing.expectEqual(audio.Format.float32_le, try native_format(spa_format(.float32_le)));
     try std.testing.expectError(error.UnsupportedFormat, native_format(0));
+    const formats = [_]audio.Format{ .unsigned8, .signed8, .signed16_le, .signed16_be, .signed24_le, .signed24_be, .signed24_32_le, .signed24_32_be, .signed32_le, .signed32_be, .float32_le, .float32_be, .alaw, .mulaw };
+    for (formats) |format| try std.testing.expectEqual(format, try native_format(spa_format(format)));
+}
+
+test "EnumFormat choices negotiate the closest supported spec" {
+    const formats = [_]audio.Format{ .float32_le, .signed16_le };
+    const rate: IntegerRange = .{ .preferred = 48000, .minimum = 44100, .maximum = 96000 };
+    const channels: IntegerRange = .{ .preferred = 2, .minimum = 1, .maximum = 8 };
+    var storage: [256]u64 align(8) = undefined;
+    const bytes = try build_enum_format_ranges(std.mem.sliceAsBytes(&storage), &formats, rate, channels, &.{});
+    const capabilities = try read_enum_format(bytes);
+    const actual = try capabilities.negotiate(.{ .format = .float32_le, .channels = 5, .sample_rate = 32000 });
+    try std.testing.expectEqual(audio.Format.float32_le, actual.format);
+    try std.testing.expectEqual(@as(u32, 44100), actual.sample_rate);
+    try std.testing.expectEqual(@as(u16, 5), actual.channels);
 }

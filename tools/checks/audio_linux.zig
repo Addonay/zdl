@@ -21,8 +21,10 @@ pub fn check() !void {
     defer output.deinit();
     _ = output.spec();
     _ = output.endpoint_name();
+    _ = output.opened_as_default();
     _ = output.buffer_frames();
     _ = output.period_frames();
+    _ = try output.migrate_default(null);
 
     var stream = try zdl.audio.Stream(.stereo, .stereo).init(allocator, .{
         .format = output.spec().format,

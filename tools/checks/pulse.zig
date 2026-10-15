@@ -35,6 +35,9 @@ pub fn check() !void {
         _ = device.format;
         _ = device.sample_rate;
         _ = device.description.len;
+        _ = device.volume.len;
+        _ = device.muted;
+        _ = device.latency_microseconds;
     }
     var sources = try connection.capture_devices();
     defer sources.deinit();
@@ -48,6 +51,11 @@ pub fn check() !void {
         .default_device_changed => |default| _ = default.name,
     };
     connection.unsubscribe();
+    if (try connection.default_device_handle(allocator, .playback)) |handle_value| {
+        var handle = handle_value;
+        defer handle.deinit();
+        try connection.set_device_volume(&handle, 0.5);
+    }
 
     var stream = try zdl.playback.Stream.open(&connection, .{
         .spec = .{ .format = .float32_le, .channels = 2, .sample_rate = 48000 },
@@ -82,6 +90,14 @@ pub fn check() !void {
     output.set_paused(false);
     _ = output.bound_count();
     _ = output.endpoint_name();
+    _ = output.opened_as_default();
+    _ = output.physical_index();
+    _ = try output.latency_microseconds();
+    _ = try output.migrate_default(null);
+    output.set_device_volume(0.5) catch |err| switch (err) {
+        error.InvalidConfiguration => {},
+        else => return err,
+    };
     _ = output.buffer_frames();
     _ = output.period_frames();
     _ = try output.pump();
@@ -116,6 +132,10 @@ pub fn check() !void {
     defer sink.deinit();
     _ = input.spec();
     _ = input.endpoint_name();
+    _ = input.opened_as_default();
+    _ = input.physical_index();
+    _ = try input.latency_microseconds();
+    _ = try input.migrate_default(null);
     _ = input.buffer_frames();
     _ = input.period_frames();
     try input.bind(.{ .stereo = &sink });

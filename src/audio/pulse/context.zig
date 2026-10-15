@@ -79,17 +79,22 @@ pub const Options = struct {
     diagnostic: ?*Diagnostic = null,
 };
 
-/// Converts a raw sample format to zdl's format, or null when this library has
-/// no equivalent (alaw, ulaw, 24-bit).
+/// Converts every PulseAudio PCM format represented by `audio.Format`.
 pub fn format_from_pulse(format: binding.SampleFormat) ?audio.Format {
     return switch (format) {
         .unsigned8 => .unsigned8,
         .signed16_le => .signed16_le,
         .signed16_be => .signed16_be,
+        .signed24_le => .signed24_le,
+        .signed24_be => .signed24_be,
+        .signed24_32_le => .signed24_32_le,
+        .signed24_32_be => .signed24_32_be,
         .signed32_le => .signed32_le,
         .signed32_be => .signed32_be,
         .float32_le => .float32_le,
         .float32_be => .float32_be,
+        .alaw => .alaw,
+        .ulaw => .mulaw,
         else => null,
     };
 }
@@ -116,10 +121,16 @@ pub fn pulse_format(format: audio.Format) binding.SampleFormat {
         .signed8 => pulse_format(native_float32()),
         .signed16_le => .signed16_le,
         .signed16_be => .signed16_be,
+        .signed24_le => .signed24_le,
+        .signed24_be => .signed24_be,
+        .signed24_32_le => .signed24_32_le,
+        .signed24_32_be => .signed24_32_be,
         .signed32_le => .signed32_le,
         .signed32_be => .signed32_be,
         .float32_le => .float32_le,
         .float32_be => .float32_be,
+        .alaw => .alaw,
+        .mulaw => .ulaw,
     };
 }
 
@@ -190,6 +201,9 @@ pub const RawDevice = struct {
     description: ?[*:0]const u8,
     sample_spec: binding.SampleSpec,
     channel_map: binding.ChannelMap,
+    volume: binding.CVolume,
+    muted: bool,
+    latency_microseconds: u64,
     /// Set for a monitor source: the index of the sink it records.
     monitor_of_sink: ?u32,
 };
@@ -210,6 +224,11 @@ pub const Device = struct {
     sample_rate: u32,
     /// One position per channel, in the server's order.
     channel_map: []Position,
+    /// Per-channel PulseAudio volume units; 65536 is PA_VOLUME_NORM.
+    volume: []u32,
+    muted: bool,
+    /// Server-reported queue/device latency in microseconds.
+    latency_microseconds: u64,
 
     pub fn channels(self: Device) u16 {
         return @intCast(self.channel_map.len);
@@ -220,6 +239,7 @@ pub const Device = struct {
         allocator.free(self.name);
         allocator.free(self.description);
         allocator.free(self.channel_map);
+        allocator.free(self.volume);
         self.* = undefined;
     }
 
@@ -232,6 +252,9 @@ pub const Device = struct {
         const positions = try allocator.alloc(Position, count);
         errdefer allocator.free(positions);
         for (positions, raw.channel_map.map[0..count]) |*position, source| position.* = source;
+        const volume = try allocator.alloc(u32, count);
+        errdefer allocator.free(volume);
+        @memcpy(volume, raw.volume.values[0..count]);
         return .{
             .direction = direction,
             .index = raw.index,
@@ -240,7 +263,25 @@ pub const Device = struct {
             .format = format_from_pulse(raw.sample_spec.format),
             .sample_rate = raw.sample_spec.rate,
             .channel_map = positions,
+            .volume = volume,
+            .muted = raw.muted,
+            .latency_microseconds = raw.latency_microseconds,
         };
+    }
+};
+
+/// Stable PulseAudio physical-device identity used when mapping server default
+/// names back to the device indices in subscription events.
+pub const DeviceHandle = struct {
+    allocator: std.mem.Allocator,
+    direction: Direction,
+    index: u32,
+    channels: u16,
+    name: [:0]u8,
+
+    pub fn deinit(self: *DeviceHandle) void {
+        self.allocator.free(self.name);
+        self.* = undefined;
     }
 };
 
@@ -622,6 +663,18 @@ pub const Shared = struct {
     }
 };
 
+/// Stack request whose lifetime spans one synchronous volume operation. The
+/// callback runs under the PulseAudio loop lock and wakes `await_operation`.
+pub const VolumeRequest = struct {
+    shared: *Shared,
+    success: ?bool = null,
+
+    pub fn complete(self: *VolumeRequest, success: bool) void {
+        self.success = success;
+        self.shared.wake();
+    }
+};
+
 /// Scratch state for one enumeration or server query. It lives on the caller's
 /// stack for the duration of the wait, so libpulse callbacks may point at it.
 pub const Request = struct {
@@ -727,6 +780,62 @@ pub const Context = struct {
         return info;
     }
 
+    /// Maps a server device name to its stable `(direction,index)` handle.
+    /// Returns null if a hotplug race removed the device before enumeration.
+    pub fn device_handle(self: *Context, allocator: std.mem.Allocator, direction: Direction, name: []const u8) Error!?DeviceHandle {
+        var devices = switch (direction) {
+            .playback => try self.playback_devices(),
+            .capture => try self.capture_devices(),
+        };
+        defer devices.deinit();
+        for (devices.items) |device| {
+            if (!std.mem.eql(u8, device.name, name)) continue;
+            return .{
+                .allocator = allocator,
+                .direction = direction,
+                .index = device.index,
+                .channels = device.channels(),
+                .name = try allocator.dupeSentinel(u8, device.name, 0),
+            };
+        }
+        return null;
+    }
+
+    /// Resolves the current server default to the `(direction,index)` handle
+    /// used by PulseAudio device-change and removal notifications.
+    pub fn default_device_handle(self: *Context, allocator: std.mem.Allocator, direction: Direction) Error!?DeviceHandle {
+        var info = try self.server_info();
+        defer info.deinit();
+        const name: []const u8 = switch (direction) {
+            .playback => info.default_sink,
+            .capture => info.default_source,
+        };
+        if (name.len == 0) return null;
+        return self.device_handle(allocator, direction, name);
+    }
+
+    /// Sets the physical sink or source volume by its PulseAudio device index.
+    /// Gain is linear in [0, 1], where 1.0 is PulseAudio's normal volume.
+    /// Applications should call this for direct user volume changes; use the
+    /// logical device's `set_gain` for per-application attenuation.
+    pub fn set_device_volume(self: *Context, handle: *const DeviceHandle, gain: f32) Error!void {
+        if (!std.math.isFinite(gain) or gain < 0 or gain > 1) return error.InvalidGain;
+        if (handle.channels == 0 or handle.channels > binding_channel_limit) return error.InvalidConfiguration;
+        var volume: binding.CVolume = .{ .channels = @intCast(handle.channels), .values = @splat(0) };
+        const raw_gain = self.shared.library.functions.sw_volume_from_linear(gain);
+        if (self.shared.library.functions.cvolume_set(&volume, handle.channels, raw_gain) == null) return error.OperationFailed;
+        var request: VolumeRequest = .{ .shared = self.shared };
+        self.shared.lock();
+        defer self.shared.unlock();
+        const context_handle = self.shared.context.?;
+        const operation = switch (handle.direction) {
+            .playback => self.shared.library.functions.context_set_sink_volume_by_index(context_handle, handle.index, &volume, binding.on_volume_success, &request),
+            .capture => self.shared.library.functions.context_set_source_volume_by_index(context_handle, handle.index, &volume, binding.on_volume_success, &request),
+        };
+        try self.shared.await_operation(operation);
+        if (request.success != true) return error.OperationFailed;
+    }
+
     /// Every playback device (sink) the server lists right now.
     pub fn playback_devices(self: *Context) Error!DeviceList {
         return self.list(.playback);
@@ -793,3 +902,11 @@ pub const Context = struct {
         return .{ .allocator = shared.allocator, .items = items };
     }
 };
+
+test "Pulse sample formats preserve 24-bit and G.711 representations" {
+    try std.testing.expectEqual(audio.Format.signed24_le, format_from_pulse(.signed24_le).?);
+    try std.testing.expectEqual(audio.Format.signed24_be, format_from_pulse(.signed24_be).?);
+    try std.testing.expectEqual(audio.Format.signed24_32_le, format_from_pulse(.signed24_32_le).?);
+    try std.testing.expectEqual(audio.Format.alaw, format_from_pulse(.alaw).?);
+    try std.testing.expectEqual(audio.Format.mulaw, format_from_pulse(.ulaw).?);
+}

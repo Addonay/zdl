@@ -76,6 +76,9 @@ pub fn Output(comptime layout: audio.Layout) type {
 
         allocator: std.mem.Allocator,
         name: [:0]u8,
+        follows_default: bool,
+        preferred_spec: audio.Spec,
+        requested_buffer_frames: usize,
         stream: pw_stream.Stream,
         frame_bytes: usize,
         period_size: usize,
@@ -88,11 +91,14 @@ pub fn Output(comptime layout: audio.Layout) type {
             if (options.buffer_frames == 0 or options.sample_rate == 0) return error.InvalidSampleRate;
             const name = try resolve_name(allocator, connection, options.endpoint, .sink);
             errdefer allocator.free(name);
+            const preferred: audio.Spec = .{ .format = options.format, .channels = channels, .sample_rate = options.sample_rate };
+            const capabilities = if (name.len != 0) connection.node_capabilities(.sink, name) catch null else null;
 
             var stream = try pw_stream.Stream.open(allocator, connection, .{
                 .direction = .playback,
-                .spec = .{ .format = options.format, .channels = channels, .sample_rate = options.sample_rate },
+                .spec = preferred,
                 .positions = pod.layout_positions(layout),
+                .capabilities = capabilities,
                 .target = if (name.len != 0) name else null,
                 .name = "zdl playback",
                 .buffer_frames = options.buffer_frames,
@@ -110,6 +116,9 @@ pub fn Output(comptime layout: audio.Layout) type {
             return .{
                 .allocator = allocator,
                 .name = name,
+                .follows_default = options.endpoint == null,
+                .preferred_spec = preferred,
+                .requested_buffer_frames = options.buffer_frames,
                 .stream = stream,
                 .frame_bytes = frame_bytes,
                 .period_size = period,
@@ -130,6 +139,51 @@ pub fn Output(comptime layout: audio.Layout) type {
         /// Node name this output targets; empty when PipeWire chooses.
         pub fn endpoint_name(self: *const Self) []const u8 {
             return self.name;
+        }
+
+        /// True when this output was opened without an explicit endpoint.
+        pub fn opened_as_default(self: *const Self) bool {
+            return self.follows_default;
+        }
+
+        /// Reconnects a default-opened output to the node named by a
+        /// `Connection.default_changed` event. Existing logical streams remain
+        /// bound and queued input is converted to the replacement spec.
+        pub fn migrate_default(self: *Self, new_endpoint: ?[]const u8) Error!bool {
+            if (!self.follows_default) return false;
+            const endpoint = new_endpoint orelse return false;
+            if (endpoint.len == 0 or std.mem.eql(u8, self.name, endpoint)) return false;
+            const name = try self.allocator.dupeSentinel(u8, endpoint, 0);
+            errdefer self.allocator.free(name);
+            const capabilities = self.stream.connection.node_capabilities(.sink, endpoint) catch null;
+            var replacement = try pw_stream.Stream.open(self.allocator, self.stream.connection, .{
+                .direction = .playback,
+                .spec = self.preferred_spec,
+                .positions = pod.layout_positions(layout),
+                .capabilities = capabilities,
+                .target = name,
+                .name = "zdl playback",
+                .buffer_frames = self.requested_buffer_frames,
+            });
+            errdefer replacement.deinit();
+            if (!self.stream.active) try replacement.set_active(false);
+            const negotiated = replacement.spec();
+            if (negotiated.channels != channels) return error.ChannelMismatch;
+            const frame_bytes = try negotiated.frame_size();
+            const period = @max(@as(usize, 1), self.requested_buffer_frames / 4);
+            const scratch = std.math.mul(usize, period, frame_bytes) catch return error.Overflow;
+            try self.mixer.reconfigure(negotiated, scratch);
+
+            var previous_stream = self.stream;
+            const previous_name = self.name;
+            self.stream = replacement;
+            self.name = name;
+            self.frame_bytes = frame_bytes;
+            self.period_size = period;
+            replacement = undefined;
+            previous_stream.deinit();
+            self.allocator.free(previous_name);
+            return true;
         }
 
         /// Committed format, channels and rate negotiated with PipeWire.
@@ -168,13 +222,20 @@ pub fn Output(comptime layout: audio.Layout) type {
         }
 
         /// Paused outputs write silence and do not pull from bound streams.
-        pub fn set_paused(self: *Self, paused: bool) void {
+        pub fn set_paused(self: *Self, paused: bool) Error!void {
+            try self.stream.set_active(!paused);
             self.mixer.set_paused(paused);
+        }
+
+        /// PipeWire's device delay and stream queue depth in negotiated frames.
+        pub fn latency(self: *Self) Error!pw_stream.Latency {
+            return self.stream.latency();
         }
 
         /// Renders and writes as many frames as the ring can take, up to one
         /// period. Returns frames accepted; 0 when the ring is full.
         pub fn pump(self: *Self) Error!usize {
+            if (!self.stream.active) return 0;
             const free_frames = self.stream.writable_bytes() / self.frame_bytes;
             const frames = @min(self.period_size, free_frames);
             if (frames == 0) return 0;
@@ -215,6 +276,9 @@ pub fn Input(comptime layout: audio.Layout) type {
 
         allocator: std.mem.Allocator,
         name: [:0]u8,
+        follows_default: bool,
+        preferred_spec: audio.Spec,
+        requested_buffer_frames: usize,
         stream: pw_stream.Stream,
         frame_bytes: usize,
         period_size: usize,
@@ -227,11 +291,14 @@ pub fn Input(comptime layout: audio.Layout) type {
             if (options.buffer_frames == 0 or options.sample_rate == 0) return error.InvalidSampleRate;
             const name = try resolve_name(allocator, connection, options.endpoint, .source);
             errdefer allocator.free(name);
+            const preferred: audio.Spec = .{ .format = options.format, .channels = channels, .sample_rate = options.sample_rate };
+            const capabilities = if (name.len != 0) connection.node_capabilities(.source, name) catch null else null;
 
             var stream = try pw_stream.Stream.open(allocator, connection, .{
                 .direction = .capture,
-                .spec = .{ .format = options.format, .channels = channels, .sample_rate = options.sample_rate },
+                .spec = preferred,
                 .positions = pod.layout_positions(layout),
+                .capabilities = capabilities,
                 .target = if (name.len != 0) name else null,
                 .name = "zdl capture",
                 .buffer_frames = options.buffer_frames,
@@ -249,6 +316,9 @@ pub fn Input(comptime layout: audio.Layout) type {
             return .{
                 .allocator = allocator,
                 .name = name,
+                .follows_default = options.endpoint == null,
+                .preferred_spec = preferred,
+                .requested_buffer_frames = options.buffer_frames,
                 .stream = stream,
                 .frame_bytes = frame_bytes,
                 .period_size = period,
@@ -268,6 +338,50 @@ pub fn Input(comptime layout: audio.Layout) type {
         /// Node name this input captures from; empty when PipeWire chooses.
         pub fn endpoint_name(self: *const Self) []const u8 {
             return self.name;
+        }
+
+        /// True when this input was opened without an explicit endpoint.
+        pub fn opened_as_default(self: *const Self) bool {
+            return self.follows_default;
+        }
+
+        /// Reconnects a default-opened input to the node named by a
+        /// `Connection.default_changed` event and preserves fan-out bindings.
+        pub fn migrate_default(self: *Self, new_endpoint: ?[]const u8) Error!bool {
+            if (!self.follows_default) return false;
+            const endpoint = new_endpoint orelse return false;
+            if (endpoint.len == 0 or std.mem.eql(u8, self.name, endpoint)) return false;
+            const name = try self.allocator.dupeSentinel(u8, endpoint, 0);
+            errdefer self.allocator.free(name);
+            const capabilities = self.stream.connection.node_capabilities(.source, endpoint) catch null;
+            var replacement = try pw_stream.Stream.open(self.allocator, self.stream.connection, .{
+                .direction = .capture,
+                .spec = self.preferred_spec,
+                .positions = pod.layout_positions(layout),
+                .capabilities = capabilities,
+                .target = name,
+                .name = "zdl capture",
+                .buffer_frames = self.requested_buffer_frames,
+            });
+            errdefer replacement.deinit();
+            if (!self.stream.active) try replacement.set_active(false);
+            const negotiated = replacement.spec();
+            if (negotiated.channels != channels) return error.ChannelMismatch;
+            const frame_bytes = try negotiated.frame_size();
+            const period = @max(@as(usize, 1), self.requested_buffer_frames / 4);
+            const scratch = std.math.mul(usize, period, frame_bytes) catch return error.Overflow;
+            try self.fanout.reconfigure(negotiated, scratch);
+
+            var previous_stream = self.stream;
+            const previous_name = self.name;
+            self.stream = replacement;
+            self.name = name;
+            self.frame_bytes = frame_bytes;
+            self.period_size = period;
+            replacement = undefined;
+            previous_stream.deinit();
+            self.allocator.free(previous_name);
+            return true;
         }
 
         /// Committed format, channels and rate negotiated with PipeWire.
@@ -322,6 +436,16 @@ pub fn Input(comptime layout: audio.Layout) type {
         /// Discards buffered audio without disconnecting the stream.
         pub fn drop(self: *Self) Error!void {
             self.stream.flush();
+        }
+
+        /// Suspends or resumes capture transport without closing the stream.
+        pub fn set_paused(self: *Self, paused: bool) Error!void {
+            try self.stream.set_active(!paused);
+        }
+
+        /// PipeWire's device delay and stream queue depth in negotiated frames.
+        pub fn latency(self: *Self) Error!pw_stream.Latency {
+            return self.stream.latency();
         }
     };
 }

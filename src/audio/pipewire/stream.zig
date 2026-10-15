@@ -47,6 +47,14 @@ pub const Error = binding.Error || audio.Error || std.mem.Allocator.Error || pod
 /// Which way the stream carries audio.
 pub const Direction = enum { playback, capture };
 
+/// Current PipeWire timing values. All frame counts use the negotiated stream
+/// rate; `delay_frames` may be negative when PipeWire reports a leading clock.
+pub const Latency = struct {
+    delay_frames: i64,
+    queued_frames: u64,
+    buffered_frames: u64,
+};
+
 /// Parameters for `Stream.open`. Format and rate are preferences: PipeWire
 /// may choose others, reported by `spec`.
 pub const Options = struct {
@@ -55,6 +63,9 @@ pub const Options = struct {
     spec: audio.Spec,
     /// Canonical SPA positions, one per channel (empty leaves them to PipeWire).
     positions: []const u32 = &.{},
+    /// Optional node EnumFormat capabilities parsed by `pod.read_enum_format`.
+    /// When present, the closest advertised spec becomes this stream's request.
+    capabilities: ?pod.Capabilities = null,
     /// Node name to connect to (see `Connection.devices`). Null lets the
     /// session manager choose the default node.
     target: ?[:0]const u8 = null,
@@ -69,7 +80,7 @@ pub const Options = struct {
 const ring_multiplier = 4;
 
 /// Formats offered in EnumFormat, after the requested one.
-const offered_formats = [_]audio.Format{ .float32_le, .signed32_le, .signed16_le, .signed16_be, .unsigned8, .signed8, .signed32_be, .float32_be };
+const offered_formats = [_]audio.Format{ .float32_le, .signed32_le, .signed16_le, .signed16_be, .unsigned8, .signed8, .signed32_be, .float32_be, .signed24_32_le, .signed24_32_be, .signed24_le, .signed24_be, .alaw, .mulaw };
 
 /// Heap state shared with PipeWire callbacks. The address must be stable.
 pub const State = struct {
@@ -144,7 +155,7 @@ pub const State = struct {
         const wanted = wanted_bytes - wanted_bytes % frame_bytes;
         const copied = self.ring_read(plane.storage[0..wanted]);
         if (copied < wanted) {
-            const silence: u8 = if ((self.negotiated orelse self.requested).format == .unsigned8) 0x80 else 0;
+            const silence = (self.negotiated orelse self.requested).format.silence_byte();
             @memset(plane.storage[copied..wanted], silence);
             self.underruns += 1;
         }
@@ -199,11 +210,15 @@ pub const Stream = struct {
     allocator: std.mem.Allocator,
     connection: *context.Connection,
     state: *State,
+    active: bool = true,
 
     /// Creates the stream, connects it and waits for its negotiated format.
     /// Connects to `options.target` when given. The connection stays borrowed.
     pub fn open(allocator: std.mem.Allocator, connection: *context.Connection, options: Options) Error!Stream {
-        const requested = options.spec;
+        const requested = if (options.capabilities) |capabilities|
+            try capabilities.negotiate(options.spec)
+        else
+            options.spec;
         try requested.validate();
         if (requested.channels > 255) return error.InvalidSpec;
         const library = connection.library_handle();
@@ -361,6 +376,29 @@ pub const Stream = struct {
         defer self.connection.unlock();
         self.state.head = 0;
         self.state.count = 0;
+    }
+
+    /// Activates or suspends the PipeWire stream. This is the transport-level
+    /// pause used by logical devices; it does not discard the caller-side ring.
+    pub fn set_active(self: *Stream, active: bool) Error!void {
+        if (self.active == active) return;
+        self.connection.lock();
+        defer self.connection.unlock();
+        try self.state.library.stream_set_active(self.state.object.?, active);
+        self.active = active;
+    }
+
+    /// Reads PipeWire's current device delay and stream queue depth.
+    pub fn latency(self: *Stream) Error!Latency {
+        self.connection.lock();
+        defer self.connection.unlock();
+        const time = try self.state.library.stream_time(self.state.object.?);
+        if (time.rate.den == 0) return error.InvalidSpec;
+        return .{
+            .delay_frames = time.delay,
+            .queued_frames = time.queued,
+            .buffered_frames = time.buffered,
+        };
     }
 
     /// Frames dropped at capture or padded with silence at playback so far.

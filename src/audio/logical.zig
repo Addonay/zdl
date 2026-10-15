@@ -48,7 +48,7 @@ pub const Unavailable = error{Unavailable};
 /// Byte that represents silence for one format: unsigned 8-bit PCM is centered
 /// on 0x80; every other supported encoding (signed integer and float) uses zero.
 pub fn silence_byte(format: audio.Format) u8 {
-    return if (format == .unsigned8) 0x80 else 0;
+    return format.silence_byte();
 }
 
 /// Checks a device gain: finite and within [0, 1].
@@ -185,6 +185,29 @@ pub fn Mixer(comptime layout: audio.Layout) type {
             self.paused = paused;
         }
 
+        /// Updates the committed physical spec and resizes scratch storage.
+        /// Bound streams keep their queued input and are reset at the device
+        /// boundary so they convert into the new format/rate on the next pump.
+        pub fn reconfigure(self: *Self, spec: audio.Spec, scratch_bytes: usize) Error!void {
+            try spec.validate();
+            if (spec.channels != layout.channels()) return error.InvalidChannels;
+            const mix = try self.allocator.alloc(u8, scratch_bytes);
+            errdefer self.allocator.free(mix);
+            const stage = try self.allocator.alloc(u8, scratch_bytes);
+
+            // There are no fallible operations after the replacement storage
+            // exists: every member of this union has the same destination
+            // layout and the validated spec has its matching channel count.
+            for (self.sources.items) |source| switch (source) {
+                inline else => |stream| stream.reconfigure_destination(spec) catch unreachable,
+            };
+            self.allocator.free(self.mix);
+            self.allocator.free(self.stage);
+            self.mix = mix;
+            self.stage = stage;
+            self.spec = spec;
+        }
+
         /// Fills `mix[0..count]` with silence, then adds every bound stream
         /// scaled by the device gain. Returns the rendered prefix of `mix`.
         /// `count` must be a whole number of frames and at most the scratch size.
@@ -261,6 +284,18 @@ pub fn Fanout(comptime layout: audio.Layout) type {
             return self.sources.items.len;
         }
 
+        /// Changes the captured source spec and period storage after a device
+        /// migration. Capture streams accept source format/rate boundaries in
+        /// their queues, so their existing queued data remains valid.
+        pub fn reconfigure(self: *Self, spec: audio.Spec, scratch_bytes: usize) Error!void {
+            try spec.validate();
+            if (spec.channels != layout.channels()) return error.InvalidChannels;
+            const scratch = try self.allocator.alloc(u8, scratch_bytes);
+            self.allocator.free(self.scratch);
+            self.scratch = scratch;
+            self.spec = spec;
+        }
+
         /// Writes `bytes` (whole frames in the device spec) into every bound stream.
         pub fn distribute(self: *Self, bytes: []const u8) stream_module.Error!void {
             for (self.sources.items) |source| switch (source) {
@@ -268,4 +303,30 @@ pub fn Fanout(comptime layout: audio.Layout) type {
             };
         }
     };
+}
+
+test "mixer reconfiguration updates bound streams and keeps queued input" {
+    const testing = std.testing;
+    var stream = try stream_module.Stream(.stereo, .stereo).init(testing.allocator, .{
+        .format = .signed16_le,
+        .sample_rate = 44100,
+    });
+    defer stream.deinit();
+    var mixer = try Mixer(.stereo).init(testing.allocator, .{
+        .format = .signed16_le,
+        .channels = 2,
+        .sample_rate = 44100,
+    }, 64);
+    defer mixer.deinit();
+    try mixer.bind(.{ .stereo = &stream });
+    try stream.write(.{ .format = .signed16_le, .sample_rate = 44100 }, &.{ 0, 0, 0, 0 });
+    const queued_before = stream.queued_bytes();
+
+    try mixer.reconfigure(.{ .format = .float32_le, .channels = 2, .sample_rate = 48000 }, 128);
+
+    try testing.expectEqual(@as(usize, 1), mixer.bound_count());
+    try testing.expectEqual(audio.Format.float32_le, mixer.spec.format);
+    try testing.expectEqual(@as(u32, 48000), stream.destination_spec().sample_rate);
+    try testing.expectEqual(queued_before, stream.queued_bytes());
+    try testing.expectEqual(@as(usize, 128), mixer.mix.len);
 }

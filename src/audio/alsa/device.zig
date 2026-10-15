@@ -171,19 +171,32 @@ pub const Device = struct {
     pub fn open(library: *Library, options: Options) Error!Device {
         try options.spec.validate();
         if (options.name.len == 0 or options.latency_microseconds == 0) return error.InvalidConfiguration;
-        var handle: ?*binding.Pcm = null;
-        const opened = library.native.functions.pcm_open(&handle, options.name.ptr, if (options.direction == .playback) 0 else 1, if (options.non_blocking) 1 else 0);
-        try check(library, options.diagnostic, opened);
-        const pcm = handle orelse return error.DeviceFailure;
-        errdefer _ = library.native.functions.pcm_close(pcm);
-        // ALSA's RW_INTERLEAVED is 3. Its own enum values stay confined to this
-        // boundary; native sample format/layout values are never C enum aliases.
-        try check(library, options.diagnostic, library.native.functions.pcm_set_params(pcm, alsa_format(options.spec.format), 3, options.spec.channels, options.spec.sample_rate, @intFromBool(options.soft_resample), options.latency_microseconds));
-        var buffer_frames: usize = 0;
-        var period_frames: usize = 0;
-        try check(library, options.diagnostic, library.native.functions.pcm_get_params(pcm, &buffer_frames, &period_frames));
-        if (buffer_frames == 0 or period_frames == 0) return error.DeviceFailure;
-        return .{ .library = library, .pcm = pcm, .spec = options.spec, .direction = options.direction, .buffer_frames = buffer_frames, .period_frames = period_frames, .diagnostic = options.diagnostic };
+        const preferences = audio.closest_formats(options.spec.format);
+        var last_format_error: i32 = -22;
+        for (preferences.slice()) |format| {
+            var handle: ?*binding.Pcm = null;
+            const opened = library.native.functions.pcm_open(&handle, options.name.ptr, if (options.direction == .playback) 0 else 1, if (options.non_blocking) 1 else 0);
+            try check(library, options.diagnostic, opened);
+            const pcm = handle orelse return error.DeviceFailure;
+            // ALSA's RW_INTERLEAVED is 3. Its C enum values stay private to
+            // this boundary; `spec` stores the actual native representation.
+            const status = library.native.functions.pcm_set_params(pcm, alsa_format(format), 3, options.spec.channels, options.spec.sample_rate, @intFromBool(options.soft_resample), options.latency_microseconds);
+            if (status < 0) {
+                _ = library.native.functions.pcm_close(pcm);
+                last_format_error = status;
+                if (status == -22) continue;
+                return failure(library, options.diagnostic, status);
+            }
+            errdefer _ = library.native.functions.pcm_close(pcm);
+
+            const spec = try negotiated_spec(library, pcm, options.diagnostic);
+            var buffer_frames: usize = 0;
+            var period_frames: usize = 0;
+            try check(library, options.diagnostic, library.native.functions.pcm_get_params(pcm, &buffer_frames, &period_frames));
+            if (buffer_frames == 0 or period_frames == 0) return error.DeviceFailure;
+            return .{ .library = library, .pcm = pcm, .spec = spec, .direction = options.direction, .buffer_frames = buffer_frames, .period_frames = period_frames, .diagnostic = options.diagnostic };
+        }
+        return failure(library, options.diagnostic, last_format_error);
     }
 
     /// Drops/closes the stream without implicitly draining or blocking. Deinit
@@ -289,12 +302,67 @@ fn alsa_format(format: audio.Format) i32 {
         .unsigned8 => 1,
         .signed16_le => 2,
         .signed16_be => 3,
+        .signed24_32_le => 6,
+        .signed24_32_be => 7,
         .signed32_le => 10,
         .signed32_be => 11,
         .float32_le => 14,
         .float32_be => 15,
+        .mulaw => 20,
+        .alaw => 21,
+        .signed24_le => 32,
+        .signed24_be => 33,
     };
 }
+
+fn format_from_alsa(format: i32) ?audio.Format {
+    return switch (format) {
+        0 => .signed8,
+        1 => .unsigned8,
+        2 => .signed16_le,
+        3 => .signed16_be,
+        6 => .signed24_32_le,
+        7 => .signed24_32_be,
+        10 => .signed32_le,
+        11 => .signed32_be,
+        14 => .float32_le,
+        15 => .float32_be,
+        20 => .mulaw,
+        21 => .alaw,
+        32 => .signed24_le,
+        33 => .signed24_be,
+        else => null,
+    };
+}
+
+fn negotiated_spec(library: *Library, pcm: *binding.Pcm, diagnostic: ?*Diagnostic) Error!audio.Spec {
+    var maybe_params: ?*binding.HwParams = null;
+    try check(library, diagnostic, library.native.functions.pcm_hw_params_malloc(&maybe_params));
+    const params = maybe_params orelse return error.DeviceFailure;
+    defer library.native.functions.hw_params_free(params);
+    try check(library, diagnostic, library.native.functions.pcm_hw_params_current(pcm, params));
+    var raw_format: i32 = 0;
+    var channels: u32 = 0;
+    var rate: u32 = 0;
+    var direction: i32 = 0;
+    try check(library, diagnostic, library.native.functions.hw_params_get_format(params, &raw_format));
+    try check(library, diagnostic, library.native.functions.hw_params_get_channels(params, &channels));
+    try check(library, diagnostic, library.native.functions.hw_params_get_rate(params, &rate, &direction));
+    if (direction < -1 or direction > 1) return error.InvalidConfiguration;
+    const spec: audio.Spec = .{
+        .format = format_from_alsa(raw_format) orelse return error.InvalidConfiguration,
+        .channels = std.math.cast(u16, channels) orelse return error.InvalidChannels,
+        .sample_rate = rate,
+    };
+    try spec.validate();
+    return spec;
+}
+
+test "ALSA format identifiers round trip every native sample representation" {
+    const formats = [_]audio.Format{ .unsigned8, .signed8, .signed16_le, .signed16_be, .signed24_le, .signed24_be, .signed24_32_le, .signed24_32_be, .signed32_le, .signed32_be, .float32_le, .float32_be, .alaw, .mulaw };
+    for (formats) |format| try std.testing.expectEqual(format, format_from_alsa(alsa_format(format)).?);
+}
+
 fn check(library: *Library, diagnostic: ?*Diagnostic, result: i32) Error!void {
     if (result < 0) return failure(library, diagnostic, result);
 }

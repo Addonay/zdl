@@ -9,11 +9,10 @@
 //! buffers what is written and handles underruns itself, so unlike the ALSA
 //! output there is no carry-over of refused frames and no recovery step.
 //!
-//! Deliberate differences from SDL: the server's sink is chosen by name with
-//! `device` (null = default sink, same as SDL's default device); the requested
-//! buffer is given in frames; `Output.endpoint_name` is null for the default sink
-//! because libpulse does not report its name for a connection that did not ask
-//! for one; and drain is polled (`WouldBlock` until finished) rather than blocking.
+//! Deliberate differences from SDL: the requested buffer is given in frames;
+//! named server defaults are resolved to a device handle so callers can migrate
+//! on a polled default-change event (an unnamed default still lets libpulse
+//! choose); and drain is polled (`WouldBlock` until finished) rather than blocking.
 const std = @import("std");
 const audio = @import("../processing.zig");
 const binding = @import("binding.zig");
@@ -104,6 +103,18 @@ pub const Stream = struct {
         self.shared.lock();
         defer self.shared.unlock();
         return (try self.writable_bytes()) / self.frame_bytes;
+    }
+
+    /// Server-reported signed playback latency in microseconds. A negative
+    /// value means the stream clock leads the server's presentation point.
+    pub fn latency_microseconds(self: *Stream) Error!i64 {
+        self.shared.lock();
+        defer self.shared.unlock();
+        var usec: u64 = 0;
+        var negative: c_int = 0;
+        if (self.shared.library.functions.stream_get_latency(self.handle, &usec, &negative) < 0) return error.StreamFailed;
+        const value = std.math.cast(i64, usec) orelse return error.Overflow;
+        return if (negative != 0) -value else value;
     }
 
     /// Waits until at least one period can be written. A null timeout waits
@@ -216,22 +227,38 @@ pub fn Output(comptime layout: audio.Layout) type {
         const Mixer = logical.Mixer(layout);
 
         allocator: std.mem.Allocator,
+        context: *context.Context,
         endpoint: ?[:0]u8,
+        handle: ?context.DeviceHandle,
+        follows_default: bool,
+        preferred_spec: audio.Spec,
+        requested_buffer_frames: usize,
         stream: Stream,
         frame_bytes: usize,
         /// Bound streams, gain, pause and mixing (scratch sized for the largest request).
         mixer: Mixer,
 
         /// Opens a playback stream with `layout.channels()` channels on
-        /// `options.endpoint` (null for the default sink). The endpoint name is
-        /// copied, so the caller's slice may be freed right after this call.
+        /// `options.endpoint` or the current named default sink. The connection
+        /// stays borrowed; endpoint names and index handles are owned.
         pub fn open(allocator: std.mem.Allocator, ctx: *context.Context, options: OutputOptions) Error!Self {
-            const endpoint: ?[:0]u8 = if (options.endpoint) |name| try allocator.dupeSentinel(u8, name, 0) else null;
+            var handle = if (options.endpoint) |name|
+                try ctx.device_handle(allocator, .playback, name)
+            else
+                try ctx.default_device_handle(allocator, .playback);
+            errdefer if (handle) |*device_handle| device_handle.deinit();
+            const endpoint: ?[:0]u8 = if (options.endpoint) |name|
+                try allocator.dupeSentinel(u8, name, 0)
+            else if (handle) |device_handle|
+                try allocator.dupeSentinel(u8, device_handle.name, 0)
+            else
+                null;
             errdefer if (endpoint) |name| allocator.free(name);
+            const preferred: audio.Spec = .{ .format = options.format, .channels = channels, .sample_rate = options.sample_rate };
 
             var stream = try Stream.open(ctx, .{
                 .device = endpoint,
-                .spec = .{ .format = options.format, .channels = channels, .sample_rate = options.sample_rate },
+                .spec = preferred,
                 .buffer_frames = options.buffer_frames,
             });
             errdefer stream.deinit();
@@ -244,7 +271,12 @@ pub fn Output(comptime layout: audio.Layout) type {
 
             return .{
                 .allocator = allocator,
+                .context = ctx,
                 .endpoint = endpoint,
+                .handle = handle,
+                .follows_default = options.endpoint == null,
+                .preferred_spec = preferred,
+                .requested_buffer_frames = options.buffer_frames,
                 .stream = stream,
                 .frame_bytes = frame_bytes,
                 .mixer = mixer,
@@ -257,12 +289,78 @@ pub fn Output(comptime layout: audio.Layout) type {
             self.stream.deinit();
             self.mixer.deinit();
             if (self.endpoint) |name| self.allocator.free(name);
+            if (self.handle) |*handle| handle.deinit();
             self.* = undefined;
         }
 
-        /// Sink name this output was opened on, or null for the default sink.
+        /// Sink name currently targeted. Null means PulseAudio had no named
+        /// default when this logical output opened.
         pub fn endpoint_name(self: *const Self) ?[]const u8 {
             return self.endpoint;
+        }
+
+        /// Index received by PulseAudio subscription events, if its named sink
+        /// existed when the output was opened or most recently migrated.
+        pub fn physical_index(self: *const Self) ?u32 {
+            return if (self.handle) |handle| handle.index else null;
+        }
+
+        /// PulseAudio's signed stream latency in microseconds.
+        pub fn latency_microseconds(self: *Self) Error!i64 {
+            return self.stream.latency_microseconds();
+        }
+
+        /// Changes the physical PulseAudio sink volume resolved for this
+        /// output. Use `set_gain` for attenuation local to this application.
+        pub fn set_device_volume(self: *Self, gain: f32) Error!void {
+            const handle = self.handle orelse return error.InvalidConfiguration;
+            try self.context.set_device_volume(&handle, gain);
+        }
+
+        /// True when this output follows the PulseAudio server default.
+        pub fn opened_as_default(self: *const Self) bool {
+            return self.follows_default;
+        }
+
+        /// Reconnects a default-opened output when the caller polls a matching
+        /// `default_device_changed` event. The current device index is resolved
+        /// from the server's sink name before the replacement is committed.
+        pub fn migrate_default(self: *Self, new_name: ?[]const u8) Error!bool {
+            if (!self.follows_default) return false;
+            const name = new_name orelse return false;
+            if (name.len == 0) return false;
+            var new_handle = (try self.context.device_handle(self.allocator, .playback, name)) orelse return false;
+            errdefer new_handle.deinit();
+            if (self.endpoint != null and std.mem.eql(u8, self.endpoint.?, name) and self.handle != null and self.handle.?.index == new_handle.index) {
+                new_handle.deinit();
+                return false;
+            }
+            const endpoint = try self.allocator.dupeSentinel(u8, name, 0);
+            errdefer self.allocator.free(endpoint);
+            var replacement = try Stream.open(self.context, .{
+                .device = endpoint,
+                .spec = self.preferred_spec,
+                .buffer_frames = self.requested_buffer_frames,
+            });
+            errdefer replacement.deinit();
+            const frame_bytes = replacement.frame_bytes;
+            const scratch_frames = @max(replacement.buffer_frames, replacement.period_frames);
+            const scratch_bytes = std.math.mul(usize, scratch_frames, frame_bytes) catch return error.Overflow;
+            try self.mixer.reconfigure(replacement.spec, scratch_bytes);
+
+            var previous_stream = self.stream;
+            const previous_endpoint = self.endpoint;
+            var previous_handle = self.handle;
+            self.stream = replacement;
+            self.endpoint = endpoint;
+            self.handle = new_handle;
+            self.frame_bytes = frame_bytes;
+            replacement = undefined;
+            new_handle = undefined;
+            previous_stream.deinit();
+            if (previous_endpoint) |previous| self.allocator.free(previous);
+            if (previous_handle) |*old| old.deinit();
+            return true;
         }
 
         /// Committed format, channels and rate. Bound streams must produce exactly this.
