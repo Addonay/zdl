@@ -8,6 +8,7 @@ const std = @import("std");
 const Endian = std.lang.Endian;
 
 /// Borrowed WAVE parsing and explicit owned decoding of supported codecs.
+pub const wave = @import("wave.zig");
 pub const Wave = @import("wave.zig").Wave;
 
 /// Linux ALSA loading and explicit playback/capture devices.

@@ -16,3 +16,5 @@ then `zig fmt` the output.
 | `hidapi_switch_rumble.py` | HD rumble frequency/amplitude tables in `src/joystick/hidapi/switch_pro.zig` | see the script header |
 | `hidapi_steam_constants.py` | `src/joystick/hidapi/steam_constants.zig` | see the script header |
 | `render_gpu_shaders.py` | `src/render/gpu/shader_blobs.zig` | `render_gpu_shaders.py .ref/SDL > src/render/gpu/shader_blobs.zig` |
+| `render_debug_font.py` | `src/render/debug_font_data.zig` | `render_debug_font.py .ref/SDL/src/render/SDL_render_debug_font.h` |
+| `planar_audio_assets.py` | `examples/assets/planar-left.u8`, `examples/assets/planar-right.u8` | `planar_audio_assets.py .ref/SDL/examples/audio/05-planar-data/planar-data.c` |

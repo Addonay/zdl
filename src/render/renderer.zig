@@ -43,6 +43,7 @@ const software = @import("software.zig");
 const texture_mod = @import("texture.zig");
 const rotate = @import("rotate.zig");
 const antialias = @import("antialias.zig");
+const debug_font = @import("debug_font_data.zig");
 
 /// Streaming/static/target texture with its own storage, modulation and blend.
 pub const Texture = texture_mod.Texture;
@@ -70,6 +71,8 @@ pub const Error = surface.Error || geometry.GeometryError || software.Error ||
     NotTarget,
     /// A region passed to a read or copy was empty or outside the raster.
     InvalidRect,
+    /// The debug-text input is not well-formed UTF-8.
+    InvalidTextEncoding,
     /// Tile scale must be positive (SDL: "scale <= 0").
     InvalidTileScale,
 };
@@ -326,6 +329,43 @@ pub const Renderer = struct {
         for (rects) |rect| try frame.raster.fill_rect(try device_rect(frame.layout, rect));
     }
 
+    /// Draws SDL's public-domain 8x8 debug font at the current draw color.
+    /// Unsupported Unicode codepoints use the font's final replacement glyph;
+    /// spaces and control separators advance the pen without drawing. Text uses
+    /// the current render scale and viewport just like ordinary points.
+    pub fn debug_text(self: *Renderer, x: f32, y: f32, text: []const u8) Error!void {
+        const utf8 = std.unicode.Utf8View.init(text) catch return error.InvalidTextEncoding;
+        var points: std.ArrayList(FPoint) = .empty;
+        defer points.deinit(self.allocator);
+
+        var cursor_x = x;
+        var iterator = utf8.iterator();
+        while (iterator.nextCodepoint()) |codepoint| : (cursor_x += 8) {
+            const glyph = debug_glyph(codepoint) orelse continue;
+            for (0..8) |row| {
+                const bits = debug_font.glyphs[glyph * 8 + row];
+                for (0..8) |column| {
+                    if (bits & (@as(u8, 1) << @intCast(column)) != 0) {
+                        try points.append(self.allocator, .{ .x = cursor_x + @as(f32, @floatFromInt(column)), .y = y + @as(f32, @floatFromInt(row)) });
+                    }
+                }
+            }
+        }
+
+        const previous_blend = self.blend;
+        self.blend = Blend.ALPHA;
+        defer self.blend = previous_blend;
+        try self.draw_points(points.items);
+    }
+
+    /// Formats a message with Zig's compile-time checked format string, then
+    /// draws it with `debug_text`. The temporary formatted bytes are freed here.
+    pub fn debug_text_format(self: *Renderer, x: f32, y: f32, comptime format: []const u8, arguments: anytype) Error!void {
+        const message = try std.fmt.allocPrint(self.allocator, format, arguments);
+        defer self.allocator.free(message);
+        try self.debug_text(x, y, message);
+    }
+
     /// Draws a line with Wu antialiasing (opt-in; SDL's default line is crisp).
     /// Coordinates are scaled and truncated like `draw_line`.
     pub fn draw_line_antialiased(self: *Renderer, start: FPoint, end: FPoint) Error!void {
@@ -424,6 +464,28 @@ pub const Renderer = struct {
             .y = try offset(device.y, transform.bounds.y),
         };
         try composite(self.active_view(), rotated.view, origin, clip, tex.blend, modulation);
+    }
+
+    /// Maps a texture region onto a parallelogram. `origin`, `right` and `down`
+    /// are its top-left, top-right and bottom-left destination corners, matching
+    /// SDL_RenderTextureAffine; the fourth corner is derived from those three.
+    pub fn copy_affine(self: *Renderer, tex: *Texture, source: ?FRect, origin: FPoint, right: FPoint, down: FPoint) Error!void {
+        const src = (try self.resolve_source(tex, source)) orelse return;
+        if (tex.width() == 0 or tex.height() == 0) return error.InvalidRect;
+        const left_u = src.x / @as(f32, @floatFromInt(tex.width()));
+        const right_u = (src.x + src.width) / @as(f32, @floatFromInt(tex.width()));
+        const top_v = src.y / @as(f32, @floatFromInt(tex.height()));
+        const bottom_v = (src.y + src.height) / @as(f32, @floatFromInt(tex.height()));
+        const fourth = FPoint{ .x = right.x + down.x - origin.x, .y = right.y + down.y - origin.y };
+        const white = Color{ .r = 255, .g = 255, .b = 255, .a = 255 };
+        const vertices = [_]Vertex{
+            .{ .position = origin, .color = white, .uv = .{ .x = left_u, .y = top_v } },
+            .{ .position = right, .color = white, .uv = .{ .x = right_u, .y = top_v } },
+            .{ .position = down, .color = white, .uv = .{ .x = left_u, .y = bottom_v } },
+            .{ .position = fourth, .color = white, .uv = .{ .x = right_u, .y = bottom_v } },
+        };
+        const indices = [_]u32{ 0, 1, 2, 1, 3, 2 };
+        try self.render_geometry(tex, &vertices, &indices);
     }
 
     /// Repeats `source` across `destination` in tiles of `source size * scale`,
@@ -856,6 +918,14 @@ fn modulate(color: Color, multiplier: Color) Color {
         .b = @intCast((@as(u32, color.b) * multiplier.b) / 255),
         .a = @intCast((@as(u32, color.a) * multiplier.a) / 255),
     };
+}
+
+/// Maps SDL's byte/codepoint rules onto its 190 glyph slots.
+fn debug_glyph(codepoint: u21) ?usize {
+    if (codepoint <= 32 or (127 <= codepoint and codepoint <= 160)) return null;
+    if (codepoint >= 190) return 189;
+    if (codepoint < 127) return codepoint - 33;
+    return codepoint - 67;
 }
 
 /// Logical presentation of a state when it is active (not disabled).
