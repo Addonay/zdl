@@ -361,3 +361,9 @@ test "HIDAPI driver unit tests" {
     _ = @import("joystick/hidapi/luna.zig");
     _ = @import("joystick/hidapi/shield.zig");
 }
+
+test "Linux input and KMS unit tests" {
+    _ = @import("platform/evdev.zig");
+    _ = @import("video/kmsdrm/device.zig");
+    _ = @import("platform/linux.zig");
+}

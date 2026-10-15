@@ -314,6 +314,28 @@ const PenLink = struct {
     eraser: bool,
 };
 
+/// Appends `link`, then publishes the pen's events with `publish`. A failed
+/// publication removes the link again, so the link table never names a pen
+/// that was not announced. The caller removes the pen itself on failure.
+fn add_pen_link(
+    comptime Failure: type,
+    allocator: std.mem.Allocator,
+    links: *std.ArrayList(PenLink),
+    link: PenLink,
+    context: anytype,
+    comptime publish: fn (@TypeOf(context)) Failure!void,
+) Failure!void {
+    try links.append(allocator, link);
+    errdefer _ = links.pop();
+    try publish(context);
+}
+
+const PenPublish = struct { platform: *Platform, batch: event.Batch };
+
+fn publish_pen_batch(context: PenPublish) Error!void {
+    return context.platform.emit_batch(context.batch);
+}
+
 /// Platform instance. Owns the backend session, input state, events and windows.
 pub const Platform = struct {
     allocator: std.mem.Allocator,
@@ -323,6 +345,9 @@ pub const Platform = struct {
     wayland: ?*wayland_backend.Session = null,
     kmsdrm: ?*kms_device.Device = null,
     evdev_input: ?evdev.Input = null,
+    /// False while the console VT has released the session. Input is then read
+    /// and discarded, not published.
+    evdev_active: bool = true,
     keyboard: keyboard_state.KeyboardState = .{},
     mouse: mouse.Mouse,
     touches: touch.Touches,
@@ -713,17 +738,10 @@ pub const Platform = struct {
             },
             else => {},
         };
+        // VT transitions come before input so that nothing is published for a
+        // session that has already been released.
+        try self.pump_vt();
         try self.pump_evdev();
-        if (self.kmsdrm) |device| if (device.poll_vt()) |transition| switch (transition) {
-            .release => {
-                try device.release_vt();
-                try device.acknowledge_vt(.release);
-            },
-            .acquire => {
-                try device.acquire_vt();
-                try device.acknowledge_vt(.acquire);
-            },
-        };
         try self.advance_key_repeat();
         if (self.signals) |*signals| {
             if (signals.poll(self.now_ns())) |ev| try self.emit(ev);
@@ -738,22 +756,22 @@ pub const Platform = struct {
     /// intentionally replaced by this platform's monotonic nanosecond clock.
     fn pump_evdev(self: *Platform) Error!void {
         const input = if (self.evdev_input) |*reader| reader else return;
-        const record = for (self.records.items) |candidate| {
-            if (std.meta.activeTag(candidate.native) == .kmsdrm) break candidate;
-        } else return;
-        var dx: f32 = 0;
-        var dy: f32 = 0;
-        var wheel_x: f32 = 0;
-        var wheel_y: f32 = 0;
-        var high_res_x: f32 = 0;
-        var high_res_y: f32 = 0;
-        var has_high_res_x = false;
-        var has_high_res_y = false;
+        const window_id = self.kms_window_id() orelse return;
+        if (!self.evdev_active) {
+            input.discard();
+            return;
+        }
+        try self.handle_evdev_events(window_id, input.poll());
+    }
 
-        for (input.poll()) |raw| switch (raw.type) {
+    /// Publishes evdev events for the KMS window. Motion is accumulated per
+    /// SYN_REPORT packet. A SYN_DROPPED discards the packet in progress.
+    fn handle_evdev_events(self: *Platform, window_id: event.WindowId, events: []const evdev.Event) Error!void {
+        var motion: evdev.Motion = .{};
+        for (events) |raw| switch (raw.type) {
             .key => {
                 if (raw.code < 0x100) {
-                    try self.key_input(record.id, .{
+                    try self.key_input(window_id, .{
                         .scancode = @import("../input/linux_keys.zig").evdev_scancode(raw.code),
                         .down = raw.value != 0,
                         .raw = raw.code,
@@ -761,58 +779,74 @@ pub const Platform = struct {
                         .now_ns = self.now_ns(),
                     }, null);
                 } else if (evdev_button_index(raw.code)) |button| {
-                    try self.mouse_button(record.id, button, raw.value != 0);
+                    try self.mouse_button(window_id, button, raw.value != 0);
                 }
             },
-            .relative => switch (raw.code) {
-                0 => dx += @floatFromInt(raw.value), // REL_X
-                1 => dy += @floatFromInt(raw.value), // REL_Y
-                6 => wheel_x += @floatFromInt(raw.value), // REL_HWHEEL
-                8 => wheel_y += @floatFromInt(raw.value), // REL_WHEEL
-                11 => {
-                    high_res_y += @as(f32, @floatFromInt(raw.value)) / 120.0; // REL_WHEEL_HI_RES
-                    has_high_res_y = true;
-                },
-                12 => {
-                    high_res_x += @as(f32, @floatFromInt(raw.value)) / 120.0; // REL_HWHEEL_HI_RES
-                    has_high_res_x = true;
-                },
-                else => {},
-            },
-            .sync => if (raw.code == 3) { // SYN_DROPPED
-                try self.release_keys(record.id);
-            } else if (raw.code == 0) { // SYN_REPORT
-                try self.flush_evdev_motion(record.id, &dx, &dy, &wheel_x, &wheel_y, &high_res_x, &high_res_y, &has_high_res_x, &has_high_res_y);
-            },
+            .relative => motion.add(raw.code, raw.value),
+            .sync => if (raw.code == 0) try self.flush_evdev_motion(window_id, &motion), // SYN_REPORT
+            .dropped => motion = .{},
             .absolute, .other => {},
         };
-        try self.flush_evdev_motion(record.id, &dx, &dy, &wheel_x, &wheel_y, &high_res_x, &high_res_y, &has_high_res_x, &has_high_res_y);
+        try self.flush_evdev_motion(window_id, &motion);
     }
 
-    fn flush_evdev_motion(
-        self: *Platform,
-        window_id: event.WindowId,
-        dx: *f32,
-        dy: *f32,
-        wheel_x: *f32,
-        wheel_y: *f32,
-        high_res_x: *f32,
-        high_res_y: *f32,
-        has_high_res_x: *bool,
-        has_high_res_y: *bool,
-    ) Error!void {
-        if (dx.* != 0 or dy.* != 0) try self.mouse_move(window_id, dx.*, dy.*, true);
-        const x = if (has_high_res_x.*) high_res_x.* else wheel_x.*;
-        const y = if (has_high_res_y.*) -high_res_y.* else -wheel_y.*;
-        if (x != 0 or y != 0) try self.mouse_wheel(window_id, x, y);
-        dx.* = 0;
-        dy.* = 0;
-        wheel_x.* = 0;
-        wheel_y.* = 0;
-        high_res_x.* = 0;
-        high_res_y.* = 0;
-        has_high_res_x.* = false;
-        has_high_res_y.* = false;
+    fn flush_evdev_motion(self: *Platform, window_id: event.WindowId, motion: *evdev.Motion) Error!void {
+        if (motion.dx != 0 or motion.dy != 0) try self.mouse_move(window_id, motion.dx, motion.dy, true);
+        const scroll = motion.scroll();
+        if (scroll.x != 0 or scroll.y != 0) try self.mouse_wheel(window_id, scroll.x, scroll.y);
+        motion.* = .{};
+    }
+
+    /// The window that direct-display input is delivered to, if a KMS window exists.
+    fn kms_window_id(self: *const Platform) ?event.WindowId {
+        for (self.records.items) |candidate| {
+            if (std.meta.activeTag(candidate.native) == .kmsdrm) return candidate.id;
+        }
+        return null;
+    }
+
+    /// Runs every pending VT transition. Release is acknowledged after the
+    /// device gives up DRM master, then input stops being published and every
+    /// held key and button is released. Acquisition restores master, then
+    /// reconciles key state with the devices so that keys still held are seen.
+    fn pump_vt(self: *Platform) Error!void {
+        const device = self.kmsdrm orelse return;
+        while (device.poll_vt()) |transition| switch (transition) {
+            .release => {
+                try device.release_vt();
+                try device.acknowledge_vt(.release);
+                self.evdev_active = false;
+                try self.release_held_input();
+            },
+            .acquire => {
+                try device.acquire_vt();
+                try device.acknowledge_vt(.acquire);
+                self.evdev_active = true;
+                try self.resynchronize_input();
+            },
+        };
+    }
+
+    /// Releases every key and mouse button that the KMS window reported as held.
+    fn release_held_input(self: *Platform) Error!void {
+        const window_id = self.kms_window_id() orelse return;
+        if (self.evdev_input) |*reader| reader.reset_keys();
+        try self.release_keys(window_id);
+        const held = self.mouse.button_state(false);
+        var index: u8 = 1;
+        while (index <= 32) : (index += 1) {
+            if (held.contains(index)) try self.mouse_button(window_id, index, false);
+        }
+    }
+
+    /// Reports the keys and buttons held on each evdev device after reacquisition.
+    fn resynchronize_input(self: *Platform) Error!void {
+        const window_id = self.kms_window_id() orelse return;
+        const input = if (self.evdev_input) |*reader| reader else return;
+        input.discard();
+        for (0..input.device_count()) |index| {
+            try self.handle_evdev_events(window_id, input.resynchronize_device(index));
+        }
     }
 
     fn evdev_button_index(code: u16) ?u8 {
@@ -950,8 +984,7 @@ pub const Platform = struct {
         if (self.pen_link(source) != null) return;
         const added = try self.pens.add(self.now_ns(), window_id, name, device_type, in_proximity);
         errdefer _ = self.pens.remove(self.now_ns(), window_id, added.id);
-        try self.pen_links.append(self.allocator, .{ .source = source, .id = added.id, .eraser = eraser });
-        try self.emit_batch(added.events);
+        try add_pen_link(Error, self.allocator, &self.pen_links, .{ .source = source, .id = added.id, .eraser = eraser }, PenPublish{ .platform = self, .batch = added.events }, publish_pen_batch);
     }
 
     /// Whether a backend pen source is registered.
@@ -2276,4 +2309,24 @@ fn show_message_box_for(platform_ref: *Platform, parent: ?Window, data: message_
         .wayland => return zenity.show(platform_ref.allocator, platform_ref.io, data),
         .offscreen, .kmsdrm => return error.UnsupportedOperation,
     }
+}
+
+test "a failed pen publication leaves no link behind" {
+    const Failure = error{ OutOfMemory, PublishFailed };
+    const Publish = struct {
+        fn fail(_: void) Failure!void {
+            return error.PublishFailed;
+        }
+        fn succeed(_: void) Failure!void {}
+    };
+    var links: std.ArrayList(PenLink) = .empty;
+    defer links.deinit(std.testing.allocator);
+    const link: PenLink = .{ .source = 7, .id = @fromBackingInt(@as(u32, 1)), .eraser = false };
+
+    try std.testing.expectError(error.PublishFailed, add_pen_link(Failure, std.testing.allocator, &links, link, {}, Publish.fail));
+    try std.testing.expectEqual(@as(usize, 0), links.items.len);
+
+    try add_pen_link(Failure, std.testing.allocator, &links, link, {}, Publish.succeed);
+    try std.testing.expectEqual(@as(usize, 1), links.items.len);
+    try std.testing.expectEqual(@as(u32, 7), links.items[0].source);
 }
