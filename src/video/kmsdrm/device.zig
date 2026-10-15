@@ -87,7 +87,18 @@ const AtomicProperties = struct {
 };
 
 const Scanout = struct { bo: *binding.OpaqueGbmBo, fb_id: u32 };
-const FlipWait = struct { completed: bool = false };
+
+/// A page flip the kernel has accepted whose completion has not been handled.
+/// It is heap-allocated because its address is the kernel's user data, and it
+/// owns `next` (the buffer that becomes scanout on completion) until then.
+const PendingFlip = struct {
+    completed: bool = false,
+    next: Scanout,
+    gbm_surface: ?*binding.OpaqueGbmSurface,
+};
+
+/// Usable CRTC indices are bits of a 32-bit `possible_crtcs` mask.
+const max_crtc_index = 32;
 
 /// Owns a DRM card connection, DRM master lease, GBM device and current
 /// scanout. One Device controls one connector/CRTC at a time. Closing restores
@@ -107,6 +118,7 @@ pub const Device = struct {
     vt_generation: u64 = 0,
     current: ?Scanout = null,
     current_gbm_surface: ?*binding.OpaqueGbmSurface = null,
+    pending_flip: ?*PendingFlip = null,
     atomic: ?AtomicProperties = null,
     primary_plane_id: ?u32 = null,
     atomic_enabled: bool = false,
@@ -160,16 +172,14 @@ pub const Device = struct {
         const encoder = drm.drmModeGetEncoder(fd, selected_encoder_id) orelse return error.NoEncoder;
         defer drm.drmModeFreeEncoder(encoder);
         const crtc_ids = resources.crtcs orelse return error.NoResources;
-        for (0..@intCast(resources.count_crtcs)) |index| {
-            const crtc_id = crtc_ids[index];
-            const current_index = std.math.cast(u5, index) orelse continue;
-            if (crtc_id == encoder.crtc_id or (encoder.possible_crtcs & (@as(u32, 1) << @intCast(index))) != 0) {
-                selected_crtc = if (encoder.crtc_id != 0 and crtc_id == encoder.crtc_id) encoder.crtc_id else crtc_id;
-                selected_crtc_index = current_index;
-                break;
-            }
+        const crtc_count: usize = @min(@as(usize, @intCast(resources.count_crtcs)), max_crtc_index);
+        var busy: [max_crtc_index]bool = @splat(false);
+        for (0..crtc_count) |index| {
+            busy[index] = crtc_routed_to_other_output(fd, drm, resources, crtc_ids[index], connector.connector_id);
         }
-        if (selected_crtc == 0) return error.NoCompatibleCrtc;
+        const crtc_index = pick_crtc_index(crtc_ids[0..crtc_count], encoder.crtc_id, encoder.possible_crtcs, busy[0..crtc_count]) orelse return error.NoCompatibleCrtc;
+        selected_crtc = crtc_ids[crtc_index];
+        selected_crtc_index = @intCast(crtc_index);
         const old_crtc = drm.drmModeGetCrtc(fd, selected_crtc) orelse return error.DeviceFailure;
         const original: OriginalCrtc = .{
             .buffer_id = old_crtc.buffer_id,
@@ -224,51 +234,15 @@ pub const Device = struct {
         if (view.width != self.mode.hdisplay or view.height != self.mode.vdisplay) return error.InvalidSize;
         const gbm = &self.library.gbm_functions;
         const bo = gbm.gbm_bo_create(self.drm_device, self.mode.hdisplay, self.mode.vdisplay, drm_format_xrgb8888, gbm_bo_use_scanout | gbm_bo_use_write | gbm_bo_use_linear) orelse return error.DeviceFailure;
-        errdefer gbm.gbm_bo_destroy(bo);
-        var stride: u32 = 0;
-        var map_data: ?*anyopaque = null;
-        const mapped = gbm.gbm_bo_map(bo, 0, 0, self.mode.hdisplay, self.mode.vdisplay, gbm_bo_transfer_write, &stride, &map_data) orelse return error.BufferMappingFailed;
-        var map_active = true;
-        errdefer if (map_active) gbm.gbm_bo_unmap(bo, map_data);
-        if (stride < @as(u32, self.mode.hdisplay) * 4) return error.BufferMappingFailed;
-        const bytes: [*]u8 = @ptrCast(mapped);
-        for (0..self.mode.vdisplay) |y| {
-            const row = bytes[y * stride ..][0 .. @as(usize, self.mode.hdisplay) * 4];
-            for (0..self.mode.hdisplay) |x| {
-                const color = try view.read(x, y);
-                row[x * 4 + 0] = color.b;
-                row[x * 4 + 1] = color.g;
-                row[x * 4 + 2] = color.r;
-                row[x * 4 + 3] = 0;
-            }
-        }
-        gbm.gbm_bo_unmap(bo, map_data);
-        map_active = false;
-        map_data = null;
-        const handle = gbm.gbm_bo_get_handle(bo).u32;
-        const handles = [4]u32{ handle, 0, 0, 0 };
-        const pitches = [4]u32{ gbm.gbm_bo_get_stride(bo), 0, 0, 0 };
-        const offsets = [4]u32{ 0, 0, 0, 0 };
-        var fb_id: u32 = 0;
-        if (self.library.drm_functions.drmModeAddFB2(self.fd, self.mode.hdisplay, self.mode.vdisplay, drm_format_xrgb8888, &handles, &pitches, &offsets, &fb_id, 0) != 0) return error.DeviceFailure;
-        errdefer _ = self.library.drm_functions.drmModeRmFB(self.fd, fb_id);
-
-        const next = Scanout{ .bo = bo, .fb_id = fb_id };
-        if (self.current == null) {
-            self.initial_modeset(next) catch return error.DeviceFailure;
-        } else {
-            self.flip(next) catch return error.DeviceFailure;
-        }
-        if (self.current) |old| {
-            _ = self.library.drm_functions.drmModeRmFB(self.fd, old.fb_id);
-            if (self.current_gbm_surface) |gbm_surface| {
-                gbm.gbm_surface_release_buffer(gbm_surface, old.bo);
-            } else {
-                gbm.gbm_bo_destroy(old.bo);
-            }
-        }
-        self.current = next;
-        self.current_gbm_surface = null;
+        self.write_scanout_pixels(bo, view) catch |err| {
+            gbm.gbm_bo_destroy(bo);
+            return err;
+        };
+        const fb_id = self.add_framebuffer(bo, self.mode.hdisplay, self.mode.vdisplay) catch |err| {
+            gbm.gbm_bo_destroy(bo);
+            return err;
+        };
+        return self.present_scanout(.{ .bo = bo, .fb_id = fb_id }, null);
     }
 
     /// Creates or replaces the hardware cursor (maximum 64×64). Source pixels
@@ -333,6 +307,9 @@ pub const Device = struct {
     /// Drops scanout/cursor state and DRM master before acknowledging VT release.
     pub fn release_vt(self: *Device) Error!void {
         if (!self.has_master) return;
+        // The CRTC must not be restored under an accepted flip that could still
+        // complete onto it.
+        try self.finish_pending_flip();
         self.hide_cursor();
         if (self.current != null) try self.restore_crtc();
         if (self.library.drm_functions.drmDropMaster(self.fd) != 0) return error.DeviceFailure;
@@ -375,18 +352,20 @@ pub const Device = struct {
     /// master, destroys GBM, unloads both libraries and closes the card fd.
     pub fn deinit(self: *Device) void {
         self.hide_cursor();
+        // An accepted flip is settled before its buffers are touched. If it
+        // cannot be observed, the kernel may still scan them out, so those
+        // buffers are leaked rather than released. Closing the fd below stops
+        // event delivery, so the completion record itself is freed.
+        const flip_settled = if (self.finish_pending_flip()) |_| true else |_| false;
         if (self.current) |current| {
-            if (self.has_master) {
-                self.restore_crtc() catch {};
-                _ = self.library.drm_functions.drmModeRmFB(self.fd, current.fb_id);
-            }
-            if (self.current_gbm_surface) |gbm_surface| {
-                self.library.gbm_functions.gbm_surface_release_buffer(gbm_surface, current.bo);
-            } else {
-                self.library.gbm_functions.gbm_bo_destroy(current.bo);
-            }
+            if (self.has_master) self.restore_crtc() catch {};
+            if (flip_settled) self.release_scanout(current, self.current_gbm_surface);
             self.current = null;
             self.current_gbm_surface = null;
+        }
+        if (self.pending_flip) |pending| {
+            self.allocator.destroy(pending);
+            self.pending_flip = null;
         }
         self.library.gbm_functions.gbm_device_destroy(self.drm_device);
         if (self.has_master) _ = self.library.drm_functions.drmDropMaster(self.fd);
@@ -407,17 +386,104 @@ pub const Device = struct {
         if (self.library.drm_functions.drmModeSetCrtc(self.fd, self.crtc_id, scanout.fb_id, 0, 0, &connector_ids, 1, &self.mode) != 0) return error.DeviceFailure;
     }
 
-    fn flip(self: *Device, scanout: Scanout) Error!void {
-        var wait = FlipWait{};
+    /// Presents `next`, taking ownership of its framebuffer and buffer. Before
+    /// the kernel accepts a flip, any failure releases them. After acceptance
+    /// the buffers belong to `pending_flip` until completion, so a failed wait
+    /// returns the error with them still retained.
+    fn present_scanout(self: *Device, next: Scanout, gbm_surface: ?*binding.OpaqueGbmSurface) Error!void {
+        var owned = true;
+        errdefer if (owned) self.release_scanout(next, gbm_surface);
+
+        // One flip may be in flight at a time, and `current` must be settled
+        // before it is replaced.
+        try self.finish_pending_flip();
+        if (self.current == null) {
+            self.initial_modeset(next) catch return error.DeviceFailure;
+            self.current = next;
+            self.current_gbm_surface = gbm_surface;
+            return;
+        }
+
+        const pending = try self.allocator.create(PendingFlip);
+        pending.* = .{ .next = next, .gbm_surface = gbm_surface };
+        self.submit_flip(pending) catch |err| {
+            // Not accepted: the kernel holds no reference to `pending`.
+            self.allocator.destroy(pending);
+            return err;
+        };
+        owned = false;
+        self.pending_flip = pending;
+        try self.finish_pending_flip();
+    }
+
+    /// Queues a page flip whose completion event will set `pending.completed`.
+    /// The kernel keeps `pending` as user data until the event is handled.
+    fn submit_flip(self: *Device, pending: *PendingFlip) Error!void {
         if (self.atomic_enabled) {
-            if (self.atomic_page_flip(scanout.fb_id, &wait)) {
-                try wait_for_flip(self, &wait);
-                return;
-            }
+            if (self.atomic_page_flip(pending.next.fb_id, pending)) return;
             self.atomic_enabled = false;
         }
-        if (self.library.drm_functions.drmModePageFlip(self.fd, self.crtc_id, scanout.fb_id, drm_mode_page_flip_event, &wait) != 0) return error.DeviceFailure;
-        try wait_for_flip(self, &wait);
+        if (self.library.drm_functions.drmModePageFlip(self.fd, self.crtc_id, pending.next.fb_id, drm_mode_page_flip_event, pending) != 0) return error.DeviceFailure;
+    }
+
+    /// Waits until the pending flip completes, then makes it the current
+    /// scanout and releases the buffer it replaced. A failed wait leaves the
+    /// flip pending, so the next call continues waiting for it.
+    fn finish_pending_flip(self: *Device) Error!void {
+        const pending = self.pending_flip orelse return;
+        var context: binding.EventContext = .{ .version = 2, .vblank_handler = null, .page_flip_handler = on_page_flip, .page_flip_handler2 = null, .sequence_handler = null };
+        while (!pending.completed) {
+            var pollfd = [1]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            _ = std.posix.poll(&pollfd, -1) catch return error.PollFailed;
+            if (self.library.drm_functions.drmHandleEvent(self.fd, &context) != 0) return error.DeviceFailure;
+        }
+        self.pending_flip = null;
+        if (self.current) |old| self.release_scanout(old, self.current_gbm_surface);
+        self.current = pending.next;
+        self.current_gbm_surface = pending.gbm_surface;
+        self.allocator.destroy(pending);
+    }
+
+    /// Removes a framebuffer and returns its buffer to GBM (or its surface).
+    fn release_scanout(self: *Device, scanout: Scanout, gbm_surface: ?*binding.OpaqueGbmSurface) void {
+        _ = self.library.drm_functions.drmModeRmFB(self.fd, scanout.fb_id);
+        if (gbm_surface) |surface_handle| {
+            self.library.gbm_functions.gbm_surface_release_buffer(surface_handle, scanout.bo);
+        } else {
+            self.library.gbm_functions.gbm_bo_destroy(scanout.bo);
+        }
+    }
+
+    /// Registers a scanout-format buffer as a framebuffer object.
+    fn add_framebuffer(self: *Device, bo: *binding.OpaqueGbmBo, width: u32, height: u32) Error!u32 {
+        const gbm = &self.library.gbm_functions;
+        const handles = [4]u32{ gbm.gbm_bo_get_handle(bo).u32, 0, 0, 0 };
+        const pitches = [4]u32{ gbm.gbm_bo_get_stride(bo), 0, 0, 0 };
+        const offsets = [4]u32{ 0, 0, 0, 0 };
+        var fb_id: u32 = 0;
+        if (self.library.drm_functions.drmModeAddFB2(self.fd, width, height, drm_format_xrgb8888, &handles, &pitches, &offsets, &fb_id, 0) != 0) return error.DeviceFailure;
+        return fb_id;
+    }
+
+    /// Converts `view` into the mapped XRGB8888 scanout buffer `bo`.
+    fn write_scanout_pixels(self: *Device, bo: *binding.OpaqueGbmBo, view: surface.View) Error!void {
+        const gbm = &self.library.gbm_functions;
+        var stride: u32 = 0;
+        var map_data: ?*anyopaque = null;
+        const mapped = gbm.gbm_bo_map(bo, 0, 0, self.mode.hdisplay, self.mode.vdisplay, gbm_bo_transfer_write, &stride, &map_data) orelse return error.BufferMappingFailed;
+        defer gbm.gbm_bo_unmap(bo, map_data);
+        if (stride < @as(u32, self.mode.hdisplay) * 4) return error.BufferMappingFailed;
+        const bytes: [*]u8 = @ptrCast(mapped);
+        for (0..self.mode.vdisplay) |y| {
+            const row = bytes[y * stride ..][0 .. @as(usize, self.mode.hdisplay) * 4];
+            for (0..self.mode.hdisplay) |x| {
+                const color = try view.read(x, y);
+                row[x * 4 + 0] = color.b;
+                row[x * 4 + 1] = color.g;
+                row[x * 4 + 2] = color.r;
+                row[x * 4 + 3] = 0;
+            }
+        }
     }
 
     fn atomic_modeset(self: *Device, properties: AtomicProperties, fb_id: u32) bool {
@@ -448,31 +514,26 @@ pub const Device = struct {
         return drm.drmModeAtomicCommit(self.fd, request, drm_mode_atomic_allow_modeset, null) == 0;
     }
 
-    fn atomic_page_flip(self: *Device, fb_id: u32, wait: *FlipWait) bool {
+    fn atomic_page_flip(self: *Device, fb_id: u32, pending: *PendingFlip) bool {
         const properties = self.atomic orelse return false;
         const plane_id = self.primary_plane_id orelse return false;
         const drm = &self.library.drm_functions;
         const request = drm.drmModeAtomicAlloc() orelse return false;
         defer drm.drmModeAtomicFree(request);
         if (drm.drmModeAtomicAddProperty(request, plane_id, properties.plane_fb_id, fb_id) < 0) return false;
-        return drm.drmModeAtomicCommit(self.fd, request, drm_mode_atomic_nonblock | drm_mode_page_flip_event, wait) == 0;
+        return drm.drmModeAtomicCommit(self.fd, request, drm_mode_atomic_nonblock | drm_mode_page_flip_event, pending) == 0;
     }
 
+    /// Restores the CRTC's original mode and buffer, connected to the connector
+    /// that was attached to it. `crtc_routed_to_other_output` guarantees that
+    /// no other connected output was routed to this CRTC, so this single
+    /// connector is the only routing that changes.
     fn restore_crtc(self: *Device) Error!void {
         const connector_ids = [_]u32{self.connector_id};
         if (self.original.mode) |*mode| {
             if (self.library.drm_functions.drmModeSetCrtc(self.fd, self.crtc_id, self.original.buffer_id, self.original.x, self.original.y, &connector_ids, 1, mode) != 0) return error.DeviceFailure;
         } else {
             if (self.library.drm_functions.drmModeSetCrtc(self.fd, self.crtc_id, 0, 0, 0, &connector_ids, 0, null) != 0) return error.DeviceFailure;
-        }
-    }
-
-    fn wait_for_flip(self: *Device, wait: *FlipWait) Error!void {
-        var context: binding.EventContext = .{ .version = 2, .vblank_handler = null, .page_flip_handler = on_page_flip, .page_flip_handler2 = null, .sequence_handler = null };
-        while (!wait.completed) {
-            var pollfd = [1]std.posix.pollfd{.{ .fd = self.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-            _ = std.posix.poll(&pollfd, -1) catch return error.PollFailed;
-            if (self.library.drm_functions.drmHandleEvent(self.fd, &context) != 0) return error.DeviceFailure;
         }
     }
 };
@@ -502,37 +563,29 @@ pub const GbmWindow = struct {
         if (!self.device.has_master or self.vt_generation != self.device.vt_generation) return error.MasterUnavailable;
         const gbm = &self.device.library.gbm_functions;
         const bo = gbm.gbm_surface_lock_front_buffer(self.native) orelse return error.DeviceFailure;
-        errdefer gbm.gbm_surface_release_buffer(self.native, bo);
-        const handle = gbm.gbm_bo_get_handle(bo).u32;
-        const handles = [4]u32{ handle, 0, 0, 0 };
-        const pitches = [4]u32{ gbm.gbm_bo_get_stride(bo), 0, 0, 0 };
-        const offsets = [4]u32{ 0, 0, 0, 0 };
-        var fb_id: u32 = 0;
-        if (self.device.library.drm_functions.drmModeAddFB2(self.device.fd, self.width, self.height, drm_format_xrgb8888, &handles, &pitches, &offsets, &fb_id, 0) != 0) return error.DeviceFailure;
-        errdefer _ = self.device.library.drm_functions.drmModeRmFB(self.device.fd, fb_id);
-        const next = Scanout{ .bo = bo, .fb_id = fb_id };
-        if (self.device.current == null) try self.device.initial_modeset(next) else try self.device.flip(next);
-        if (self.device.current) |old| {
-            _ = self.device.library.drm_functions.drmModeRmFB(self.device.fd, old.fb_id);
-            if (self.device.current_gbm_surface) |old_surface| gbm.gbm_surface_release_buffer(old_surface, old.bo) else gbm.gbm_bo_destroy(old.bo);
-        }
-        self.device.current = next;
-        self.device.current_gbm_surface = self.native;
+        const fb_id = self.device.add_framebuffer(bo, self.width, self.height) catch |err| {
+            gbm.gbm_surface_release_buffer(self.native, bo);
+            return err;
+        };
+        return self.device.present_scanout(.{ .bo = bo, .fb_id = fb_id }, self.native);
     }
 
     pub fn deinit(self: *GbmWindow) void {
-        // A currently scanned-out buffer must first be replaced by the saved
-        // desktop state. Device.deinit owns that restore; keep GBM storage alive.
-        if (self.device.current) |current| if (self.device.current_gbm_surface == self.native) {
-            if (self.device.has_master) {
-                self.device.restore_crtc() catch {};
-                _ = self.device.library.drm_functions.drmModeRmFB(self.device.fd, current.fb_id);
-            }
-            self.device.library.gbm_functions.gbm_surface_release_buffer(self.native, current.bo);
-            self.device.current = null;
-            self.device.current_gbm_surface = null;
-        };
-        self.device.library.gbm_functions.gbm_surface_destroy(self.native);
+        const device = self.device;
+        // A pending flip may own a buffer of this surface, so it is settled
+        // first. If it cannot be settled, the surface stays alive because the
+        // kernel may still scan out from it.
+        if (device.finish_pending_flip()) |_| {
+            // A currently scanned-out buffer must first be replaced by the saved
+            // desktop state. Device.deinit owns that restore; keep GBM storage alive.
+            if (device.current) |current| if (device.current_gbm_surface == self.native) {
+                if (device.has_master) device.restore_crtc() catch {};
+                device.release_scanout(current, self.native);
+                device.current = null;
+                device.current_gbm_surface = null;
+            };
+            device.library.gbm_functions.gbm_surface_destroy(self.native);
+        } else |_| {}
         self.* = undefined;
     }
 };
@@ -561,8 +614,56 @@ fn public_mode(mode: binding.ModeInfo) Mode {
 }
 
 fn on_page_flip(_: c_int, _: u32, _: u32, _: u32, user_data: ?*anyopaque) callconv(.c) void {
-    const wait: *FlipWait = @ptrCast(@alignCast(user_data.?));
-    wait.completed = true;
+    const pending: *PendingFlip = @ptrCast(@alignCast(user_data.?));
+    pending.completed = true;
+}
+
+/// Index of the CRTC for an encoder. The encoder's current CRTC wins so that
+/// existing routing is kept. Otherwise the first compatible CRTC not marked
+/// `busy` is used; a busy CRTC drives another connected output.
+fn pick_crtc_index(crtc_ids: []const u32, current_crtc: u32, possible_crtcs: u32, busy: []const bool) ?usize {
+    if (current_crtc != 0) {
+        for (crtc_ids, 0..) |crtc_id, index| {
+            if (crtc_id == current_crtc) return index;
+        }
+    }
+    for (crtc_ids, busy, 0..) |_, is_busy, index| {
+        if (index >= max_crtc_index) break;
+        if (possible_crtcs & (@as(u32, 1) << @intCast(index)) == 0 or is_busy) continue;
+        return index;
+    }
+    return null;
+}
+
+/// True when a connected connector other than `own_connector_id` is currently
+/// routed to `crtc_id`. Taking such a CRTC would displace that output.
+fn crtc_routed_to_other_output(fd: c_int, drm: *const binding.DrmFunctions, resources: *const binding.Resources, crtc_id: u32, own_connector_id: u32) bool {
+    const connector_ids = resources.connectors orelse return true;
+    for (0..@intCast(resources.count_connectors)) |index| {
+        const connector_id = connector_ids[index];
+        if (connector_id == own_connector_id) continue;
+        const connector = drm.drmModeGetConnector(fd, connector_id) orelse continue;
+        defer drm.drmModeFreeConnector(connector);
+        if (connector.connection != drm_mode_connected or connector.encoder_id == 0) continue;
+        const encoder = drm.drmModeGetEncoder(fd, connector.encoder_id) orelse continue;
+        defer drm.drmModeFreeEncoder(encoder);
+        if (encoder.crtc_id == crtc_id) return true;
+    }
+    return false;
+}
+
+test "CRTC choice prefers the encoder's current CRTC" {
+    const crtcs = [_]u32{ 10, 11 };
+    const none = [_]bool{ false, false };
+    // Both CRTCs are compatible; the current one is index 1, not the first.
+    try std.testing.expectEqual(@as(?usize, 1), pick_crtc_index(&crtcs, 11, 0b11, &none));
+    // Without a current CRTC, the first compatible CRTC is used.
+    try std.testing.expectEqual(@as(?usize, 0), pick_crtc_index(&crtcs, 0, 0b11, &none));
+    // A CRTC driving another output is never taken as a fallback.
+    try std.testing.expectEqual(@as(?usize, 1), pick_crtc_index(&crtcs, 0, 0b11, &[_]bool{ true, false }));
+    // Incompatible CRTCs are skipped, and no usable one yields null.
+    try std.testing.expectEqual(@as(?usize, 1), pick_crtc_index(&crtcs, 0, 0b10, &none));
+    try std.testing.expectEqual(@as(?usize, null), pick_crtc_index(&crtcs, 0, 0b01, &[_]bool{ true, false }));
 }
 
 fn find_atomic_properties(fd: c_int, drm: *const binding.DrmFunctions, connector_id: u32, crtc_id: u32, crtc_index: u5) ?AtomicProperties {
