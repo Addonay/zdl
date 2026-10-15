@@ -67,11 +67,19 @@ has less functionality; the conversion ledger must distinguish these states.
   presentation and RandR displays; requires libc.
 - `src/video/wayland/` (`zdl.wayland`): libwayland-client binding (private),
   generated protocol tables, Window, cursors, clipboard, text input; requires libc.
+- `src/video/kmsdrm/` (`zdl.kmsdrm`): private runtime-loaded libdrm/libgbm,
+  connected output/mode selection, saved CRTC restore, VT release/acquire,
+  atomic/legacy modeset and page flips, GBM scanout/EGL windows and hardware
+  cursor; EGL targets must be rebuilt after a VT change; requires libc.
+- `src/video/offscreen/` (`zdl.offscreen`): headless software framebuffer and
+  optional surfaceless EGL pbuffer/context; the framebuffer needs no display or
+  C library.
 - `src/render/software.zig`: immediate clipped primitives, colored/nearest-textured
   triangle batches, top-left coverage and explicit alias snapshots. Antialiasing
   and remaining renderer integration are pending.
 - `src/platform/` (`zdl.linux`): unified Linux Platform/Window/event pump over
-  the X11 and Wayland backends; requires libc.
+  X11, Wayland, offscreen and KMS/DRM backends; KMS uses `platform/evdev.zig`
+  to route relative input through the shared keyboard/mouse state; requires libc.
 - `src/app/` (`zdl.app`): device registries, render coordinate conversion and
   the main-callbacks loop.
 - `src/fs/` (`zdl.fs`): host folders, path info, directory iteration, glob,
@@ -89,7 +97,8 @@ has less functionality; the conversion ledger must distinguish these states.
 - `src/gpu/` (`zdl.gpu`): GPU API types and the Vulkan backend foundation;
   binding private in `gpu/vulkan/binding.zig`; requires libc.
 - `src/video/egl/`, `src/video/vulkan_surface/` (`zdl.egl`, `zdl.vulkan_surface`):
-  EGL contexts and Vulkan surfaces for X11/Wayland windows; requires libc.
+  EGL contexts and Vulkan surfaces for X11/Wayland/GBM windows plus pbuffer
+  surfaces for offscreen rendering; requires libc.
 - `src/video/{display,window_state,blit_yuv}.zig` (`zdl.video`): displays and
   modes, backend-independent window state, camera frame conversion,
   colorspaces/transfer functions, wide and float formats, P010 YUV and RLE.
@@ -197,11 +206,12 @@ become `builtin.target.*`; `@bitCast` on extern types is gone; bit sets are
 are removed; `ArrayList.getLast` becomes `last()`. Local langrefs:
 `/home/addo/.zvm/{0.17.0,master}/doc/langref.html`.
 
-The build compiles existing tests and a consumer; it does not run them. The user
-has requested no new tests or runtime testing yet. Do not run `zig build test`,
-consumer executables, GUI windows, audio capture/playback, or device probes without
-new authorization. Backend call bodies in the compile consumer are protected by
-the impossible user PID zero, and checks still compile/link their methods.
+The build compiles test bodies and a consumer. The user has now explicitly
+authorized `zig build test` for hardware-free offscreen framebuffer and KMS mode
+math tests in this worktree. Do not run hardware probes, interactive consumer
+executables, GUI windows, audio capture/playback, or device operations. Backend
+call bodies in the compile consumer are protected by the impossible user PID
+zero, and checks still compile/link their methods.
 
 Compile-only Xlib layout validation used both Zig guards and a C-header static
 assert object under `.cache`; it did not execute native code. Core-only

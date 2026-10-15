@@ -32,6 +32,8 @@ pub const NativeWindow = union(enum) {
     /// `wl_surface*` from libwayland-client. A wl_egl_window of `size` is
     /// created on it and owned by the WindowSurface.
     wayland: *anyopaque,
+    /// `gbm_surface*` from a `kmsdrm.GbmWindow`; borrowed.
+    gbm: *anyopaque,
 };
 
 /// An EGL window surface and the native window bookkeeping it needs.
@@ -65,6 +67,10 @@ pub const WindowSurface = struct {
                 const handle = display.library.functions.eglCreateWindowSurface(display.handle, config.handle, @intFromPtr(wl_window), request.ptr) orelse return error.SurfaceCreationFailed;
                 return .{ .display = display, .handle = handle, .wayland_window = wl_window };
             },
+            .gbm => |surface| {
+                const handle = display.library.functions.eglCreateWindowSurface(display.handle, config.handle, @intFromPtr(surface), request.ptr) orelse return error.SurfaceCreationFailed;
+                return .{ .display = display, .handle = handle, .wayland_window = null };
+            },
         }
     }
 
@@ -92,6 +98,36 @@ pub const WindowSurface = struct {
         if (self.wayland_window) |wl_window| {
             if (self.display.wayland_egl) |egl| egl.destroy(wl_window);
         }
+        self.* = undefined;
+    }
+};
+
+/// EGL pbuffer surface for headless rendering. It borrows its Display and must
+/// be deinitialized before that display. Width and height are EGL pixel units.
+pub const PbufferSurface = struct {
+    display: *Display,
+    handle: *binding.Surface,
+
+    /// Creates an EGL pbuffer using a config returned by
+    /// `Display.choose_pbuffer_config`.
+    pub fn create(display: *Display, config: Config, size: Size) Error!PbufferSurface {
+        if (size.width == 0 or size.height == 0) return error.SurfaceCreationFailed;
+        var list: attributes.AttributeList(2) = .{};
+        try list.append(attributes.egl.width, @intCast(size.width));
+        try list.append(attributes.egl.height, @intCast(size.height));
+        const request = list.terminated();
+        const handle = display.library.functions.eglCreatePbufferSurface(display.handle, config.handle, request.ptr) orelse return error.SurfaceCreationFailed;
+        return .{ .display = display, .handle = handle };
+    }
+
+    /// Swaps the pbuffer's EGL buffers when the selected config is double buffered.
+    pub fn swap_buffers(self: *PbufferSurface) Error!void {
+        if (self.display.library.functions.eglSwapBuffers(self.display.handle, self.handle) != binding.true_value) return error.SwapBuffersFailed;
+    }
+
+    /// Releases the pbuffer; the EGL display remains owned by its caller.
+    pub fn deinit(self: *PbufferSurface) void {
+        _ = self.display.library.functions.eglDestroySurface(self.display.handle, self.handle);
         self.* = undefined;
     }
 };

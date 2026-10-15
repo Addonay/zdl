@@ -13,9 +13,10 @@ everything below compiles and links. Linux is the first target.
   JACK backends with matching Output/Input types.
 - Video: pixels, colorspaces, wide/float/YUV formats, RLE, surfaces, BMP,
   JPEG/PNG (`zdl.image`), displays and window state (`zdl.video`), X11
-  (`zdl.x11`) and Wayland (`zdl.wayland`) backends, EGL/OpenGL contexts and
-  Vulkan surfaces (`zdl.egl`, `zdl.vulkan_surface`), the unified Linux
-  platform and event pump (`zdl.linux`), app callbacks (`zdl.app`).
+  (`zdl.x11`), Wayland (`zdl.wayland`), KMS/DRM (`zdl.kmsdrm`) and headless
+  offscreen (`zdl.offscreen`) backends, EGL/OpenGL contexts and Vulkan surfaces
+  (`zdl.egl`, `zdl.vulkan_surface`), the unified Linux platform/event pump
+  (`zdl.linux`), app callbacks (`zdl.app`).
 - Rendering: software renderer (`zdl.render`, `zdl.software`), the SDL GPU API
   on Vulkan (`zdl.gpu`) and a GPU-backed renderer (`zdl.render.gpu`).
 - Input: keyboards/keymaps/state, libxkbcommon (`zdl.xkb`), events and
@@ -26,9 +27,11 @@ everything below compiles and links. Linux is the first target.
   (`zdl.system`), V4L2 cameras, D-Bus, dialogs, notifications, tray, message
   boxes.
 
-Nothing above has been exercised at runtime yet. `docs/porting.md` lists, per
-area, what is implemented, what deliberately differs from SDL and what remains.
-Other platforms are deferred until Linux is complete.
+The offscreen software framebuffer has a display-free unit test. KMS/DRM,
+offscreen EGL, and the other system backends are compile-checked only; no
+hardware or graphics driver was exercised. `docs/porting.md` lists, per area,
+what is implemented, what deliberately differs from SDL and what remains. Other
+platforms are deferred until Linux is complete.
 
 Use Zig master, currently `0.18.0-dev.246+05671ced9`. A build dependency exposes
 source so each consumer compiles only the declarations it uses:

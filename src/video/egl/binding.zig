@@ -33,6 +33,10 @@ pub const egl_version: Int = 0x3054;
 pub const egl_extensions: Int = 0x3055;
 pub const egl_platform_x11: Enum = 0x31D5;
 pub const egl_platform_wayland: Enum = 0x31D8;
+/// EGL_MESA_platform_gbm.
+pub const egl_platform_gbm: Enum = 0x31D7;
+/// EGL_MESA_platform_surfaceless.
+pub const egl_platform_surfaceless: Enum = 0x31DD;
 pub const egl_opengl_api: Enum = 0x30A2;
 pub const egl_opengl_es_api: Enum = 0x30A0;
 
@@ -42,7 +46,7 @@ pub const gl_extensions: u32 = 0x1F03;
 pub const gl_major_version: u32 = 0x821B;
 pub const gl_num_extensions: u32 = 0x821D;
 
-pub const GetPlatformDisplay = *const fn (Enum, *anyopaque, ?[*]const isize) callconv(.c) ?*Display;
+pub const GetPlatformDisplay = *const fn (Enum, ?*anyopaque, ?[*]const isize) callconv(.c) ?*Display;
 pub const GetProcAddress = *const fn ([*:0]const u8) callconv(.c) ?*const anyopaque;
 pub const GlGetString = *const fn (u32) callconv(.c) ?[*:0]const u8;
 pub const GlGetStringi = *const fn (u32, u32) callconv(.c) ?[*:0]const u8;
@@ -61,6 +65,7 @@ pub const Functions = struct {
     eglChooseConfig: *const fn (*Display, [*]const Int, ?[*]?*Config, Int, *Int) callconv(.c) Bool,
     eglGetConfigAttrib: *const fn (*Display, *Config, Int, *Int) callconv(.c) Bool,
     eglCreateWindowSurface: *const fn (*Display, *Config, usize, [*]const Int) callconv(.c) ?*Surface,
+    eglCreatePbufferSurface: *const fn (*Display, *Config, [*]const Int) callconv(.c) ?*Surface,
     eglDestroySurface: *const fn (*Display, *Surface) callconv(.c) Bool,
     eglCreateContext: *const fn (*Display, *Config, ?*Context, [*]const Int) callconv(.c) ?*Context,
     eglDestroyContext: *const fn (*Display, *Context) callconv(.c) Bool,
