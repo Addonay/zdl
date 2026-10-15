@@ -2,7 +2,7 @@
 //! block: `data.json` (document sections) and the chart series in
 //! `chart-area-interactive.tsx`. Generated once; edit by hand if the sample changes.
 
-pub const Status = enum { done, in_process };
+pub const Status = enum { done, in_process, not_started };
 
 pub const Section = struct {
     id: u32,

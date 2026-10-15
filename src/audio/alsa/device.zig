@@ -287,13 +287,28 @@ pub const Device = struct {
         try check(self.library, self.diagnostic, self.library.native.functions.pcm_drain(self.pcm));
     }
 
-    /// Waits for readiness. Null means ALSA's indefinite wait; zero polls once.
-    /// A finite timeout lets an application implement its own deadline policy.
+    /// Waits until a full period can be written (playback) or read (capture).
+    /// Null waits indefinitely; zero polls once. As SDL's ALSA_WaitDevice does,
+    /// readiness is `snd_pcm_avail` against the period size, sleeping a short
+    /// slice between checks. `snd_pcm_wait` is not used: alsa-lib maps a poll
+    /// error to -EIO, which plugins such as pipewire-alsa report for a stream
+    /// that is prepared but not yet started.
     pub fn wait(self: *Device, timeout_milliseconds: ?u31) Error!bool {
-        const result = self.library.native.functions.pcm_wait(self.pcm, if (timeout_milliseconds) |milliseconds| milliseconds else -1);
-        if (result < 0) return self.io_failure(result);
-        self.last_status = 0;
-        return result > 0;
+        const period_ms = (@as(u64, self.period_frames) * 1000) / @max(self.spec.sample_rate, 1);
+        const slice_ms: u31 = @intCast(std.math.clamp(period_ms, 1, 5));
+        var waited: u64 = 0;
+        while (true) {
+            const available = self.library.native.functions.pcm_avail(self.pcm);
+            if (available < 0) return self.io_failure(available);
+            self.last_status = 0;
+            if (@as(usize, @intCast(available)) >= self.period_frames) return true;
+            if (timeout_milliseconds) |limit| {
+                if (waited >= limit) return false;
+            }
+            const request: std.os.linux.timespec = .{ .sec = 0, .nsec = @as(isize, slice_ms) * std.time.ns_per_ms };
+            _ = std.os.linux.nanosleep(&request, null);
+            waited += slice_ms;
+        }
     }
 
     fn io_failure(self: *Device, result: isize) Error {

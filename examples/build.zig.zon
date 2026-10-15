@@ -3,8 +3,8 @@
     .version = "0.0.1",
     .dependencies = .{
         .zdl = .{
-            .url = "git+https://github.com/Addonay/zdl#c64c082fcecbdf41895421c34ead0041026e62b7",
-            .hash = "zdl-0.0.0-k7bE1dsnSgCoiiiZEMQ3n62LAprozf_Mto2j7DJGJh89",
+            .url = "git+https://github.com/Addonay/zdl#d13787d4bd3aeee9b90ed8b0e715ccc0431a81dd",
+            .hash = "zdl-0.0.0-k7bE1bo0SgDk4PQuwF6tSGI2zMk54uTw4BrAcxwgO0Tb",
         },
         .zlay = .{
             .url = "git+https://github.com/Addonay/zlay#d6112faa78b5750a3817b927b7d48bb562634304",

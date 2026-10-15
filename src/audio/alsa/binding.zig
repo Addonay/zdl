@@ -36,6 +36,7 @@ pub const Functions = struct {
     pcm_drain: *const fn (*Pcm) callconv(.c) i32,
     pcm_drop: *const fn (*Pcm) callconv(.c) i32,
     pcm_wait: *const fn (*Pcm, i32) callconv(.c) i32,
+    pcm_avail: *const fn (*Pcm) callconv(.c) isize,
     device_name_hint: *const fn (i32, [*:0]const u8, *?[*:null]?*Hint) callconv(.c) i32,
     device_name_free_hint: *const fn ([*:null]?*Hint) callconv(.c) i32,
     device_name_get_hint: *const fn (*const Hint, [*:0]const u8) callconv(.c) ?[*:0]u8,

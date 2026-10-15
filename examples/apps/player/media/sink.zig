@@ -54,7 +54,9 @@ pub const Sink = struct {
         errdefer allocator.destroy(self);
         self.library = audio.alsa.Library.open() catch return error.Unavailable;
         errdefer self.library.deinit();
-        self.output = try Output.open(allocator, &self.library, .{ .format = .float32_le, .sample_rate = 48_000 });
+        // ~170 ms: the player pumps audio from its UI loop, so a short buffer underruns
+        // whenever a frame (or an unoptimized build) takes longer than one buffer.
+        self.output = try Output.open(allocator, &self.library, .{ .format = .float32_le, .sample_rate = 48_000, .buffer_frames = 8192 });
         errdefer self.output.deinit();
         const spec = self.output.spec();
         self.route = try make_route(allocator, layout, spec.format, spec.sample_rate);

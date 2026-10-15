@@ -298,7 +298,7 @@ const Functions = struct {
     display_read_events: *const fn (Proxy) callconv(.c) c_int,
     display_cancel_read: *const fn (Proxy) callconv(.c) void,
     display_get_error: *const fn (Proxy) callconv(.c) c_int,
-    proxy_marshal_array_flags: *const fn (Proxy, u32, ?*const Interface, u32, u32, ?[*]const Argument) callconv(.c) ?*anyopaque,
+    proxy_marshal_array_flags: *const fn (Proxy, u32, ?*const Interface, u32, u32, ?[*]Argument) callconv(.c) ?*anyopaque,
     proxy_add_listener: *const fn (Proxy, *const anyopaque, ?*anyopaque) callconv(.c) c_int,
     proxy_destroy: *const fn (Proxy) callconv(.c) void,
     proxy_get_version: *const fn (Proxy) callconv(.c) u32,
@@ -416,13 +416,23 @@ pub const Library = struct {
 
     /// Creates an object with an explicit version (untyped `wl_registry.bind`).
     pub fn constructor_version(self: *const Library, object: Proxy, opcode: u32, interface: *const Interface, version: u32, args: []const Argument) Error!Proxy {
-        const created = self.functions.proxy_marshal_array_flags(object, opcode, interface, version, 0, if (args.len == 0) null else args.ptr);
+        const created = self.marshal(object, opcode, interface, version, args);
         return created orelse error.RequestFailed;
     }
 
     /// Sends a request that creates no object.
     pub fn send(self: *const Library, object: Proxy, opcode: u32, args: []const Argument) void {
-        _ = self.functions.proxy_marshal_array_flags(object, opcode, null, self.functions.proxy_get_version(object), 0, if (args.len == 0) null else args.ptr);
+        _ = self.marshal(object, opcode, null, self.functions.proxy_get_version(object), args);
+    }
+
+    // libwayland replaces new_id argument slots with the created proxy. Generated
+    // request literals can live in read-only memory in optimized builds, so every
+    // call receives its own writable copy. No pointer is retained by libwayland.
+    fn marshal(self: *const Library, object: Proxy, opcode: u32, interface: ?*const Interface, version: u32, args: []const Argument) ?Proxy {
+        var writable: [32]Argument = undefined;
+        std.debug.assert(args.len <= writable.len); // All generated request signatures fit.
+        @memcpy(writable[0..args.len], args);
+        return self.functions.proxy_marshal_array_flags(object, opcode, interface, version, 0, if (args.len == 0) null else &writable);
     }
 
     /// Attaches `listener` (one function pointer per event, in event order) with
@@ -1206,3 +1216,20 @@ pub const tablet_tool_listener = [_]?*const anyopaque{
     @ptrCast(&tablet_tool_button),
     @ptrCast(&tablet_tool_frame),
 };
+
+test "constructor gives libwayland writable new-id arguments without mutating the caller" {
+    const Fake = struct {
+        fn marshal(_: Proxy, _: u32, _: ?*const Interface, _: u32, _: u32, args: ?[*]Argument) callconv(.c) ?Proxy {
+            std.debug.assert(args.?[0].u == 42);
+            args.?[1].o = @ptrFromInt(0x2000);
+            return args.?[1].o;
+        }
+    };
+    var lib: Library = undefined;
+    lib.functions.proxy_marshal_array_flags = Fake.marshal;
+    const arguments = [_]Argument{ .{ .u = 42 }, .{ .o = null } };
+    const interface: Interface = undefined;
+    const proxy = try lib.constructor_version(@ptrFromInt(0x1000), 0, &interface, 1, &arguments);
+    try std.testing.expectEqual(@as(Proxy, @ptrFromInt(0x2000)), proxy);
+    try std.testing.expect(arguments[1].o == null);
+}

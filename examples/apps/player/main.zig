@@ -31,6 +31,13 @@ const Program = struct {
     preferences: bool = false,
     info: bool = false,
     repeat: bool = false,
+    volume: f32 = 0.5,
+    muted: bool = false,
+    scrubbing: bool = false,
+    scrub_target: f64 = 0,
+    resume_after_scrub: bool = false,
+    volume_drag: bool = false,
+    remaining_time: bool = false,
     notice: []const u8 = "",
     video_custom: ui.Custom = undefined,
     seek_custom: ui.Custom = undefined,
@@ -63,13 +70,20 @@ const Program = struct {
     fn load(self: *Program, index: usize) void {
         if (index >= self.playlist.items.len) return;
         // Close the previous audio device before opening its replacement.
-        if (self.player) |p| p.close();
+        if (self.player) |p| {
+            self.volume = p.get_volume();
+            self.muted = p.is_muted();
+            p.close();
+        }
+        self.scrubbing = false;
         self.player = null;
         self.cached_seconds = null;
         self.player = media.Player.open(self.allocator, self.io, self.playlist.items[index]) catch |err| {
             self.notice = @errorName(err);
             return;
         };
+        self.player.?.set_volume(self.volume) catch {};
+        self.player.?.set_muted(self.muted) catch {};
         self.current = index;
         self.notice = "";
     }
@@ -153,11 +167,13 @@ const Program = struct {
         self.volume_custom = .{ .draw = draw_volume, .context = self };
         const dimensions = u.layout.getLayoutDimensions();
         u.open(id("player-root"), .{ .layout = .{ .sizing = .{ .width = .grow(.{}), .height = .grow(.{}) }, .direction = .top_to_bottom }, .background_color = u.theme.background });
-        u.open(id("titlebar"), .{ .layout = .{ .sizing = .{ .width = .grow(.{}), .height = .fixed(40) }, .padding = .{ .left = 8, .right = 148 }, .child_gap = 4, .child_alignment = .{ .y = .center } } });
-        text(u, "VLC", 2, 15, u.theme.primary);
+        u.open(id("titlebar"), .{ .layout = .{ .sizing = .{ .width = .grow(.{}), .height = .fixed(40) }, .padding = .{ .left = 6, .right = 114 }, .child_gap = 7, .child_alignment = .{ .y = .center } } });
+        u.open(id("vlc-logo-slot"), .{ .layout = .{ .sizing = .{ .width = .fixed(38), .height = .fixed(28) }, .child_alignment = .center } });
+        u.icon(id("vlc-logo"), ix(.vlc_logo), 24, u.theme.primary);
+        u.close();
         if (self.button(u, "file-menu", .more, false)) self.open_files();
         if (self.button(u, "sidebar-toggle", .sidebar, false)) self.sidebar = !self.sidebar;
-        W.separator(u, id("title-divider"), true, 20);
+        u.icon(id("title-divider"), ix(.divider), 24, u.theme.muted_foreground);
         if (W.button(u, id("open-file"), .{ .label = "Videos", .icon = ix(.folder), .variant = .ghost, .size = .sm, .font = .regular, .radius = 4 })) self.open_files();
         space(u, "title-left-space");
         u.open(id("window-title"), .{ .layout = .{ .sizing = .{ .width = .fit(.{}), .height = .fit(.{}) } }, .floating = .{ .attach_to = .element_with_id, .parent_id = id("titlebar").id, .attach_points = .{ .element = .center_center, .parent = .center_center } } });
@@ -203,7 +219,7 @@ const Program = struct {
         u.theme.sidebar = if (dark) C.rgb(14, 14, 14) else C.rgb(221, 221, 221);
     }
     fn button(_: *Program, u: *ui.Ui, name: []const u8, glyph: assets.Icon, active: bool) bool {
-        return W.button(u, id(name), .{ .icon = ix(glyph), .icon_size = 24, .variant = if (active) .default else .ghost, .size = .icon_sm, .radius = 4 });
+        return W.button(u, id(name), .{ .icon = ix(glyph), .icon_size = 24, .variant = if (active) .default else .ghost, .size = .icon_sm, .radius = if (active) 6 else 4, .width = if (active) 54 else if (std.mem.eql(u8, name, "fullscreen")) 36 else if (std.mem.eql(u8, name, "previous") or std.mem.eql(u8, name, "next") or std.mem.eql(u8, name, "mute") or std.mem.eql(u8, name, "tracks") or std.mem.eql(u8, name, "preferences") or std.mem.eql(u8, name, "playlist-button") or std.mem.eql(u8, name, "audio-settings")) 30 else 28, .height = if (std.mem.eql(u8, name, "tracks") or std.mem.eql(u8, name, "preferences") or std.mem.eql(u8, name, "playlist-button") or std.mem.eql(u8, name, "audio-settings")) 32 else 28 });
     }
     fn build_sidebar(self: *Program, u: *ui.Ui) void {
         u.open(id("navigation"), .{ .layout = .{ .sizing = .{ .width = .fixed(50), .height = .grow(.{}) }, .direction = .top_to_bottom, .padding = .axes(8, 8), .child_gap = 16 } });
@@ -234,25 +250,66 @@ const Program = struct {
         };
         const p = self.player;
         const playing = if (p) |value| !value.is_paused() else false;
-        u.open(id("playback-controls"), .{ .layout = .{ .sizing = .{ .width = .grow(.{}), .height = .fixed(50) }, .padding = .axes(16, 0), .child_gap = 8, .child_alignment = .{ .y = .center } } });
+        if (p) |value| {
+            self.volume = value.get_volume();
+            self.muted = value.is_muted();
+        }
+        u.open(id("playback-controls"), .{ .layout = .{ .sizing = .{ .width = .grow(.{}), .height = .fixed(54) }, .padding = .axes(20, 0), .child_gap = 20, .child_alignment = .{ .y = .center } } });
+        u.open(id("transport"), .{ .layout = .{ .child_gap = 8, .child_alignment = .center } });
         if (self.button(u, "previous", .previous, false)) advance = true;
         if (self.button(u, "play-pause", if (playing) .pause else .play, true)) {
             if (p) |value| value.toggle_pause() catch {} else self.open_files();
         }
         if (self.button(u, "next", .next, false)) advance = false;
+        u.close();
         const position = if (p) |value| value.position() else 0;
         const duration = if (p) |value| value.duration() else 0;
-        text(u, self.time(position), 4, 14, u.theme.muted_foreground);
+        u.open(id("timeline"), .{ .layout = .{ .sizing = .{ .width = .grow(.{}) }, .child_gap = 8, .child_alignment = .center } });
+        self.time_label(u, "current-time", if (self.scrubbing) self.scrub_target else position, false);
         u.clickable(id("seek"));
+        u.focusable(id("seek"));
         u.open(id("seek"), .{ .layout = .{ .sizing = .{ .width = .grow(.{}), .height = .fixed(28) } }, .custom = .{ .data = &self.seek_custom } });
         u.close();
-        if (u.pressed(id("seek")) and self.seek_rect.w > 0) if (p) |value| value.seek(std.math.clamp((u.pointer().x - self.seek_rect.x) / self.seek_rect.w, 0, 1) * duration) catch {};
-        text(u, self.time(duration), 4, 14, u.theme.muted_foreground);
-        if (self.button(u, "mute", .volume, false)) if (p) |value| value.set_muted(!value.is_muted()) catch {};
-        u.clickable(id("volume"));
-        u.open(id("volume"), .{ .layout = .{ .sizing = .{ .width = .fixed(90), .height = .fixed(24) } }, .custom = .{ .data = &self.volume_custom } });
+        if (p) |value| {
+            if (u.pointer_pressed() and u.hovered(id("seek")) and self.seek_rect.w > 0) {
+                self.scrubbing = true;
+                self.resume_after_scrub = !value.is_paused();
+                value.pause();
+            }
+            if (self.scrubbing and self.seek_rect.w > 0) {
+                self.scrub_target = @as(f64, std.math.clamp((u.pointer().x - self.seek_rect.x) / self.seek_rect.w, 0, 1)) * duration;
+                if (u.layout.pointerState().state == .released_this_frame) {
+                    value.seek(self.scrub_target) catch |err| {
+                        self.notice = @errorName(err);
+                    };
+                    if (self.resume_after_scrub) value.play() catch {};
+                    self.scrubbing = false;
+                }
+            }
+        }
+        self.time_label(u, "duration", if (self.remaining_time) @max(0, duration - position) else duration, self.remaining_time);
+        if (u.pressed(id("duration"))) self.remaining_time = !self.remaining_time;
         u.close();
-        if (u.pressed(id("volume")) and self.volume_rect.w > 0) if (p) |value| value.set_volume(std.math.clamp((u.pointer().x - self.volume_rect.x) / self.volume_rect.w, 0, 1)) catch {};
+        u.open(id("audio-controls"), .{ .layout = .{ .child_gap = 8, .child_alignment = .center } });
+        if (self.button(u, "mute", .volume, false)) {
+            self.muted = !self.muted;
+            if (p) |value| value.set_muted(self.muted) catch {};
+        }
+        u.clickable(id("volume"));
+        u.open(id("volume"), .{ .layout = .{ .sizing = .{ .width = .fixed(88), .height = .fixed(28) } }, .custom = .{ .data = &self.volume_custom } });
+        u.close();
+        if (u.pointer_pressed() and u.hovered(id("volume"))) self.volume_drag = true;
+        if (self.volume_drag and self.volume_rect.w > 0) {
+            self.volume = std.math.clamp((u.pointer().x - self.volume_rect.x) / self.volume_rect.w, 0, 1);
+            if (p) |value| value.set_volume(self.volume) catch {};
+            if (u.layout.pointerState().state == .released_this_frame) self.volume_drag = false;
+        }
+        u.close();
+        u.open(id("extra-controls"), .{ .layout = .{ .child_gap = 12, .child_alignment = .center } });
+        if (self.button(u, "audio-settings", .audio, false)) {
+            self.preferences = !self.preferences;
+            self.info = false;
+        }
         if (self.button(u, "tracks", .subtitles, false)) {
             self.info = !self.info;
             self.preferences = false;
@@ -262,6 +319,16 @@ const Program = struct {
             self.info = false;
         }
         if (self.button(u, "playlist-button", .playlist, false)) self.sidebar = !self.sidebar;
+        u.close();
+        u.close();
+    }
+    fn time_label(self: *Program, u: *ui.Ui, name: []const u8, seconds: f64, negative: bool) void {
+        const key = id(name);
+        u.focusable(key);
+        u.clickable(key);
+        u.open(key, .{ .layout = .{ .sizing = .{ .width = .fixed(76), .height = .fixed(28) }, .child_alignment = .center }, .background_color = if (u.hovered(key)) u.theme.accent else C.transparent, .corner_radius = .all(6) });
+        const label = self.time(seconds);
+        u.text_run(if (negative) self.format("-{s}", .{label}) else label, .{ .font = 0, .size = 15, .line_height = 17, .color = u.theme.muted_foreground, .wrap = .none });
         u.close();
     }
     fn time(self: *Program, seconds: f64) []const u8 {
@@ -334,7 +401,7 @@ const Program = struct {
     fn draw_seek(canvas: *ui.Canvas, rect: ui.Rect, context: *anyopaque) void {
         const self: *Program = @ptrCast(@alignCast(context));
         self.seek_rect = .{ .x = rect.x / self.layout_scale, .y = rect.y / self.layout_scale, .w = rect.w / self.layout_scale, .h = rect.h / self.layout_scale };
-        const ratio = if (self.player) |p| if (p.duration() > 0) std.math.clamp(p.position() / p.duration(), 0, 1) else 0 else 0;
+        const ratio = if (self.player) |p| if (p.duration() > 0) std.math.clamp((if (self.scrubbing) self.scrub_target else p.position()) / p.duration(), 0, 1) else 0 else 0;
         const base = C.rgb(9, 9, 9);
         const orange = C.rgb(211, 121, 24);
         canvas.fill_rounded(rect, .all(4 * self.layout_scale), .{ .solid = base });
@@ -345,7 +412,7 @@ const Program = struct {
     fn draw_volume(canvas: *ui.Canvas, rect: ui.Rect, context: *anyopaque) void {
         const self: *Program = @ptrCast(@alignCast(context));
         self.volume_rect = .{ .x = rect.x / self.layout_scale, .y = rect.y / self.layout_scale, .w = rect.w / self.layout_scale, .h = rect.h / self.layout_scale };
-        const volume = if (self.player) |p| if (p.is_muted()) 0 else p.get_volume() else 0;
+        const volume: f32 = if (self.muted) 0 else self.volume;
         canvas.fill_rounded(rect, .all(3 * self.layout_scale), .{ .solid = C.rgb(9, 9, 9) });
         canvas.fill_rounded(.{ .x = rect.x + 4 * self.layout_scale, .y = rect.y + 8 * self.layout_scale, .w = @max(0, (rect.w - 8 * self.layout_scale) * volume), .h = 8 * self.layout_scale }, .all(2 * self.layout_scale), .{ .solid = C.rgb(134, 166, 16) });
     }
@@ -353,12 +420,12 @@ const Program = struct {
 pub fn main(init: std.process.Init) !void {
     var app = Program{ .allocator = init.gpa, .io = init.io };
     defer app.deinit();
-    var options = ui.Options{ .title = "VLC Media Player", .fonts = &assets.fonts, .icons = &assets.icons, .dark = true, .titlebar_height = 40 };
+    var options = ui.Options{ .title = "VLC Media Player", .fonts = &assets.fonts, .icons = &assets.icons, .dark = true, .titlebar_height = 40, .caption_button_width = 36, .caption_glyph = 14, .caption_right_padding = 6, .muted_caption_buttons = true };
     var args = std.process.Args.Iterator.init(init.minimal.args);
     defer args.deinit();
     _ = args.next();
     while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "--smoke")) options.smoke = true else if (std.mem.eql(u8, arg, "--snapshot")) options.snapshot_path = args.next() orelse return error.MissingSnapshotPath else if (std.mem.eql(u8, arg, "--light")) options.dark = false else if (std.mem.eql(u8, arg, "--playlist")) app.sidebar = true else try app.add(arg);
+        if (std.mem.eql(u8, arg, "--size")) try options.set_size(args.next() orelse return error.MissingSize) else if (std.mem.eql(u8, arg, "--smoke")) options.smoke = true else if (std.mem.eql(u8, arg, "--snapshot")) options.snapshot_path = args.next() orelse return error.MissingSnapshotPath else if (std.mem.eql(u8, arg, "--light")) options.dark = false else if (std.mem.eql(u8, arg, "--playlist")) app.sidebar = true else try app.add(arg);
     }
     if (app.playlist.items.len > 0) {
         app.load(0);

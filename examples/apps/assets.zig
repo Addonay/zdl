@@ -116,3 +116,6 @@ pub const icon_sources = [_][]const u8{
     @embedFile("assets/icons/tabler-user-circle.svg"),
     @embedFile("assets/icons/tabler-users.svg"),
 };
+
+/// Public avatar used by the shadcn dashboard reference.
+pub const avatar_jpg = @embedFile("assets/shadcn.jpg");

@@ -150,6 +150,7 @@ pub const Player = struct {
     accepted_frames: u64 = 0,
     paused: bool = false,
     pause_needs_seek: bool = false,
+    hardware_paused: bool = false,
     seek_floor: f64 = 0,
     ended: bool = false,
     failed: bool = false,
@@ -263,9 +264,10 @@ pub const Player = struct {
         if (self.pause_needs_seek) {
             try self.seek(self.position());
             self.pause_needs_seek = false;
-        } else if (self.sink) |sink| {
-            if (!sink.set_paused(false)) try self.seek(self.position());
+        } else if (self.hardware_paused) {
+            if (self.sink) |sink| if (!sink.set_paused(false)) try self.seek(self.position());
         }
+        self.hardware_paused = false;
         self.paused = false;
         self.clock.set_running(true, self.accepted_frames, self.now());
     }
@@ -274,7 +276,10 @@ pub const Player = struct {
         if (self.paused) return;
         self.clock.set_running(false, self.accepted_frames, self.now());
         self.paused = true;
-        if (self.sink) |sink| self.pause_needs_seek = !sink.set_paused(true);
+        if (self.sink) |sink| {
+            self.hardware_paused = sink.set_paused(true);
+            self.pause_needs_seek = !self.hardware_paused;
+        }
     }
 
     pub fn toggle_pause(self: *Player) !void {
@@ -299,6 +304,8 @@ pub const Player = struct {
         self.shared.mutex.unlock(io);
 
         if (self.sink) |sink| try sink.clear();
+        self.hardware_paused = false;
+        self.pause_needs_seek = false;
         if (self.pending) |picture| {
             self.free_picture(picture);
             self.pending = null;
@@ -646,7 +653,10 @@ pub const Player = struct {
         self.ended = true;
         self.paused = true;
         self.clock.set_running(false, self.accepted_frames, self.now());
-        if (self.sink) |sink| self.pause_needs_seek = !sink.set_paused(true);
+        if (self.sink) |sink| {
+            self.hardware_paused = sink.set_paused(true);
+            self.pause_needs_seek = !self.hardware_paused;
+        }
         self.push_event(.ended);
     }
 

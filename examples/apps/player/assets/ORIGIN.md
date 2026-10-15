@@ -24,3 +24,8 @@ Icons copied from the user-supplied VLC Redesign Figma export, https://www.figma
 - add: 463:550
 
 Inter 4.1: https://github.com/rsms/inter/releases/tag/v4.1; DM Mono: https://github.com/google/fonts/tree/main/ofl/dmmono. Font licenses included.
+
+The VLC logo, divider and audio-control icons are copied unchanged from the
+user's `Downloads/VLC Redesign (Community) (1).zip` SVG export. The matching
+`VLC Redesign (Community).zip` contains the PNG frame references. Existing
+exports are reused locally; no plugin connection is needed to build the app.

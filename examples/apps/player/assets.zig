@@ -6,7 +6,7 @@ pub const fonts = [_][]const u8{
     @embedFile("assets/fonts/Inter-SemiBold.otf"),
     @embedFile("assets/fonts/DMMono-Regular.ttf"),
 };
-pub const Icon = enum(u16) { play, pause, previous, next, fullscreen, playlist, settings, volume, home, videos, music, streaming, recent, folder, subtitles, more, sidebar, search, sort, list, preferences, add };
+pub const Icon = enum(u16) { play, pause, previous, next, fullscreen, playlist, settings, volume, home, videos, music, streaming, recent, folder, subtitles, more, sidebar, search, sort, list, preferences, add, vlc_logo, divider, audio };
 pub const icons = [_][]const u8{
     @embedFile("assets/icons/play.svg"),
     @embedFile("assets/icons/pause.svg"),
@@ -30,4 +30,7 @@ pub const icons = [_][]const u8{
     @embedFile("assets/icons/list.svg"),
     @embedFile("assets/icons/preferences.svg"),
     @embedFile("assets/icons/add.svg"),
+    @embedFile("assets/icons/vlc-logo.svg"),
+    @embedFile("assets/icons/divider.svg"),
+    @embedFile("assets/icons/audio.svg"),
 };

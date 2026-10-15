@@ -27,7 +27,7 @@ const radius_lg: f32 = 10;
 const radius_full: f32 = 9999;
 
 fn with_alpha(color: Color, alpha: f32) Color {
-    return color.withAlpha(alpha * 255);
+    return color.withAlpha(alpha * color.a);
 }
 
 fn style(font: Role, size: u16, line_height: u16, color: Color) runtime.TextStyle {
@@ -55,6 +55,8 @@ pub const ButtonOptions = struct {
     font: Role = .medium,
     icon_size: f32 = 16,
     radius: f32 = radius_md,
+    height: ?f32 = null,
+    padding_x: ?u16 = null,
 };
 
 const ButtonColors = struct { background: Color, foreground: Color, border: Color };
@@ -92,11 +94,11 @@ fn button_colors(theme: *const Theme, variant: Variant, hovered: bool) ButtonCol
 /// A shadcn `Button`. Returns true on the frame it was pressed.
 pub fn button(ui: *Ui, id: Id, options: ButtonOptions) bool {
     const icon_only = options.size == .icon or options.size == .icon_sm;
-    const height: f32 = switch (options.size) {
+    const height: f32 = options.height orelse switch (options.size) {
         .default, .icon => 36,
         .sm, .icon_sm => 32,
     };
-    const padding: f32 = switch (options.size) {
+    const padding: f32 = if (options.padding_x) |v| @floatFromInt(v) else switch (options.size) {
         .default => 16,
         .sm => 12,
         .icon, .icon_sm => 0,
@@ -144,6 +146,9 @@ pub const BadgeOptions = struct {
     icon: ?u16 = null,
     variant: BadgeVariant = .outline,
     foreground: ?Color = null,
+    icon_color: ?Color = null,
+    padding_x: u16 = 8,
+    font: Role = .medium,
 };
 
 /// A pill-shaped `Badge` (rounded-full, text-xs medium, icons 12 points).
@@ -160,7 +165,7 @@ pub fn badge(ui: *Ui, id: Id, options: BadgeOptions) void {
     ui.open(id, .{
         .layout = .{
             .sizing = .{ .width = .fit(.{}), .height = .fit(.{}) },
-            .padding = .axes(8, 2),
+            .padding = .axes(options.padding_x + 1, 3),
             .child_gap = 4,
             .child_alignment = .center,
         },
@@ -168,8 +173,8 @@ pub fn badge(ui: *Ui, id: Id, options: BadgeOptions) void {
         .corner_radius = .all(radius_full),
         .border = .{ .color = border, .width = .outside(1) },
     });
-    if (options.icon) |index| ui.icon(Id.seeded("badge-icon", id.id), index, 12, options.foreground orelse text_color);
-    ui.text_run(options.label, style(.medium, 12, 16, options.foreground orelse text_color));
+    if (options.icon) |index| ui.icon(Id.seeded("badge-icon", id.id), index, 12, options.icon_color orelse options.foreground orelse text_color);
+    ui.text_run(options.label, style(options.font, 12, 16, options.foreground orelse text_color));
     ui.close();
 }
 
@@ -277,13 +282,13 @@ pub fn toggle_item(ui: *Ui, id: Id, label: []const u8, active: bool, edge: Toggl
     };
     ui.open(id, .{
         .layout = .{
-            .sizing = .{ .width = .fit(.{}), .height = .fixed(32) },
-            .padding = .axes(10, 0),
+            .sizing = .{ .width = .fit(.{}), .height = .fixed(36) },
+            .padding = .axes(17, 0),
             .child_alignment = .center,
         },
         .background_color = if (active) theme.accent else if (hovered) theme.muted else theme.background,
         .corner_radius = radius,
-        .border = .{ .color = theme.input, .width = .{ .left = 1, .right = 1, .top = 1, .bottom = 1 } },
+        .border = .{ .color = theme.input, .width = .{ .left = if (edge == .first or edge == .single) 1 else 0, .right = 1, .top = 1, .bottom = 1 } },
         .user_data = @constCast(&ui.decors.xs),
     });
     ui.text_run(label, style(.medium, 14, 20, if (active) theme.accent_foreground else theme.foreground));
@@ -302,6 +307,7 @@ pub const FieldOptions = struct {
     align_right: bool = false,
     /// Shows the caret at the end of the value when focused.
     focused: bool = false,
+    bordered: bool = false,
 };
 
 /// A `Input` in the table style: transparent until hovered or focused. Returns
@@ -320,13 +326,22 @@ pub fn field(ui: *Ui, id: Id, value: []const u8, options: FieldOptions) bool {
             .child_gap = 0,
             .child_alignment = .{ .x = if (options.align_right) .right else .left, .y = .center },
         },
-        .background_color = if (focused) theme.background else if (hovered) with_alpha(theme.input, 0.3) else Color.transparent,
+        .clip = .{ .horizontal = true },
+        .background_color = if (options.bordered) with_alpha(theme.input, 0.3) else if (focused) theme.background else if (hovered) with_alpha(theme.input, 0.3) else Color.transparent,
         .corner_radius = .all(radius_md),
-        .border = if (focused) .{ .color = theme.input, .width = .outside(1) } else .{},
+        .border = if (focused or options.bordered) .{ .color = theme.input, .width = .outside(1) } else .{},
         .user_data = if (focused) @constCast(&ui.decors.xs) else null,
     });
     if (value.len > 0) {
-        ui.text_run(value, style(.regular, 14, 20, theme.foreground));
+        var shown = value;
+        if (focused) {
+            const available = @max(0, options.width - 18);
+            while (shown.len > 0 and ui.measure(shown, style(.regular, 14, 20, theme.foreground)) > available) {
+                const length = std.unicode.utf8ByteSequenceLength(shown[0]) catch 1;
+                shown = shown[@min(length, shown.len)..];
+            }
+        }
+        ui.text_run(shown, style(.regular, 14, 20, theme.foreground));
     } else if (options.placeholder.len > 0) {
         ui.text_run(options.placeholder, style(.regular, 14, 20, theme.muted_foreground));
     }
@@ -400,7 +415,7 @@ pub fn popover_begin(ui: *Ui, id: Id, anchor: Id, width: f32, decor: *const runt
                 .parent = if (above) (if (align_end) .right_top else .left_top) else (if (align_end) .right_bottom else .left_bottom),
             },
             .offset = .{ .x = 0, .y = if (above) -4 else 4 },
-            .z_index = 100,
+            .z_index = 300,
             .pointer_capture_mode = .capture,
         },
     });

@@ -342,12 +342,26 @@ pub const Options = struct {
     dark: bool = false,
     custom_titlebar: bool = true,
     titlebar_height: u16 = 48,
+    caption_button_width: u16 = 46,
+    caption_glyph: u16 = 10,
+    caption_right_padding: u16 = 0,
+    muted_caption_buttons: bool = false,
     /// Open a native window, present one frame and close for runtime QA.
     smoke: bool = false,
-    /// Write a deterministic first frame without opening a display.
+    /// Write a stabilized deterministic snapshot without opening a display.
     snapshot_path: ?[]const u8 = null,
+    snapshot_frames: u8 = 2,
     /// Frame rate while an animation runs. Idle windows block in `wait_event`.
     animation_hz: f64 = 60,
+
+    pub fn set_size(self: *Options, value: []const u8) error{InvalidSize}!void {
+        var parts = std.mem.splitScalar(u8, value, 'x');
+        const width = std.fmt.parseInt(u16, parts.next() orelse return error.InvalidSize, 10) catch return error.InvalidSize;
+        const height = std.fmt.parseInt(u16, parts.next() orelse return error.InvalidSize, 10) catch return error.InvalidSize;
+        if (parts.next() != null or width < self.min_width or height < self.min_height or width > 8192 or height > 8192) return error.InvalidSize;
+        self.width = width;
+        self.height = height;
+    }
 };
 
 const wheel_step: f32 = 40;
@@ -426,13 +440,16 @@ pub fn run(comptime Program: type, program: *Program, init: std.process.Init, op
         .surface = &surface,
         .animation_hz = options.animation_hz,
         .snapshot_path = options.snapshot_path,
+        .snapshot_frames = @max(1, options.snapshot_frames),
         .custom_titlebar = options.custom_titlebar,
         .smoke = options.smoke,
+        .caption_right_padding = options.caption_right_padding,
+        .muted_caption_buttons = options.muted_caption_buttons,
         .controls = zdl.linux.window_controls.Controls.init(zdl.linux.window_controls.load(allocator, io, .{
             .current = environment.getPosix("XDG_CURRENT_DESKTOP"),
             .home = environment.getPosix("HOME"),
             .config_home = environment.getPosix("XDG_CONFIG_HOME"),
-        }), .{ .height = options.titlebar_height }),
+        }), .{ .height = options.titlebar_height, .button_width = options.caption_button_width, .glyph = options.caption_glyph }),
     };
     const result = try zdl.app.callbacks.run(Frame(Program), &frame, platform, io, .{
         .pacing = .wait_event,
@@ -467,8 +484,12 @@ fn Frame(comptime Program: type) type {
         surface: *zdl.surface.Surface,
         animation_hz: f64,
         snapshot_path: ?[]const u8,
+        snapshot_frames: u8,
+        frames_drawn: u8 = 0,
         custom_titlebar: bool,
         smoke: bool,
+        caption_right_padding: u16,
+        muted_caption_buttons: bool,
         controls: zdl.linux.window_controls.Controls,
 
         pointer: zlay.Vec2 = .{ .x = -1, .y = -1 },
@@ -526,7 +547,7 @@ fn Frame(comptime Program: type) type {
                 std.debug.print("frame failed: {s}\n", .{@errorName(err)});
                 return .failure;
             };
-            return if (self.snapshot_path != null or self.smoke) .success else .@"continue";
+            return if ((self.snapshot_path != null and self.frames_drawn >= self.snapshot_frames) or (self.smoke and self.frames_drawn > 0)) .success else .@"continue";
         }
 
         fn advance_focus(self: *Self, backwards: bool) void {
@@ -549,6 +570,7 @@ fn Frame(comptime Program: type) type {
 
         fn draw_frame(self: *Self, context: *zdl.app.callbacks.Context) !void {
             const ui = self.ui;
+            if (self.snapshot_path != null) self.needs_frame = true;
             const logical = try self.window.size();
             const pixels = try self.window.size_in_pixels();
             if (pixels.width == 0 or pixels.height == 0) return;
@@ -588,6 +610,17 @@ fn Frame(comptime Program: type) type {
 
             // zlay hit-tests the pointer against the previous layout, as in Clay.
             ui.layout.setPointerState(self.pointer, self.pointer_down);
+            if (ui.layout.pointerState().state == .pressed_this_frame) {
+                ui.focus = 0;
+                var remaining = ui.focusable_count;
+                while (remaining > 0) {
+                    remaining -= 1;
+                    if (pointer_over(ui, ui.focusables[remaining])) {
+                        ui.focus = ui.focusables[remaining];
+                        break;
+                    }
+                }
+            }
             ui.layout.updateScrollContainers(false, self.wheel, dt);
             self.wheel = .{};
 
@@ -610,7 +643,7 @@ fn Frame(comptime Program: type) type {
             for (commands) |command| painter.draw(command);
 
             if (self.custom_titlebar) {
-                self.controls.set_width(logical.width);
+                self.controls.set_width(@max(0, logical.width - @as(i32, self.caption_right_padding)));
                 self.controls.set_window_state(try self.window.flags());
                 var regions = ui.drag_regions;
                 for (self.controls.geometry.placed()) |placed| try regions.add(.{ .rect = placed.rect, .kind = .not_draggable });
@@ -618,19 +651,20 @@ fn Frame(comptime Program: type) type {
                 var renderer = zdl.render.renderer.Renderer.init(self.allocator, self.surface.view);
                 try renderer.set_scale(scale, scale);
                 try self.controls.draw(&renderer, .{
-                    .symbol = to_renderer_color(ui.theme.foreground),
+                    .symbol = to_renderer_color(if (self.muted_caption_buttons) ui.theme.muted_foreground else ui.theme.foreground),
                     .inactive_symbol = to_renderer_color(ui.theme.muted_foreground),
                     .hover = to_renderer_color(ui.theme.accent),
                 });
             }
-            if (self.snapshot_path) |path| {
+            self.frames_drawn +|= 1;
+            if (self.snapshot_path) |path| if (self.frames_drawn >= self.snapshot_frames) {
                 const bytes = try zdl.image.png.encode(self.allocator, self.surface.view);
                 defer self.allocator.free(bytes);
                 try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = path, .data = bytes });
-            }
+            };
             try self.window.present(self.surface.view);
             self.needs_frame = false;
-            context.pacing = if (animating or ui.redraw) .{ .rate_hz = self.animation_hz } else .wait_event;
+            context.pacing = if (self.snapshot_path != null and self.frames_drawn < self.snapshot_frames) .unlimited else if (animating or ui.redraw) .{ .rate_hz = self.animation_hz } else .wait_event;
         }
 
         fn update_cursor(self: *Self) void {

@@ -10,6 +10,7 @@
 //! 0..255 and alpha in 0..255.
 
 const std = @import("std");
+const surface = @import("zdl").surface;
 const zlay = @import("zlay");
 
 pub const Color = zlay.Color;
@@ -111,6 +112,8 @@ const Clip = struct {
         return self.x1 <= self.x0 or self.y1 <= self.y0;
     }
 };
+
+pub const ImageOptions = struct { radius: f32 = 0, grayscale: bool = false };
 
 pub const Canvas = struct {
     pixels: []u8,
@@ -302,6 +305,50 @@ pub const Canvas = struct {
         }
     }
 
+    /// Bilinearly samples a borrowed image into a rounded, clipped rectangle.
+    /// Source data stays owned by its caller; this method retains no pointers.
+    pub fn draw_image(self: *Canvas, view: surface.View, rect: Rect, options: ImageOptions) surface.Error!void {
+        if (view.width == 0 or view.height == 0 or rect.w <= 0 or rect.h <= 0) return;
+        const bounds = Clip.intersect(self.clip, bounds_of(rect, 0));
+        if (bounds.empty()) return;
+        const radii = clamp_radii(.all(options.radius), rect.w / 2, rect.h / 2);
+        var y = bounds.y0;
+        while (y < bounds.y1) : (y += 1) {
+            var x = bounds.x0;
+            while (x < bounds.x1) : (x += 1) {
+                const px = @as(f32, @floatFromInt(x)) + 0.5;
+                const py = @as(f32, @floatFromInt(y)) + 0.5;
+                const coverage = std.math.clamp(0.5 - rounded_distance(px - rect.x - rect.w / 2, py - rect.y - rect.h / 2, rect.w / 2, rect.h / 2, radii), 0, 1);
+                if (coverage <= 0) continue;
+                const sx = std.math.clamp((px - rect.x) / rect.w * @as(f32, @floatFromInt(view.width)) - 0.5, 0, @as(f32, @floatFromInt(view.width - 1)));
+                const sy = std.math.clamp((py - rect.y) / rect.h * @as(f32, @floatFromInt(view.height)) - 0.5, 0, @as(f32, @floatFromInt(view.height - 1)));
+                const x0: usize = @intFromFloat(sx);
+                const y0: usize = @intFromFloat(sy);
+                const x1 = @min(x0 + 1, view.width - 1);
+                const y1 = @min(y0 + 1, view.height - 1);
+                const tx = sx - @as(f32, @floatFromInt(x0));
+                const ty = sy - @as(f32, @floatFromInt(y0));
+                const a = try view.read(x0, y0);
+                const b = try view.read(x1, y0);
+                const c = try view.read(x0, y1);
+                const d = try view.read(x1, y1);
+                var color: Color = undefined;
+                inline for (.{ "r", "g", "b", "a" }) |channel| {
+                    const top = @as(f32, @floatFromInt(@field(a, channel))) * (1 - tx) + @as(f32, @floatFromInt(@field(b, channel))) * tx;
+                    const bottom = @as(f32, @floatFromInt(@field(c, channel))) * (1 - tx) + @as(f32, @floatFromInt(@field(d, channel))) * tx;
+                    @field(color, channel) = top * (1 - ty) + bottom * ty;
+                }
+                if (options.grayscale) {
+                    const gray = color.r * 0.2126 + color.g * 0.7152 + color.b * 0.0722;
+                    color.r = gray;
+                    color.g = gray;
+                    color.b = gray;
+                }
+                self.blend(x, y, color, coverage);
+            }
+        }
+    }
+
     /// Blends one pixel. `coverage` is 0..1 and multiplies the color alpha.
     pub fn blend(self: *Canvas, x: i32, y: i32, color: Color, coverage: f32) void {
         const px: usize = @intCast(x);
@@ -399,4 +446,18 @@ test "erfc matches known values" {
     try std.testing.expectApproxEqAbs(@as(f32, 1), erfc(0), 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.157299), erfc(1), 1e-4);
     try std.testing.expectApproxEqAbs(@as(f32, 1.842701), erfc(-1), 1e-4);
+}
+
+test "image sampling respects a clip even when the image starts outside the canvas" {
+    var pixels: [64]u8 = undefined;
+    var canvas = Canvas.init(&pixels, 4, 4, 16);
+    canvas.clear(Color.rgb(255, 255, 255));
+    var source = [_]u8{ 200, 40, 20, 255 };
+    const view = try surface.View.init(&source, 1, 1, 4, .rgba8, null);
+    canvas.push_clip(.{ .x = 1, .y = 1, .w = 2, .h = 2 });
+    try canvas.draw_image(view, .{ .x = -1, .y = -1, .w = 4, .h = 4 }, .{});
+    canvas.pop_clip();
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, pixels[0..4]);
+    try std.testing.expectEqualSlices(u8, &source, pixels[20..24]);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255 }, pixels[60..64]);
 }

@@ -300,6 +300,8 @@ hardware.
   antialiased canvas, theme tokens, focus/keyboard activation, clipping and
   frame-owned text copies. Copies fix stack-local badge text lifetime; popovers
   flip above anchors near the window bottom. No OS accessibility tree yet.
+- Progressive JPEG refinement now counts EOB runs without including the current
+  block twice, matching upstream stb and restoring the dashboard avatar.
 - Dashboard and VLC-style player are runnable native views. Their source,
   dependencies, commands, interactions and remaining fidelity gaps are in
   `examples/apps/README.md`. No claim of exact reference parity is made.
@@ -311,8 +313,10 @@ hardware.
 - X11 smoke presentation exposed a dangling `XShmSegmentInfo` retained by XImage.
   It now has stable allocator-owned storage, with a move/retained-pointer
   regression test. SysV mapping tests use a fake X backend, not an X server.
-- Final Debug and ReleaseSafe verification runs 249 native tests, including the SHM regression.
-  ReleaseSafe application tests run 16 cases across toolkit, dashboard and media.
+- Debug and ReleaseSafe verification runs 250 native tests, including the SHM
+  regression and a baseline/progressive JPEG equivalence fixture. Application
+  tests cover toolkit clipping, chart interpolation, UTF-8 drawer edits and media
+  queue/clock behavior.
   Native smoke rendering passes on Wayland and X11; H.264 and 10-bit FFV1 probes
   advance frames, freeze on pause and resume beyond a 0.5-second seek target.
   KMS/DRM, physical controllers and camera runtime remain unverified. Decoder

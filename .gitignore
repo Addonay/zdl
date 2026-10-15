@@ -17,3 +17,4 @@ translation-report/
 # Examples package build output
 examples/.zig-cache/
 examples/zig-out/
+examples/zig-pkg/
