@@ -116,7 +116,8 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
         .imports = &.{ .{ .name = "zdl", .module = zdl }, .{ .name = "media", .module = media } },
     });
-    b.installArtifact(b.addExecutable(.{ .name = "playback-check", .root_module = playback }));
+    const playback_exe = b.addExecutable(.{ .name = "playback-check", .root_module = playback });
+    b.installArtifact(playback_exe);
     const apps_tests = b.addTest(.{ .root_module = dashboard });
     const run_apps_tests = b.addRunArtifact(apps_tests);
     const media_tests = b.addTest(.{ .root_module = media });
@@ -138,4 +139,8 @@ pub fn build(b: *std.Build) void {
     const run_player = b.addRunArtifact(player_exe);
     run_player.addPassthruArgs();
     b.step("run-apps-player", "Run the VLC-style native media player").dependOn(&run_player.step);
+    const build_apps = b.step("build-apps", "Compile the native applications and playback probe");
+    build_apps.dependOn(&dashboard_exe.step);
+    build_apps.dependOn(&player_exe.step);
+    build_apps.dependOn(&playback_exe.step);
 }

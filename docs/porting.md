@@ -311,7 +311,7 @@ hardware.
 - X11 smoke presentation exposed a dangling `XShmSegmentInfo` retained by XImage.
   It now has stable allocator-owned storage, with a move/retained-pointer
   regression test. SysV mapping tests use a fake X backend, not an X server.
-- Final Debug verification runs 249 native tests, including the SHM regression.
+- Final Debug and ReleaseSafe verification runs 249 native tests, including the SHM regression.
   ReleaseSafe application tests run 16 cases across toolkit, dashboard and media.
   Native smoke rendering passes on Wayland and X11; H.264 and 10-bit FFV1 probes
   advance frames, freeze on pause and resume beyond a 0.5-second seek target.

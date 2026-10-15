@@ -3,15 +3,15 @@
     .version = "0.0.1",
     .dependencies = .{
         .zdl = .{
-            .url = "git+https://github.com/Addonay/zdl#3997494535c233419923ba36bfa92dc911c46cc8",
-            .hash = "zdl-0.0.0-k7bE1WfGPADm7EiA08-DqJqs9ZCtc9DU0cZMkkg7GMSw",
+            .url = "git+https://github.com/Addonay/zdl#c64c082fcecbdf41895421c34ead0041026e62b7",
+            .hash = "zdl-0.0.0-k7bE1dsnSgCoiiiZEMQ3n62LAprozf_Mto2j7DJGJh89",
         },
         .zlay = .{
             .url = "git+https://github.com/Addonay/zlay#d6112faa78b5750a3817b927b7d48bb562634304",
             .hash = "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr",
         },
     },
-    .minimum_zig_version = "0.18.0-dev.246+05671ced9",
+    .minimum_zig_version = "0.18.0-dev.253+16d31ceed",
     .paths = .{""},
     .fingerprint = 0x7bd0ad450dd7fbd1,
 }
