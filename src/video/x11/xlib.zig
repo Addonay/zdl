@@ -433,9 +433,9 @@ pub const Event = extern union {
     mapping: MappingEvent,
     xkb_state: XkbStateEvent,
     /// GenericEvent cookie; XInput2 events arrive as this and carry their data
-    /// only between XGetEventData and XFreeEventData.
+    /// only between XGetEventData and XFreeEventData. Their records are therefore
+    /// not variants here: XIDeviceEvent is 200 bytes and would not fit this union.
     generic: GenericEventCookie,
-    xi_device: XIDeviceEvent,
     xi_raw: XIRawEvent,
     padding: [24]c_long,
 };
@@ -866,12 +866,14 @@ pub const color_do_blue: u8 = 1 << 2;
 pub const XIButtonState = extern struct { mask_len: c_int, mask: ?[*]u8 };
 pub const XIValuatorState = extern struct { mask_len: c_int, mask: ?[*]u8, values: ?[*]f64 };
 pub const XIModifierState = extern struct { base: c_int, latched: c_int, locked: c_int, effective: c_int };
-pub const XIGroupState = extern struct { base: u8, latched: u8, locked: u8, effective: u8 };
+/// XInput2.h: `typedef XIModifierState XIGroupState;`, four native ints.
+pub const XIGroupState = XIModifierState;
 
 /// XIDeviceEvent (XI2.h): key, button, motion and touch events. Offsets: extension
 /// 32, evtype 36, time 40, deviceid 48, sourceid 52, detail 56, root 64, event 72,
-/// child 80, coordinates as doubles 88-120, flags 120, state blocks from 128
-/// (192 bytes total). A touch event carries its touch id in `detail`.
+/// child 80, coordinates as doubles 88-120, flags 120, buttons 128, valuators 144,
+/// modifiers 168, group 184 (200 bytes total). A touch event carries its touch
+/// id in `detail`.
 pub const XIDeviceEvent = extern struct {
     kind: c_int,
     serial: c_ulong,
@@ -965,7 +967,9 @@ pub const XIDeviceChangedEvent = extern struct {
 };
 
 /// XIGesturePinchEvent (XI2.h, protocol 2.4). `scale` is relative to the start of
-/// the gesture; deltas are in pixels.
+/// the gesture; deltas are in pixels. Field order follows the header: the deltas,
+/// scale and angle come before flags and modifiers. LP64 offsets: scale 152,
+/// delta_angle 160, flags 168, mods 172, group 188; size 208.
 pub const XIGesturePinchEvent = extern struct {
     kind: c_int,
     serial: c_ulong,
@@ -984,15 +988,15 @@ pub const XIGesturePinchEvent = extern struct {
     root_y: f64,
     event_x: f64,
     event_y: f64,
-    flags: c_int,
-    mods: XIModifierState,
-    group: XIGroupState,
     delta_x: f64,
     delta_y: f64,
     delta_unaccel_x: f64,
     delta_unaccel_y: f64,
     scale: f64,
     delta_angle: f64,
+    flags: c_int,
+    mods: XIModifierState,
+    group: XIGroupState,
 };
 
 /// XIGrabModifiers: one modifier combination of a passive grab and its result.
@@ -1576,7 +1580,10 @@ comptime {
         std.debug.assert(@offsetOf(XWindowAttributes, "map_state") == 92);
         std.debug.assert(@sizeOf(XWMHints) == 56);
         std.debug.assert(@sizeOf(XFontStruct) == 96);
-        std.debug.assert(@sizeOf(XIDeviceEvent) == 192);
+        std.debug.assert(@sizeOf(XIDeviceEvent) == 200);
+        std.debug.assert(@offsetOf(XIDeviceEvent, "mods") == 168);
+        std.debug.assert(@offsetOf(XIDeviceEvent, "group") == 184);
+        std.debug.assert(@sizeOf(Event) == 192);
         std.debug.assert(@offsetOf(XIDeviceEvent, "deviceid") == 48);
         std.debug.assert(@offsetOf(XIDeviceEvent, "root_x") == 88);
         std.debug.assert(@offsetOf(XIDeviceEvent, "flags") == 120);
@@ -1588,9 +1595,13 @@ comptime {
         std.debug.assert(@sizeOf(XIScrollClassInfo) == 32);
         std.debug.assert(@offsetOf(XIHierarchyEvent, "info") == 56);
         std.debug.assert(@offsetOf(XIPropertyEvent, "property") == 56);
-        std.debug.assert(@offsetOf(XIGesturePinchEvent, "mods") == 124);
-        std.debug.assert(@offsetOf(XIGesturePinchEvent, "scale") == 176);
-        std.debug.assert(@sizeOf(XIGesturePinchEvent) == 192);
+        std.debug.assert(@offsetOf(XIGesturePinchEvent, "scale") == 152);
+        std.debug.assert(@offsetOf(XIGesturePinchEvent, "delta_angle") == 160);
+        std.debug.assert(@offsetOf(XIGesturePinchEvent, "flags") == 168);
+        std.debug.assert(@offsetOf(XIGesturePinchEvent, "mods") == 172);
+        std.debug.assert(@offsetOf(XIGesturePinchEvent, "group") == 188);
+        std.debug.assert(@sizeOf(XIGesturePinchEvent) == 208);
+        std.debug.assert(@sizeOf(XIGroupState) == 16);
         std.debug.assert(@sizeOf(XIButtonClassInfo) == 40);
         std.debug.assert(@sizeOf(XIDeviceInfo) == 40);
     }

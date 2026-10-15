@@ -2,6 +2,7 @@
 const std = @import("std");
 const zdl = @import("zdl");
 const common = @import("common");
+const utf8_text = @import("text.zig");
 
 const copy_label = "Click here to copy!";
 const paste_label = "Click here to paste!";
@@ -52,8 +53,11 @@ const App = struct {
                     if (self.copy_pressed and inside_copy) {
                         window.set_clipboard_text(self.current_time[0..self.current_time_len]) catch return .failure;
                     } else if (self.paste_pressed and inside_paste) {
+                        // Fetch first: a failed paste keeps the previous text, which
+                        // is still owned and freed exactly once by `deinit`.
+                        const text = window.clipboard_text(self.allocator) catch return .failure;
                         if (self.pasted) |previous| self.allocator.free(previous);
-                        self.pasted = window.clipboard_text(self.allocator) catch return .failure;
+                        self.pasted = text;
                     }
                     self.copy_pressed = false;
                     self.paste_pressed = false;
@@ -110,7 +114,7 @@ fn draw_pasted_text(renderer: *common.Renderer, text: []const u8) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |raw_line| {
         const line = std.mem.trimEnd(u8, raw_line, "\r");
-        try renderer.debug_text(x, y, line[0..@min(max_chars, line.len)]);
+        try renderer.debug_text(x, y, utf8_text.codepoint_prefix(line, max_chars));
         y += 10;
         if (pasted_rect.height - (y - pasted_rect.y) < 8) break;
     }

@@ -198,9 +198,13 @@ pub fn run(
         .quit_on_quit_event = options.quit_on_quit_event,
     };
 
+    // The watch starts before `init`, so a rate hint that `init` sets is a change
+    // the first iteration applies. SDL's callback likewise reads the hint after
+    // initialization, so the value set during it is not missed.
+    var hint_watch = HintPacing.init(options.hints, context.pacing);
     if (@hasDecl(App, "init")) context.result = App.init(app, &context);
     if (context.result == .@"continue") {
-        context.result = loop(App, app, &context, options) catch |err| {
+        context.result = loop(App, app, &context, options, &hint_watch) catch |err| {
             if (@hasDecl(App, "quit")) App.quit(app, &context, .failure);
             return err;
         };
@@ -209,13 +213,12 @@ pub fn run(
     return context.result;
 }
 
-fn loop(comptime App: type, app: *App, context: *Context, options: Options) Error!Result {
+fn loop(comptime App: type, app: *App, context: *Context, options: Options, hint_watch: *HintPacing) Error!Result {
     // SDL primes its hint callback, so the first iteration after start counts as a
     // change: it pumps instead of blocking even in wait_event mode.
     var applied = context.pacing;
     var pacing_changed = true;
     var next_deadline_ns: u64 = 0;
-    var hint_watch = HintPacing.init(options.hints, context.pacing);
     const first_increment = applied.increment_ns();
     if (first_increment != 0) next_deadline_ns = deadline_after(context.now_ns(), first_increment);
 
@@ -379,6 +382,16 @@ test "rate hint changes are detected through the table revision" {
     try testing.expect(watch.poll(&hints).? == .wait_event);
     _ = try hints.reset(main_callback_rate_hint);
     try testing.expect(watch.poll(&hints).? == .unlimited);
+}
+
+test "a rate hint set during initialization is seen by the first poll" {
+    const testing = std.testing;
+    var hints = hints_mod.Hints.init(testing.allocator, null);
+    defer hints.deinit();
+    // `run` creates the watch before App.init, which then sets the hint.
+    var watch = HintPacing.init(&hints, Pacing.from_hint(hints.get(main_callback_rate_hint)));
+    _ = try hints.set(main_callback_rate_hint, "30");
+    try testing.expectEqual(@as(f64, 30), watch.poll(&hints).?.rate_hz);
 }
 
 test "tiny pacing rates and large deadlines saturate safely" {

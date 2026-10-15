@@ -640,9 +640,31 @@ fn read_proximity(connection: *window.Connection, state: *State, id: c_int) ?boo
     return words[4] != 0 or words[3] != 0;
 }
 
+/// Decodes up to `out.len` items from an XIGetProperty reply of `item_count`
+/// items of `format` bits. Format 32 items are packed 4-byte words. XIGetProperty
+/// does not return C longs as XGetWindowProperty does (verified against libXi),
+/// so reading them as longs would read past the reply and mix neighbouring words.
+fn decode_int_items(bytes: []const u8, format: c_int, item_count: usize, out: []i32) usize {
+    const item_size: usize = switch (format) {
+        8 => 1,
+        16 => 2,
+        32 => 4,
+        else => return 0,
+    };
+    const n = @min(out.len, item_count, bytes.len / item_size);
+    for (out[0..n], 0..) |*item, index| {
+        const at = index * item_size;
+        item.* = switch (format) {
+            8 => @as(i8, @bitCast(bytes[at])),
+            16 => std.mem.readInt(i16, bytes[at..][0..2], .native),
+            else => std.mem.readInt(i32, bytes[at..][0..4], .native),
+        };
+    }
+    return n;
+}
+
 /// Reads up to `out.len` integers of an integer property of a device. Returns how
-/// many were read (0 when the property is absent or has another type). Format 32
-/// items arrive as C longs.
+/// many were read (0 when the property is absent or has another type).
 fn read_int_property(connection: *window.Connection, id: c_int, property: xlib.Atom, out: []i32) usize {
     const xi = connection.library.xi orelse return 0;
     const api = &connection.library.functions;
@@ -655,16 +677,21 @@ fn read_int_property(connection: *window.Connection, id: c_int, property: xlib.A
     const bytes = data orelse return 0;
     defer _ = api.XFree(bytes);
     if (actual_type != xlib.xa_integer or count == 0 or (format != 8 and format != 16 and format != 32)) return 0;
-    const n = @min(out.len, @as(usize, @intCast(count)));
-    for (out[0..n], 0..) |*item, index| {
-        item.* = switch (format) {
-            8 => @as(i8, @bitCast(bytes[index])),
-            16 => std.mem.readInt(i16, bytes[index * 2 ..][0..2], .native),
-            // XIGetProperty hands 32-bit items back as C longs, as XGetWindowProperty does.
-            else => @truncate(std.mem.readInt(c_long, bytes[index * @sizeOf(c_long) ..][0..@sizeOf(c_long)], .native)),
-        };
-    }
-    return n;
+    const item_bytes: usize = @intCast(@divExact(format, 8));
+    const reply_len = @as(usize, @intCast(count)) * item_bytes;
+    return decode_int_items(bytes[0..reply_len], format, @intCast(count), out);
+}
+
+test "XIGetProperty integer items are read as packed words" {
+    // Three format 32 items as libXi returns them: 0x11111111, -2, 0x33333333.
+    const reply = [_]u8{ 0x11, 0x11, 0x11, 0x11, 0xfe, 0xff, 0xff, 0xff, 0x33, 0x33, 0x33, 0x33 };
+    var out: [5]i32 = undefined;
+    try std.testing.expectEqual(@as(usize, 3), decode_int_items(&reply, 32, 3, &out));
+    try std.testing.expectEqualSlices(i32, &.{ 0x11111111, -2, 0x33333333 }, out[0..3]);
+    // Items never extend past the reply, even when the count claims more.
+    try std.testing.expectEqual(@as(usize, 3), decode_int_items(&reply, 32, 5, &out));
+    try std.testing.expectEqual(@as(usize, 2), decode_int_items(reply[0..8], 32, 3, &out));
+    try std.testing.expectEqual(@as(usize, 0), decode_int_items(&reply, 64, 3, &out));
 }
 
 /// Whether the device is an eraser: its "Wacom Tool Type" property (an atom or a
@@ -687,7 +714,8 @@ fn read_tool_type(connection: *window.Connection, state: *const State, id: c_int
     defer _ = api.XFree(bytes);
     if (count == 0) return null;
     if (actual_type == xlib.xa_atom and format == 32) {
-        const atom: xlib.Atom = std.mem.readInt(c_ulong, bytes[0..@sizeOf(c_ulong)], .native);
+        // The atom is a 32-bit item of the packed reply, widened after reading.
+        const atom: xlib.Atom = std.mem.readInt(u32, bytes[0..4], .native);
         if (atom == 0) return null;
         const name_ptr = api.XGetAtomName(connection.display, atom) orelse return null;
         defer _ = api.XFree(@ptrCast(name_ptr));
