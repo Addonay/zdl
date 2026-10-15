@@ -1495,7 +1495,7 @@ fn checked_rect(tex: *const Texture, region: ?IRect) Error!IRect {
     return rect;
 }
 
-test "scRGB sRGB textures use sampler decoding instead of shader decoding" {
+test "packed textures hand their colorspace to the shader unchanged" {
     var tex: Texture = .{
         .gpu = undefined,
         .access = .static,
@@ -1504,11 +1504,11 @@ test "scRGB sRGB textures use sampler decoding instead of shader decoding" {
         .pixel_height = 1,
         .texel_bytes = 4,
         .colorspace = .srgb,
-        .hardware_srgb = true,
     };
-    try std.testing.expectEqual(color.Input.unspecified, texture_input(&tex));
-    tex.hardware_srgb = false;
+    // Storage is always UNORM, so sRGB decoding is the shader's job.
     try std.testing.expectEqual(color.Input.srgb, texture_input(&tex));
+    tex.colorspace = .hdr10;
+    try std.testing.expectEqual(color.Input.hdr10, texture_input(&tex));
 }
 
 /// The half-size chroma area of a luma rectangle (SDL's `rect->x / 2`, `(w + 1) / 2`).
