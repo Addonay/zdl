@@ -304,75 +304,86 @@ pub const IntegerRange = struct {
         }
         return best;
     }
-
-    /// Adds choices from another EnumFormat param for the same property.
-    pub fn merge(self: *IntegerRange, other: IntegerRange) void {
-        if (other.has_range) {
-            if (self.has_range) {
-                self.minimum = @min(self.minimum, other.minimum);
-                self.maximum = @max(self.maximum, other.maximum);
-            } else {
-                self.minimum = other.minimum;
-                self.maximum = other.maximum;
-                self.has_range = true;
-            }
-        }
-        for (other.values[0..other.value_count]) |value| {
-            var found = false;
-            for (self.values[0..self.value_count]) |old| found = found or old == value;
-            if (!found and self.value_count < self.values.len) {
-                self.values[self.value_count] = value;
-                self.value_count += 1;
-            }
-        }
-    }
 };
 
-/// Parsed SPA_PARAM_EnumFormat capabilities for one node. The pod parser keeps
-/// the default and allowed format/rate/channel choices so stream negotiation
-/// can select the closest device-supported spec before connecting.
-pub const Capabilities = struct {
+/// Most EnumFormat alternatives kept for one node.
+pub const max_alternatives = 16;
+
+/// One EnumFormat param: a format list with the rate and channel choices the
+/// node advertises with it. Each alternative is kept whole, so a rate is never
+/// paired with a format that the same param does not offer.
+pub const Alternative = struct {
     formats: [14]audio.Format = undefined,
     format_count: u8 = 0,
     sample_rate: IntegerRange,
     channels: IntegerRange,
 
-    /// Merges another parameter alternative from the same node.
-    pub fn merge(self: *Capabilities, other: Capabilities) void {
-        for (other.formats[0..other.format_count]) |format| {
-            var found = false;
-            for (self.formats[0..self.format_count]) |old| found = found or old == format;
-            if (!found and self.format_count < self.formats.len) {
-                self.formats[self.format_count] = format;
-                self.format_count += 1;
-            }
+    fn supports(self: Alternative, format: audio.Format) bool {
+        for (self.formats[0..self.format_count]) |supported| {
+            if (supported == format) return true;
         }
-        self.sample_rate.merge(other.sample_rate);
-        self.channels.merge(other.channels);
+        return false;
     }
 
-    /// Reconciles a caller's preferred spec with the node's advertised choices.
+    /// The best spec this alternative supports for `preferred`, or null when it
+    /// offers none of the preferred formats or the resulting spec is invalid.
+    fn rank(self: Alternative, preferred: audio.Spec) ?Ranked {
+        for (audio.closest_formats(preferred.format).slice(), 0..) |format, format_rank| {
+            if (!self.supports(format)) continue;
+            const sample_rate = self.sample_rate.choose(preferred.sample_rate);
+            const channels = std.math.cast(u16, self.channels.choose(preferred.channels)) orelse return null;
+            const spec: audio.Spec = .{ .format = format, .sample_rate = sample_rate, .channels = channels };
+            spec.validate() catch return null;
+            return .{
+                .spec = spec,
+                .format_rank = format_rank,
+                .rate_distance = abs_difference(sample_rate, preferred.sample_rate),
+                .channel_distance = abs_difference(channels, preferred.channels),
+            };
+        }
+        return null;
+    }
+};
+
+const Ranked = struct {
+    spec: audio.Spec,
+    format_rank: usize,
+    rate_distance: u64,
+    channel_distance: u64,
+
+    fn better_than(self: Ranked, other: Ranked) bool {
+        if (self.format_rank != other.format_rank) return self.format_rank < other.format_rank;
+        if (self.rate_distance != other.rate_distance) return self.rate_distance < other.rate_distance;
+        return self.channel_distance < other.channel_distance;
+    }
+};
+
+/// Parsed SPA_PARAM_EnumFormat capabilities for one node: one alternative per
+/// EnumFormat param. Negotiation picks a complete spec from one alternative, so
+/// the node's correlations between format, rate and channels are respected.
+pub const Capabilities = struct {
+    alternatives: [max_alternatives]Alternative = undefined,
+    count: u8 = 0,
+
+    /// Adds the alternatives of another EnumFormat param of the same node.
+    pub fn merge(self: *Capabilities, other: Capabilities) Error!void {
+        for (other.alternatives[0..other.count]) |alternative| {
+            if (self.count == max_alternatives) return error.UnsupportedFormat;
+            self.alternatives[self.count] = alternative;
+            self.count += 1;
+        }
+    }
+
+    /// Chooses the best spec the node supports: format preference ranks first,
+    /// then the rate distance and the channel distance from the request.
     pub fn negotiate(self: Capabilities, preferred: audio.Spec) (Error || audio.Error)!audio.Spec {
         try preferred.validate();
-        if (self.format_count == 0) return error.MalformedPod;
-        const preferences = audio.closest_formats(preferred.format);
-        var selected: ?audio.Format = null;
-        for (preferences.slice()) |candidate| {
-            for (self.formats[0..self.format_count]) |supported| {
-                if (candidate == supported) {
-                    selected = candidate;
-                    break;
-                }
-            }
-            if (selected != null) break;
+        var best: ?Ranked = null;
+        for (self.alternatives[0..self.count]) |alternative| {
+            const candidate = alternative.rank(preferred) orelse continue;
+            if (best == null or candidate.better_than(best.?)) best = candidate;
         }
-        const result: audio.Spec = .{
-            .format = selected orelse return error.UnsupportedFormat,
-            .sample_rate = self.sample_rate.choose(preferred.sample_rate),
-            .channels = std.math.cast(u16, self.channels.choose(preferred.channels)) orelse return error.MalformedPod,
-        };
-        try result.validate();
-        return result;
+        return (best orelse return error.UnsupportedFormat).spec;
     }
 };
 
@@ -420,12 +431,15 @@ pub fn read_enum_format(bytes: []const u8) Error!Capabilities {
         cursor = std.math.add(usize, value_at + 8, value_size) catch return error.MalformedPod;
     }
     if (!media_ok or !raw_ok or format_count == 0) return error.UnsupportedFormat;
-    return .{
+    var capabilities: Capabilities = .{};
+    capabilities.alternatives[0] = .{
         .formats = formats,
         .format_count = @intCast(format_count),
         .sample_rate = rate orelse return error.MalformedPod,
         .channels = channels orelse return error.MalformedPod,
     };
+    capabilities.count = 1;
+    return capabilities;
 }
 
 /// Decodes a Format object as delivered by a stream's `param_changed` event.
@@ -590,4 +604,52 @@ test "EnumFormat choices negotiate the closest supported spec" {
     try std.testing.expectEqual(audio.Format.float32_le, actual.format);
     try std.testing.expectEqual(@as(u32, 44100), actual.sample_rate);
     try std.testing.expectEqual(@as(u16, 5), actual.channels);
+}
+
+test "discrete rates from separate EnumFormat params are not merged into a range" {
+    var first_storage: [256]u64 align(8) = undefined;
+    var second_storage: [256]u64 align(8) = undefined;
+    const first = try build_enum_format(std.mem.sliceAsBytes(&first_storage), &.{.float32_le}, 44100, 2, &.{});
+    const second = try build_enum_format(std.mem.sliceAsBytes(&second_storage), &.{.float32_le}, 48000, 2, &.{});
+    var capabilities = try read_enum_format(first);
+    try capabilities.merge(try read_enum_format(second));
+    try std.testing.expectEqual(@as(u8, 2), capabilities.count);
+
+    // 46000 Hz is not offered. The nearer of the two offered rates is chosen.
+    const between = try capabilities.negotiate(.{ .format = .float32_le, .channels = 2, .sample_rate = 46000 });
+    try std.testing.expectEqual(@as(u32, 44100), between.sample_rate);
+    const exact = try capabilities.negotiate(.{ .format = .float32_le, .channels = 2, .sample_rate = 48000 });
+    try std.testing.expectEqual(@as(u32, 48000), exact.sample_rate);
+}
+
+test "a format is negotiated only with the rates its own EnumFormat offers" {
+    var first_storage: [256]u64 align(8) = undefined;
+    var second_storage: [256]u64 align(8) = undefined;
+    const first = try build_enum_format(std.mem.sliceAsBytes(&first_storage), &.{.float32_le}, 44100, 2, &.{});
+    const second = try build_enum_format(std.mem.sliceAsBytes(&second_storage), &.{.signed16_le}, 96000, 8, &.{});
+    var capabilities = try read_enum_format(first);
+    try capabilities.merge(try read_enum_format(second));
+
+    // float32 is offered at 44100 Hz stereo only. It is not paired with 96000 Hz.
+    const float = try capabilities.negotiate(.{ .format = .float32_le, .channels = 2, .sample_rate = 96000 });
+    try std.testing.expectEqual(audio.Format.float32_le, float.format);
+    try std.testing.expectEqual(@as(u32, 44100), float.sample_rate);
+    try std.testing.expectEqual(@as(u16, 2), float.channels);
+
+    const short = try capabilities.negotiate(.{ .format = .signed16_le, .channels = 2, .sample_rate = 96000 });
+    try std.testing.expectEqual(audio.Format.signed16_le, short.format);
+    try std.testing.expectEqual(@as(u32, 96000), short.sample_rate);
+    try std.testing.expectEqual(@as(u16, 8), short.channels);
+}
+
+test "a rate range keeps values inside it and clamps values outside" {
+    var storage: [256]u64 align(8) = undefined;
+    const rate: IntegerRange = .{ .preferred = 48000, .minimum = 44100, .maximum = 96000 };
+    const channels: IntegerRange = .{ .preferred = 2, .minimum = 1, .maximum = 8 };
+    const bytes = try build_enum_format_ranges(std.mem.sliceAsBytes(&storage), &.{.float32_le}, rate, channels, &.{});
+    const capabilities = try read_enum_format(bytes);
+    const inside = try capabilities.negotiate(.{ .format = .float32_le, .channels = 2, .sample_rate = 46000 });
+    try std.testing.expectEqual(@as(u32, 46000), inside.sample_rate);
+    const above = try capabilities.negotiate(.{ .format = .float32_le, .channels = 2, .sample_rate = 192000 });
+    try std.testing.expectEqual(@as(u32, 96000), above.sample_rate);
 }

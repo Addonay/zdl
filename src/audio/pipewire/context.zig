@@ -502,10 +502,11 @@ const NodeFormatRequest = struct {
         if (size > 65536) return self.fail();
         const total = std.math.add(usize, 8, size) catch return self.fail();
         const parsed = pod.read_enum_format(ptr[0..total]) catch return self.fail();
-        if (self.capabilities) |*previous|
-            previous.merge(parsed)
-        else
+        if (self.capabilities) |*previous| {
+            previous.merge(parsed) catch return self.fail();
+        } else {
             self.capabilities = parsed;
+        }
     }
 
     fn fail(self: *NodeFormatRequest) void {

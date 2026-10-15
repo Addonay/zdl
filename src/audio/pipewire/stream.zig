@@ -388,14 +388,16 @@ pub const Stream = struct {
         self.active = active;
     }
 
-    /// Reads PipeWire's current device delay and stream queue depth.
+    /// Reads PipeWire's current device delay and stream queue depth, in frames
+    /// of the negotiated stream rate. PipeWire reports the delay in the graph's
+    /// time domain (`pw_time.rate`), so it is converted here.
     pub fn latency(self: *Stream) Error!Latency {
         self.connection.lock();
         defer self.connection.unlock();
         const time = try self.state.library.stream_time(self.state.object.?);
-        if (time.rate.den == 0) return error.InvalidSpec;
+        const stream_rate = (self.state.negotiated orelse return error.InvalidSpec).sample_rate;
         return .{
-            .delay_frames = time.delay,
+            .delay_frames = try graph_to_stream_frames(time.delay, time.rate.num, time.rate.den, stream_rate),
             .queued_frames = time.queued,
             .buffered_frames = time.buffered,
         };
@@ -408,6 +410,21 @@ pub const Stream = struct {
         return .{ .underruns = self.state.underruns, .overruns = self.state.overruns };
     }
 };
+
+/// Converts a delay from graph frames to stream frames. `pw_time.rate` is the
+/// graph's time per frame, `graph_num / graph_den` seconds, so a delay of
+/// `delay` frames lasts `delay * graph_num / graph_den` seconds. That is
+/// `delay * graph_num * stream_rate / graph_den` stream frames, rounded to the
+/// nearest frame with ties away from zero. The i128 product cannot overflow for
+/// any i64 delay and u32 rate, and the quotient is checked back into i64.
+pub fn graph_to_stream_frames(delay: i64, graph_num: u32, graph_den: u32, stream_rate: u32) Error!i64 {
+    if (graph_num == 0 or graph_den == 0 or stream_rate == 0) return error.InvalidSpec;
+    const numerator = @as(i128, delay) * @as(i128, graph_num) * @as(i128, stream_rate);
+    const denominator: i128 = graph_den;
+    const half = @divTrunc(denominator, 2);
+    const rounded = if (numerator < 0) numerator - half else numerator + half;
+    return std.math.cast(i64, @divTrunc(rounded, denominator)) orelse error.InvalidSpec;
+}
 
 fn offered_list(storage: *[offered_formats.len + 1]audio.Format, requested: audio.Format) []const audio.Format {
     storage[0] = requested;
@@ -437,4 +454,16 @@ test "offered formats keep the requested one first" {
     const list = offered_list(&storage, .signed16_be);
     try std.testing.expectEqual(audio.Format.signed16_be, list[0]);
     try std.testing.expectEqual(offered_formats.len, list.len);
+}
+
+test "PipeWire delay converts from graph frames to stream frames" {
+    const testing = std.testing;
+    // 480 graph frames at 48 kHz are 10 ms, which is 441 frames at 44.1 kHz.
+    try testing.expectEqual(@as(i64, 441), try graph_to_stream_frames(480, 1, 48000, 44100));
+    try testing.expectEqual(@as(i64, -441), try graph_to_stream_frames(-480, 1, 48000, 44100));
+    try testing.expectEqual(@as(i64, 480), try graph_to_stream_frames(480, 1, 48000, 48000));
+    // 0.91875 stream frames round to one.
+    try testing.expectEqual(@as(i64, 1), try graph_to_stream_frames(1, 1, 48000, 44100));
+    try testing.expectError(error.InvalidSpec, graph_to_stream_frames(480, 1, 0, 44100));
+    try testing.expectError(error.InvalidSpec, graph_to_stream_frames(480, 1, 48000, 0));
 }
