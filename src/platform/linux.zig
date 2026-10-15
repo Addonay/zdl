@@ -1194,7 +1194,6 @@ pub const Platform = struct {
         }
         self.consumed_buttons &= ~bit;
         const record = self.find(window_id) orelse return false;
-        std.debug.print("DEBUG transition index={d} pressed={} active={} pointer={?}\n", .{ index, pressed, record.hit_regions.is_active(), record.pointer });
         if (!record.hit_regions.is_active()) return false;
         const point = record.pointer orelse return false;
         const flags = record.state.flags;
@@ -1202,7 +1201,6 @@ pub const Platform = struct {
         // A maximized or fullscreen window is not resized by its edges.
         const resizable = flags.resizable and !flags.fullscreen and !flags.maximized;
         const result = hit.classify(record.hit_regions, size.width, size.height, point, resizable);
-        std.debug.print("DEBUG press index={d} point={d},{d} size={d}x{d} result={any}\n", .{ index, point.x, point.y, size.width, size.height, result });
         switch (result) {
             .normal => return false,
             .resize => {

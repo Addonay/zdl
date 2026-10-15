@@ -624,7 +624,6 @@ pub const Connection = struct {
             },
             xlib.button_press, xlib.button_release => {
                 const button = raw.key.keycode;
-                std.debug.print("DEBUG button raw kind={d} keycode={d} state={d} window={d}\n", .{ raw.kind, raw.key.keycode, raw.key.state, raw.any.window });
                 if (raw.kind == xlib.button_press and button >= 4 and button <= 7) {
                     return .{ .window = window, .payload = .{ .wheel = .{
                         .x = if (button == 6) 1 else if (button == 7) -1 else 0,

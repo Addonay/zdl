@@ -248,7 +248,6 @@ fn handle(p: *platform.Platform, session: *Session, ev: x11.Event) platform.Erro
         }, .{ .keycode = key.keycode, .modifiers = key.modifiers }),
         .motion => |motion| try p.mouse_move(id, @floatFromInt(motion.position.x), @floatFromInt(motion.position.y), false),
         .button => |button| {
-            std.debug.print("DEBUG x11 button {d} pressed={}\n", .{ button.button, button.pressed });
             // Buttons 4-7 are wheel ticks and arrive as `.wheel` on press only.
             if (button.button >= 4 and button.button <= 7) return;
             try p.mouse_move(id, @floatFromInt(button.position.x), @floatFromInt(button.position.y), false);
