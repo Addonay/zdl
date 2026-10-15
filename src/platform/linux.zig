@@ -425,7 +425,6 @@ pub const Platform = struct {
             .payloads = payload.Store.init(allocator),
             .signals = options.signals,
         };
-        errdefer self.allocator.destroy(self);
         errdefer self.release_resources();
 
         const env = options.environment;

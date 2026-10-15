@@ -214,7 +214,16 @@ pub const MemoryBlock = struct {
     memory_type_index: u32,
     kind: MemoryKind,
     dedicated: bool,
+    defragmenting: bool = false,
     free: memory_ranges.FreeList,
+    allocations: std.ArrayList(*MemoryAllocation) = .empty,
+};
+
+/// Resource backing associated with a suballocation so the allocator can move it.
+pub const MemoryOwner = union(enum) {
+    none,
+    buffer: *BufferBacking,
+    texture: *TextureBacking,
 };
 
 /// A suballocation held by a Vulkan resource backing. The block pointer remains
@@ -224,6 +233,7 @@ pub const MemoryAllocation = struct {
     block: *MemoryBlock,
     offset: u64,
     size: u64,
+    owner: MemoryOwner = .none,
 
     pub fn memory(self: MemoryAllocation) vk.Handle {
         return self.block.memory;
@@ -255,6 +265,7 @@ pub const Device = struct {
     memory: vk.PhysicalDeviceMemoryProperties,
     /// Vulkan blocks, grouped by memory type and resource kind.
     memory_blocks: std.ArrayList(*MemoryBlock) = .empty,
+    defragmentation_active: bool = false,
     limits: vk.PhysicalDeviceLimits,
     name_buf: [256]u8,
     extensions: DeviceExtensions,
@@ -500,8 +511,9 @@ pub const Device = struct {
         errdefer free_buffer_backing(self, backing);
         const container = try self.allocator.create(BufferContainer);
         errdefer self.allocator.destroy(container);
-        container.* = .{ .size = info.size, .vk_usage = usage, .class = .gpu_buffer, .active = backing };
+        container.* = .{ .size = info.size, .vk_usage = usage, .usage = info.usage, .class = .gpu_buffer, .active = backing };
         try container.backings.append(self.allocator, backing);
+        backing.container = container;
         return .{ .device = self, .container = container, .size = info.size, .usage = info.usage };
     }
 
@@ -513,8 +525,9 @@ pub const Device = struct {
         errdefer free_buffer_backing(self, backing);
         const container = try self.allocator.create(BufferContainer);
         errdefer self.allocator.destroy(container);
-        container.* = .{ .size = info.size, .vk_usage = transfer_usage, .class = .transfer_buffer, .active = backing };
+        container.* = .{ .size = info.size, .vk_usage = transfer_usage, .usage = .none, .class = .transfer_buffer, .active = backing };
         try container.backings.append(self.allocator, backing);
+        backing.container = container;
         return .{
             .buffer = .{ .device = self, .container = container, .size = info.size, .usage = .none },
             .direction = info.usage,
@@ -556,6 +569,7 @@ pub const Device = struct {
         errdefer self.allocator.destroy(container);
         container.* = .{ .info = info, .aspect = aspect, .layers = layers, .can_cycle = true, .active = backing };
         try container.backings.append(self.allocator, backing);
+        backing.container = container;
         errdefer container.backings.deinit(self.allocator);
         var texture = Texture{ .device = self, .container = container, .info = info, .aspect = aspect, .layers = layers };
         var initializer = try self.acquire_command_buffer();
@@ -737,15 +751,19 @@ pub const Device = struct {
         // returning slices without resource-level vkMapMemory/vkUnmapMemory.
         const dedicated = dedicated_memory_required(requirements.size, class);
         const block_size = if (dedicated) requirements.size else small_block_size;
-        for (list) |index| {
-            if (!dedicated) {
-                for (self.memory_blocks.items) |block| {
-                    if (block.dedicated or block.memory_type_index != index or block.kind != kind) continue;
-                    const offset = try block.free.allocate(requirements.size, alignment) orelse continue;
-                    return .{ .block = block, .offset = offset, .size = requirements.size };
+        if (!dedicated) {
+            for (list) |index| {
+                if (try self.find_memory_range(index, kind, requirements.size, alignment)) |allocation| return allocation;
+            }
+            if (!self.defragmentation_active and self.has_fragmented_memory()) {
+                self.defragment_memory() catch {};
+                for (list) |index| {
+                    if (try self.find_memory_range(index, kind, requirements.size, alignment)) |allocation| return allocation;
                 }
             }
+        }
 
+        for (list) |index| {
             const block = self.create_memory_block(index, kind, block_size, dedicated) catch |err| switch (err) {
                 error.OutOfDeviceMemory, error.OutOfHostMemory => continue,
                 else => return err,
@@ -762,6 +780,15 @@ pub const Device = struct {
             return .{ .block = block, .offset = offset, .size = requirements.size };
         }
         return error.OutOfDeviceMemory;
+    }
+
+    fn find_memory_range(self: *Device, memory_type_index: u32, kind: MemoryKind, size: u64, alignment: u64) Error!?MemoryAllocation {
+        for (self.memory_blocks.items) |block| {
+            if (block.dedicated or block.defragmenting or block.memory_type_index != memory_type_index or block.kind != kind) continue;
+            const offset = try block.free.allocate(size, alignment) orelse continue;
+            return .{ .block = block, .offset = offset, .size = size };
+        }
+        return null;
     }
 
     fn create_memory_block(self: *Device, memory_type_index: u32, kind: MemoryKind, size: u64, dedicated: bool) Error!*MemoryBlock {
@@ -792,6 +819,8 @@ pub const Device = struct {
     /// Returns a resource range after its Vulkan object has been destroyed.
     /// An extra empty pooled block is released; one remains available for reuse.
     pub fn release_memory(self: *Device, allocation: MemoryAllocation) void {
+        var detached = allocation;
+        self.unregister_allocation(&detached);
         const block = allocation.block;
         block.free.release(allocation.offset, allocation.size);
         if (block.dedicated) {
@@ -821,8 +850,109 @@ pub const Device = struct {
 
     fn destroy_memory_block(self: *Device, block: *MemoryBlock) void {
         self.fns.vkFreeMemory(self.device, block.memory, null);
+        block.allocations.deinit(self.allocator);
         block.free.deinit();
         self.allocator.destroy(block);
+    }
+
+    fn unregister_allocation(_: *Device, allocation: *MemoryAllocation) void {
+        const owner_ptr: ?*MemoryAllocation = switch (allocation.owner) {
+            .none => null,
+            .buffer => |backing| &backing.allocation,
+            .texture => |backing| &backing.allocation,
+        };
+        if (owner_ptr) |target| {
+            const block = allocation.block;
+            for (block.allocations.items, 0..) |candidate, index| {
+                if (candidate == target) {
+                    _ = block.allocations.swapRemove(index);
+                    break;
+                }
+            }
+            target.owner = .none;
+        }
+    }
+
+    fn has_fragmented_memory(self: *const Device) bool {
+        for (self.memory_blocks.items) |block| {
+            if (block.dedicated or block.defragmenting or block.free.regions.items.len < 2) continue;
+            if (block.free.live_allocations != block.allocations.items.len or block.allocations.items.len == 0) continue;
+            var movable = true;
+            for (block.allocations.items) |allocation| switch (allocation.owner) {
+                .none => movable = false,
+                .buffer => |backing| if (backing.refs != 0 or backing.mapped or backing.container == null) {
+                    movable = false;
+                },
+                .texture => |backing| if (backing.refs != 0 or !backing.owned or backing.container == null) {
+                    movable = false;
+                },
+            };
+            if (!movable) continue;
+            return true;
+        }
+        return false;
+    }
+
+    /// Draft compaction bookkeeping. Relocation helpers currently return
+    /// UnsupportedFeature; allocation falls back to a fresh block. Driver-level
+    /// copy/descriptor validation is required before relocation can be enabled.
+    fn defragment_memory(self: *Device) Error!void {
+        if (self.defragmentation_active) return;
+        self.defragmentation_active = true;
+        defer self.defragmentation_active = false;
+        try self.wait_idle();
+
+        var index: usize = 0;
+        while (index < self.memory_blocks.items.len) {
+            const block = self.memory_blocks.items[index];
+            if (block.dedicated or block.free.regions.items.len < 2 or
+                block.free.live_allocations != block.allocations.items.len or block.allocations.items.len == 0)
+            {
+                index += 1;
+                continue;
+            }
+            var movable = true;
+            for (block.allocations.items) |allocation| switch (allocation.owner) {
+                .none => movable = false,
+                .buffer => |backing| {
+                    if (backing.refs != 0 or backing.mapped or backing.container == null) movable = false;
+                },
+                .texture => |backing| {
+                    if (backing.refs != 0 or !backing.owned or backing.container == null) movable = false;
+                },
+            };
+            if (!movable) {
+                index += 1;
+                continue;
+            }
+
+            block.defragmenting = true;
+            errdefer if (self.memory_block_index(block) != null) {
+                block.defragmenting = false;
+            };
+            while (self.memory_block_index(block) != null and block.allocations.items.len > 0) {
+                const allocation = block.allocations.items[0];
+                switch (allocation.owner) {
+                    .none => break,
+                    .buffer => |backing| try compact_buffer_backing(self, backing),
+                    .texture => |backing| try compact_texture_backing(self, backing),
+                }
+            }
+            if (self.memory_block_index(block)) |current| {
+                block.defragmenting = false;
+                index = current + 1;
+            } else {
+                // The last moved allocation may have released this block.
+                index = @min(index, self.memory_blocks.items.len);
+            }
+        }
+    }
+
+    fn memory_block_index(self: *const Device, block: *const MemoryBlock) ?usize {
+        for (self.memory_blocks.items, 0..) |candidate, index| {
+            if (candidate == block) return index;
+        }
+        return null;
     }
 
     /// The four-pass SDL search: required+preferred+not-tolerable first, then
@@ -1007,7 +1137,9 @@ fn free_object(dev: *Device, backing: *ObjectBacking) void {
 pub const BufferBacking = struct {
     handle: vk.Handle,
     allocation: MemoryAllocation,
+    container: ?*BufferContainer = null,
     refs: u32 = 0,
+    mapped: bool = false,
     /// Set when the owning container was released while `refs` was positive;
     /// the last `unref` frees the backing.
     orphaned: bool = false,
@@ -1020,6 +1152,7 @@ pub const BufferContainer = struct {
     /// Vulkan usage flags of every backing, before the transfer flags that
     /// `create_buffer_handle` adds.
     vk_usage: vk.Flags,
+    usage: types.BufferUsage,
     class: MemoryClass,
     /// The backing that commands recorded now use.
     active: *BufferBacking,
@@ -1072,13 +1205,16 @@ pub const TransferBuffer = struct {
         const allocation = self.buffer.active().allocation;
         _ = try vk.check(dev.fns.vkMapMemory(dev.device, allocation.memory(), allocation.offset, allocation.size, 0, &ptr));
         self.mapped = true;
+        self.buffer.active().mapped = true;
         const bytes: [*]u8 = @ptrCast(ptr orelse return error.MemoryMapFailed);
         return bytes[0..self.buffer.size];
     }
 
     pub fn unmap(self: *TransferBuffer) void {
         if (!self.mapped) return;
-        self.buffer.device.fns.vkUnmapMemory(self.buffer.device.device, self.buffer.active().allocation.memory());
+        const backing = self.buffer.active();
+        self.buffer.device.fns.vkUnmapMemory(self.buffer.device.device, backing.allocation.memory());
+        backing.mapped = false;
         self.mapped = false;
     }
 
@@ -1096,6 +1232,7 @@ pub const TextureBacking = struct {
     image: vk.Handle,
     view: vk.Handle,
     allocation: MemoryAllocation,
+    container: ?*TextureContainer = null,
     /// Layout per subresource, indexed by `layer * num_levels + mip`.
     layouts: []i32,
     refs: u32 = 0,
@@ -1231,6 +1368,16 @@ pub fn unref(dev: *Device, ref: Ref) void {
     }
 }
 
+// The worktree draft records resource owners but did not supply relocation
+// implementations. Keep failure explicit: allocation falls back to a new block.
+// Moving live Vulkan resources needs separate driver-level correctness validation.
+fn compact_buffer_backing(_: *Device, _: *BufferBacking) Error!void {
+    return error.UnsupportedFeature;
+}
+fn compact_texture_backing(_: *Device, _: *TextureBacking) Error!void {
+    return error.UnsupportedFeature;
+}
+
 fn create_buffer_backing(dev: *Device, size: u32, usage: vk.Flags, class: MemoryClass) Error!*BufferBacking {
     const handle = try dev.create_buffer_handle(size, usage);
     var allocation: ?MemoryAllocation = null;
@@ -1244,7 +1391,10 @@ fn create_buffer_backing(dev: *Device, size: u32, usage: vk.Flags, class: Memory
     const memory = allocation.?;
     _ = try vk.check(dev.fns.vkBindBufferMemory(dev.device, handle, memory.memory(), memory.offset));
     const backing = try dev.allocator.create(BufferBacking);
+    errdefer dev.allocator.destroy(backing);
     backing.* = .{ .handle = handle, .allocation = memory };
+    try memory.block.allocations.append(dev.allocator, &backing.allocation);
+    backing.allocation.owner = .{ .buffer = backing };
     return backing;
 }
 
@@ -1259,6 +1409,7 @@ fn release_buffer_backing(dev: *Device, backing: *BufferBacking) void {
 }
 
 fn free_buffer_backing(dev: *Device, backing: *BufferBacking) void {
+    dev.unregister_allocation(&backing.allocation);
     dev.retire(.{ .buffer = .{ .handle = backing.handle, .allocation = backing.allocation } });
     dev.allocator.destroy(backing);
 }
@@ -1281,6 +1432,7 @@ fn cycle_buffer(dev: *Device, container: *BufferContainer) Error!void {
     const fresh = try create_buffer_backing(dev, container.size, container.vk_usage, container.class);
     errdefer free_buffer_backing(dev, fresh);
     try container.backings.append(dev.allocator, fresh);
+    fresh.container = container;
     container.active = fresh;
 }
 
@@ -1330,7 +1482,10 @@ fn create_texture_backing(dev: *Device, info: types.TextureCreateInfo, layers: u
     @memset(layouts.?, vk.VK_IMAGE_LAYOUT_UNDEFINED);
 
     const backing = try dev.allocator.create(TextureBacking);
+    errdefer dev.allocator.destroy(backing);
     backing.* = .{ .image = image, .view = view.?, .allocation = memory, .layouts = layouts.?, .owned = true };
+    try memory.block.allocations.append(dev.allocator, &backing.allocation);
+    backing.allocation.owner = .{ .texture = backing };
     return backing;
 }
 
@@ -1347,6 +1502,7 @@ fn release_texture_backing(dev: *Device, backing: *TextureBacking) void {
 fn free_texture_backing(dev: *Device, backing: *TextureBacking) void {
     if (backing.owned) {
         pass.evict_image(dev, backing.image);
+        dev.unregister_allocation(&backing.allocation);
         dev.retire(.{ .image = .{ .handle = backing.image, .view = backing.view, .allocation = backing.allocation } });
     } else if (backing.view != 0) {
         dev.retire(.{ .image_view = backing.view });
@@ -1375,6 +1531,7 @@ fn wrap_swapchain_image(dev: *Device, image: vk.Handle, view: vk.Handle, info: t
     errdefer dev.allocator.destroy(container);
     container.* = .{ .info = info, .aspect = vk.VK_IMAGE_ASPECT_COLOR_BIT, .layers = 1, .can_cycle = false, .active = backing };
     try container.backings.append(dev.allocator, backing);
+    backing.container = container;
     return .{ .device = dev, .container = container, .info = info, .aspect = vk.VK_IMAGE_ASPECT_COLOR_BIT, .layers = 1 };
 }
 
@@ -1397,6 +1554,7 @@ fn cycle_texture(self: *CommandBuffer, texture: *Texture) Error!void {
         const fresh = try create_texture_backing(dev, container.info, container.layers, container.aspect);
         errdefer free_texture_backing(dev, fresh);
         try container.backings.append(dev.allocator, fresh);
+        fresh.container = container;
         container.active = fresh;
     }
     try self.track_texture(texture);

@@ -13,8 +13,9 @@
 //! - The decompressed stream must contain at least the bytes the image needs.
 //!   The expected size is computed exactly (Adam7 includes one filter byte per pass
 //!   row), rather than stb's whole-stream guess.
-//! - Encoding writes filter type 0 on every row and uses std's deflate
-//!   compressor. Its bytes differ from miniz's output, but the decoded pixels match.
+//! - Encoding uses adaptive row filtering and std's deflate compressor. Its
+//!   bytes differ from miniz's output, but the decoded pixels match.
+//! - Chunk CRC and zlib Adler checks are verified by default, with bounded allocations.
 //! - Corrupt data returns `error.CorruptPng` rather than stb's message strings.
 // Decoding behavior follows stb_image by Sean Barrett (MIT or public domain,
 // see docs/licenses/stb_image.txt), as bundled by upstream SDL.
@@ -77,8 +78,23 @@ const adam7 = struct {
     const yspc = [7]usize{ 8, 8, 8, 4, 4, 2, 2 };
 };
 
-/// Decodes a complete PNG into 8-bit samples.
+/// Allocation and integrity policy for untrusted PNG input. Limits cover each
+/// inflated/output allocation, not allocator bookkeeping or their combined peak.
+pub const DecodeOptions = struct {
+    max_width: u32 = 32768,
+    max_height: u32 = 32768,
+    max_decoded_bytes: usize = 512 * 1024 * 1024,
+    max_compressed_bytes: usize = 256 * 1024 * 1024,
+    verify_checksums: bool = true,
+};
+
+/// Decodes a complete PNG into 8-bit samples using bounded, checksum-verified defaults.
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Image {
+    return decode_with_options(allocator, bytes, .{});
+}
+
+/// Decodes with explicit resource/integrity policy. Returned samples are owned.
+pub fn decode_with_options(allocator: std.mem.Allocator, bytes: []const u8, options: DecodeOptions) Error!Image {
     if (bytes.len < 8 or !std.mem.eql(u8, bytes[0..8], &signature)) return error.NotPng;
 
     var header: ?Header = null;
@@ -93,16 +109,24 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Image {
     var idata: std.ArrayList(u8) = .empty;
     defer idata.deinit(allocator);
 
+    var first_idat: ?[]const u8 = null;
+    var compressed_len: usize = 0;
     var pos: usize = 8;
     var first = true;
     while (true) {
-        if (pos + 8 > bytes.len) return error.CorruptPng;
+        if (bytes.len - pos < 8) return error.CorruptPng;
         const length: usize = std.mem.readInt(u32, bytes[pos..][0..4], .big);
         const kind = bytes[pos + 4 ..][0..4].*;
         pos += 8;
-        if (bytes.len - pos < length + 4) return error.CorruptPng;
+        if (length > bytes.len - pos or bytes.len - pos - length < 4) return error.CorruptPng;
         const body = bytes[pos..][0..length];
-        pos += length + 4; // skip the CRC (not verified, as stb does)
+        if (options.verify_checksums) {
+            var crc = std.hash.Crc32.init();
+            crc.update(&kind);
+            crc.update(body);
+            if (crc.final() != std.mem.readInt(u32, bytes[pos + length ..][0..4], .big)) return error.CorruptPng;
+        }
+        pos += length + 4;
 
         if (std.mem.eql(u8, &kind, "CgBI")) {
             iphone = true;
@@ -113,6 +137,11 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Image {
             first = false;
             if (length != 13) return error.CorruptPng;
             header = try Header.parse(body);
+            const h = header.?;
+            if (h.width > options.max_width or h.height > options.max_height) return error.ImageTooLarge;
+            const count = std.math.mul(usize, h.width, h.height) catch return error.ImageTooLarge;
+            const decoded = std.math.mul(usize, count, @as(usize, h.img_n) * (if (h.depth == 16) @as(usize, 2) else 1)) catch return error.ImageTooLarge;
+            if (decoded > options.max_decoded_bytes) return error.ImageTooLarge;
             continue;
         }
         if (first) return error.CorruptPng; // every other chunk must follow IHDR
@@ -127,7 +156,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Image {
                 palette_rgba[i] = .{ body[i * 3], body[i * 3 + 1], body[i * 3 + 2], 255 };
             }
         } else if (std.mem.eql(u8, &kind, "tRNS")) {
-            if (idata.items.len != 0) return error.CorruptPng;
+            if (compressed_len != 0) return error.CorruptPng;
             if (h.color_type == 3) {
                 if (pal_len == 0) return error.CorruptPng;
                 if (length > pal_len) return error.CorruptPng;
@@ -148,9 +177,17 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Image {
             }
         } else if (std.mem.eql(u8, &kind, "IDAT")) {
             if (h.color_type == 3 and !has_palette) return error.CorruptPng;
-            try idata.appendSlice(allocator, body);
+            if (body.len > options.max_compressed_bytes -| compressed_len) return error.ImageTooLarge;
+            compressed_len += body.len;
+            // Most PNGs have one IDAT: borrow it instead of allocating/copying.
+            if (first_idat == null) {
+                first_idat = body;
+            } else {
+                if (idata.items.len == 0) try idata.appendSlice(allocator, first_idat.?);
+                try idata.appendSlice(allocator, body);
+            }
         } else if (std.mem.eql(u8, &kind, "IEND")) {
-            if (idata.items.len == 0) return error.CorruptPng;
+            if (compressed_len == 0 or length != 0) return error.CorruptPng;
             break;
         } else if ((kind[0] & 0x20) == 0) {
             // Upper-case first letter means critical: stb rejects unknown ones.
@@ -159,7 +196,7 @@ pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) Error!Image {
     }
 
     const h = header orelse return error.CorruptPng;
-    var image = try decode_pixels(allocator, h, idata.items, iphone, has_trns, &trns, trns_len);
+    var image = try decode_pixels(allocator, h, if (idata.items.len != 0) idata.items else first_idat.?, iphone, has_trns, &trns, trns_len, options);
     errdefer image.deinit();
     if (h.color_type == 3) {
         const colors = try allocator.alloc(pixels.Color, 256);
@@ -198,7 +235,7 @@ const Header = struct {
 };
 
 /// Inflates the IDAT stream, unfilters every scanline and applies tRNS.
-fn decode_pixels(allocator: std.mem.Allocator, h: Header, idata: []const u8, iphone: bool, has_trns: bool, trns: *const [6]u8, trns_len: usize) Error!Image {
+fn decode_pixels(allocator: std.mem.Allocator, h: Header, idata: []const u8, iphone: bool, has_trns: bool, trns: *const [6]u8, trns_len: usize, options: DecodeOptions) Error!Image {
     _ = trns_len;
     const x: usize = h.width;
     const y: usize = h.height;
@@ -218,10 +255,12 @@ fn decode_pixels(allocator: std.mem.Allocator, h: Header, idata: []const u8, iph
         break :blk total;
     } else (row_bytes(img_n, x, depth) + 1) * y;
 
-    const raw = try inflate(allocator, idata, raw_len, !iphone);
+    if (raw_len > options.max_decoded_bytes) return error.ImageTooLarge;
+    const raw = try inflate(allocator, idata, raw_len, !iphone, options.verify_checksums);
     defer allocator.free(raw);
 
     const out_bytes = std.math.mul(usize, std.math.mul(usize, x, y) catch return error.ImageTooLarge, out_n * sb) catch return error.ImageTooLarge;
+    if (out_bytes > options.max_decoded_bytes) return error.ImageTooLarge;
     const final = try allocator.alloc(u8, out_bytes);
     errdefer allocator.free(final);
 
@@ -274,7 +313,7 @@ fn row_bytes(img_n: usize, width: usize, depth: usize) usize {
 }
 
 /// Inflates exactly `expected` bytes from the IDAT stream.
-fn inflate(allocator: std.mem.Allocator, idata: []const u8, expected: usize, zlib: bool) Error![]u8 {
+fn inflate(allocator: std.mem.Allocator, idata: []const u8, expected: usize, zlib: bool, verify: bool) Error![]u8 {
     var input = std.Io.Reader.fixed(idata);
     const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
     defer allocator.free(window);
@@ -282,7 +321,16 @@ fn inflate(allocator: std.mem.Allocator, idata: []const u8, expected: usize, zli
     const out = try allocator.alloc(u8, expected);
     errdefer allocator.free(out);
     decompress.reader.readSliceAll(out) catch return error.CorruptPng;
-    return out;
+    // Force the end marker and container trailer to be parsed. Reading only the
+    // requested pixels used to accept truncated streams and trailing raw output.
+    _ = decompress.reader.takeByte() catch |err| switch (err) {
+        error.EndOfStream => {
+            if (verify and zlib and decompress.container_metadata.zlib.adler != std.hash.Adler32.hash(out)) return error.CorruptPng;
+            return out;
+        },
+        else => return error.CorruptPng,
+    };
+    return error.CorruptPng;
 }
 
 /// Unfilters `height` scanlines from `raw` (filter byte + row bytes each) and
@@ -293,6 +341,22 @@ fn unfilter_pass(allocator: std.mem.Allocator, raw: []const u8, width: usize, he
     // Filter byte distance: at least one byte, or one sample for 8/16-bit.
     const filter_bytes: usize = if (depth < 8) 1 else img_n * bytes;
     const dest_row = dest_width * out_n * bytes;
+
+    // Common 8/16-bit rows with no inserted alpha can unfilter directly into
+    // their final destination. The previous destination row is the predictor:
+    // no two-row scratch allocation, sample allocation or row copy is needed.
+    if (depth >= 8 and img_n == out_n) {
+        for (0..height) |j| {
+            const begin = j * (nk + 1);
+            if (raw.len -| begin < nk + 1) return error.CorruptPng;
+            const filter = raw[begin];
+            if (filter > 4) return error.CorruptPng;
+            const cur = dest[j * dest_row ..][0..nk];
+            const prior = if (j == 0) cur else dest[(j - 1) * dest_row ..][0..nk];
+            unfilter_row(if (j == 0) first_row_filter(filter) else filter, raw[begin + 1 ..][0..nk], prior, cur, filter_bytes);
+        }
+        return;
+    }
 
     const prior_buf = try allocator.alloc(u8, nk);
     defer allocator.free(prior_buf);
@@ -335,6 +399,10 @@ fn unfilter_pass(allocator: std.mem.Allocator, raw: []const u8, width: usize, he
 /// Expands `width` pixels of `img_n` samples (each `bytes` wide) into `out_n`
 /// channels. The opaque alpha sample is the maximum value of the sample size.
 fn expand_samples(dest: []u8, src: []const u8, width: usize, img_n: usize, out_n: usize, bytes: usize) void {
+    if (img_n == out_n) {
+        @memcpy(dest[0 .. width * img_n * bytes], src[0 .. width * img_n * bytes]);
+        return;
+    }
     for (0..width) |i| {
         const from = i * img_n * bytes;
         const to = i * out_n * bytes;
@@ -438,50 +506,81 @@ fn read_sample(data: []const u8, offset: usize, sb: usize) u16 {
     return data[offset];
 }
 
-/// Encodes an image as an 8-bit PNG. Indexed views are written as color type 3
-/// with the view's palette (alpha becomes tRNS); other formats are written as
-/// RGBA. Every scanline uses filter type 0.
+/// PNG row predictor. Adaptive chooses the lowest sum of absolute signed
+/// residuals per row; explicit filters avoid that search when throughput matters.
+pub const Filter = enum { none, sub, up, average, paeth, adaptive };
+pub const Compression = enum { fast, balanced, best };
+/// Encoding policy. `.fast` trades size for speed; `.none` skips filter search.
+pub const EncodeOptions = struct {
+    filter: Filter = .adaptive,
+    compression: Compression = .balanced,
+};
+
+/// Encodes an owned PNG byte slice. Indexed views retain their palette/alpha;
+/// other formats become RGBA. Uses adaptive filtering and balanced compression.
 pub fn encode(allocator: std.mem.Allocator, view: surface.View) Error![]u8 {
+    return encode_with_options(allocator, view, .{});
+}
+
+/// Encodes with explicit filtering and compression policy. Temporary storage is
+/// proportional to one scanline rather than the entire uncompressed image.
+pub fn encode_with_options(allocator: std.mem.Allocator, view: surface.View, options: EncodeOptions) Error![]u8 {
     const indexed = view.format == .indexed;
     if (indexed and view.palette == null) return error.MissingPalette;
     const width: usize = view.width;
     const height: usize = view.height;
+    if (width == 0 or height == 0) return error.InvalidSize;
     const bpp: usize = if (indexed) 1 else 4;
+    const row_len = std.math.mul(usize, width, bpp) catch return error.ImageTooLarge;
+    const storage = try allocator.alloc(u8, std.math.mul(usize, row_len + 1, 4) catch return error.ImageTooLarge);
+    defer allocator.free(storage);
+    var prior = storage[0..row_len];
+    var row = storage[row_len .. row_len * 2];
+    const filtered = storage[row_len * 2 ..][0 .. row_len + 1];
+    const candidate = storage[row_len * 3 + 1 ..][0 .. row_len + 1];
+    @memset(prior, 0);
 
-    const raw_len = (1 + width * bpp) * height;
-    const raw = try allocator.alloc(u8, raw_len);
-    defer allocator.free(raw);
-    var offset: usize = 0;
-    for (0..height) |y| {
-        raw[offset] = 0;
-        offset += 1;
-        const row = raw[offset..][0 .. width * bpp];
-        if (indexed) {
-            const indexed_format = view.format.indexed;
-            const source = try view.row(y);
-            for (0..width) |x| row[x] = try indexed_format.read_index(source, x);
-        } else {
-            for (0..width) |x| {
-                const color = try view.read(x, y);
-                row[x * 4 + 0] = color.r;
-                row[x * 4 + 1] = color.g;
-                row[x * 4 + 2] = color.b;
-                row[x * 4 + 3] = color.a;
-            }
-        }
-        offset += width * bpp;
-    }
-
-    // Compress requires a sink with real buffer capacity (it asserts > 8 bytes).
     var compressed: std.Io.Writer.Allocating = try .initCapacity(allocator, 4096);
     defer compressed.deinit();
     const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
     defer allocator.free(window);
-    // The sink is an allocating writer, so a write failure means allocation failed.
-    var compress = std.compress.flate.Compress.init(&compressed.writer, window, .zlib, std.compress.flate.Compress.Options.default) catch return error.OutOfMemory;
-    compress.writer.writeAll(raw) catch return error.OutOfMemory;
+    const compression = switch (options.compression) {
+        .fast => std.compress.flate.Compress.Options.fastest,
+        .balanced => std.compress.flate.Compress.Options.default,
+        .best => std.compress.flate.Compress.Options.best,
+    };
+    var compress = std.compress.flate.Compress.init(&compressed.writer, window, .zlib, compression) catch return error.OutOfMemory;
+    for (0..height) |y| {
+        const source = try view.row(y);
+        if (view.format == .rgba8) {
+            @memcpy(row, source);
+        } else if (indexed) {
+            const indexed_format = view.format.indexed;
+            if (indexed_format.bits == 8) @memcpy(row, source) else {
+                for (0..width) |x| row[x] = try indexed_format.read_index(source, x);
+            }
+        } else {
+            for (0..width) |x| {
+                const color = try view.read(x, y);
+                row[x * 4 ..][0..4].* = .{ color.r, color.g, color.b, color.a };
+            }
+        }
+        if (options.filter == .adaptive) {
+            var best_score = filter_encode(0, row, prior, bpp, filtered);
+            for (1..5) |kind| {
+                const score = filter_encode(@intCast(kind), row, prior, bpp, candidate);
+                if (score < best_score) {
+                    best_score = score;
+                    @memcpy(filtered, candidate);
+                }
+            }
+        } else _ = filter_encode(@intCast(@backingInt(options.filter)), row, prior, bpp, filtered);
+        compress.writer.writeAll(filtered) catch return error.OutOfMemory;
+        std.mem.swap([]u8, &row, &prior);
+    }
     compress.finish() catch return error.OutOfMemory;
     const idat = compressed.written();
+    if (idat.len > std.math.maxInt(u32)) return error.ImageTooLarge;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -527,4 +626,126 @@ fn append_chunk(allocator: std.mem.Allocator, out: *std.ArrayList(u8), kind: *co
     var checksum: [4]u8 = undefined;
     std.mem.writeInt(u32, &checksum, crc.final(), .big);
     try out.appendSlice(allocator, &checksum);
+}
+
+/// Constructs one filtered scanline and its PNG signed-residual heuristic score.
+fn filter_encode(kind: u8, row: []const u8, prior: []const u8, bpp: usize, output: []u8) u64 {
+    output[0] = kind;
+    var score: u64 = 0;
+    for (row, 0..) |value, i| {
+        const left: u8 = if (i >= bpp) row[i - bpp] else 0;
+        const upper_left: u8 = if (i >= bpp) prior[i - bpp] else 0;
+        const predicted: u8 = switch (kind) {
+            0 => 0,
+            1 => left,
+            2 => prior[i],
+            3 => @intCast((@as(u16, left) + prior[i]) >> 1),
+            4 => paeth(left, prior[i], upper_left),
+            else => unreachable,
+        };
+        const residual = value -% predicted;
+        output[i + 1] = residual;
+        score += @min(@as(u16, residual), 256 - @as(u16, residual));
+    }
+    return score;
+}
+
+test "PNG filters and compression policies roundtrip RGBA without touching padding" {
+    const a = std.testing.allocator;
+    var input: [7 * 37]u8 = @splat(0xa5);
+    const view = try surface.View.init(&input, 8, 7, 37, .rgba8, null);
+    for (0..7) |y| for (0..8) |x| {
+        try view.write(x, y, .{ .r = @intCast(x * 31), .g = @intCast(y * 41), .b = @intCast((x ^ y) * 29), .a = @intCast(x * 17 + y * 13) });
+    };
+    const filters = [_]Filter{ .none, .sub, .up, .average, .paeth, .adaptive };
+    for (filters) |filter| for ([_]Compression{ .fast, .balanced, .best }) |compression| {
+        const encoded = try encode_with_options(a, view, .{ .filter = filter, .compression = compression });
+        defer a.free(encoded);
+        var decoded = try decode(a, encoded);
+        defer decoded.deinit();
+        try std.testing.expectEqual(@as(u8, 4), decoded.channels);
+        for (0..7) |y| try std.testing.expectEqualSlices(u8, try view.row(y), decoded.data[y * 32 ..][0..32]);
+    };
+}
+
+test "PNG all filters match independent scalar inverse including short and unaligned rows" {
+    var source: [137]u8 = undefined;
+    var prior: [137]u8 = undefined;
+    var filtered: [138]u8 = undefined;
+    var result: [137]u8 = undefined;
+    for (&source, &prior, 0..) |*s, *p, i| {
+        s.* = @truncate(i * 103 + 17);
+        p.* = @truncate(i * 59 + 231);
+    }
+    for ([_]usize{ 1, 2, 3, 4, 6, 8 }) |bpp| {
+        for ([_]usize{ bpp, bpp + 1, 137 }) |len| {
+            for (0..5) |kind| {
+                _ = filter_encode(@intCast(kind), source[0..len], prior[0..len], bpp, filtered[0 .. len + 1]);
+                unfilter_row(@intCast(kind), filtered[1 .. len + 1], prior[0..len], result[0..len], bpp);
+                try std.testing.expectEqualSlices(u8, source[0..len], result[0..len]);
+            }
+        }
+    }
+}
+
+test "PNG decode bounds and CRC validation reject untrusted input" {
+    const a = std.testing.allocator;
+    var data: [16]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const view = try surface.View.init(&data, 2, 2, 8, .rgba8, null);
+    const encoded = try encode(a, view);
+    defer a.free(encoded);
+    try std.testing.expectError(error.ImageTooLarge, decode_with_options(a, encoded, .{ .max_width = 1 }));
+    try std.testing.expectError(error.ImageTooLarge, decode_with_options(a, encoded, .{ .max_decoded_bytes = 15 }));
+    try std.testing.expectError(error.ImageTooLarge, decode_with_options(a, encoded, .{ .max_compressed_bytes = 1 }));
+    // Alter IHDR's CRC, leaving its actual data intact.
+    encoded[29] ^= 1;
+    try std.testing.expectError(error.CorruptPng, decode(a, encoded));
+    var unchecked = try decode_with_options(a, encoded, .{ .verify_checksums = false });
+    unchecked.deinit();
+    encoded[29] ^= 1;
+    // Every truncated prefix is rejected, including the IEND CRC.
+    for (0..encoded.len) |len| {
+        if (decode(a, encoded[0..len])) |success| {
+            var bad = success;
+            bad.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "PNG split IDAT chunks decode identically including empty chunks" {
+    const a = std.testing.allocator;
+    var data: [12]u8 = .{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const view = try surface.View.init(&data, 3, 1, 12, .rgba8, null);
+    const encoded = try encode(a, view);
+    defer a.free(encoded);
+    var chunks: std.ArrayList(u8) = .empty;
+    defer chunks.deinit(a);
+    try chunks.appendSlice(a, encoded[0..33]);
+    const len = std.mem.readInt(u32, encoded[33..][0..4], .big);
+    const idat = encoded[41..][0..len];
+    try append_chunk(a, &chunks, "IDAT", &.{});
+    try append_chunk(a, &chunks, "IDAT", idat[0 .. len / 2]);
+    try append_chunk(a, &chunks, "IDAT", &.{});
+    try append_chunk(a, &chunks, "IDAT", idat[len / 2 ..]);
+    try append_chunk(a, &chunks, "IEND", &.{});
+    var result = try decode(a, chunks.items);
+    defer result.deinit();
+    try std.testing.expectEqualSlices(u8, &data, result.data);
+}
+
+test "PNG palette alpha roundtrip and indexed packed expansion" {
+    const a = std.testing.allocator;
+    var data: [2]u8 = .{ 0b01011010, 0b10100101 };
+    const palette = [_]pixels.Color{ .{ .r = 255, .g = 0, .b = 0, .a = 127 }, .{ .r = 0, .g = 255, .b = 0, .a = 255 } };
+    const view = try surface.View.init(&data, 8, 2, 1, .{ .indexed = .{ .bits = 1 } }, &palette);
+    const encoded = try encode(a, view);
+    defer a.free(encoded);
+    var result = try decode(a, encoded);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u8, 1), result.channels);
+    try std.testing.expectEqualSlices(pixels.Color, &palette, result.palette.?[0..2]);
+    for (0..2) |y| for (0..8) |x| {
+        try std.testing.expectEqual(try view.format.indexed.read_index(try view.row(y), x), result.data[y * 8 + x]);
+    };
 }

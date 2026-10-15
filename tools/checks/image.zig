@@ -9,9 +9,13 @@ pub fn check() void {
     _ = image.png.is_png;
     _ = image.png.decode;
     _ = image.png.encode;
-    _ = image.load.load_jpg;
-    _ = image.load.load_png;
-    _ = image.load.convert_mjpg_to_nv12;
-    _ = image.load.convert_mjpg_frame_to_nv12;
-    _ = image.load.convert_mjpg_frame_to_surface;
+    _ = image.load_jpeg;
+    _ = image.load_png;
+    _ = image.load_webp;
+    _ = image.decode;
+    _ = image.decodeAs;
+    _ = image.probe;
+    _ = image.mjpg.frame_to_nv12;
+    _ = image.mjpg.frame_to_nv12_from;
+    _ = image.mjpg.frame_to_surface;
 }

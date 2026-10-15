@@ -31,5 +31,23 @@ pub fn build(b: *std.Build) void {
     // Existing tests remain available for explicit execution, without running
     // any as part of this compile-only port.
     const run = b.addRunArtifact(tests);
-    b.step("test", "Run existing native unit tests").dependOn(&run.step);
+    const test_step = b.step("test", "Run native unit tests and Linux platform regressions");
+    test_step.dependOn(&run.step);
+
+    // Platform API bodies instantiate optional C-library backends. Test those
+    // with libc in a separate application root, keeping native/core consumers
+    // free to compile without libc.
+    if (target.result.os.tag == .linux) {
+        const platform_module = b.createModule(.{
+            .root_source_file = b.path("tools/platform_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "zdl", .module = native }},
+        });
+        const platform_tests = b.addTest(.{ .root_module = platform_module });
+        b.default_step.dependOn(&platform_tests.step);
+        check.dependOn(&platform_tests.step);
+        test_step.dependOn(&b.addRunArtifact(platform_tests).step);
+    }
 }

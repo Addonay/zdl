@@ -14,7 +14,7 @@ const pixels_wide = @import("pixels_wide.zig");
 const surface = @import("surface.zig");
 const bmp = @import("bmp.zig");
 const png = @import("../image/png.zig");
-const load = @import("../image/load.zig");
+const image_codecs = @import("../image/image.zig");
 
 const Masks = pixels.Packed.Masks;
 
@@ -165,7 +165,7 @@ test "sdl pixels: save and load PNG" {
         try s.view.fill(.{ .r = 255, .g = 255, .b = 255, .a = 255 }, null);
         const bytes = try png.encode(testing.allocator, s.view);
         defer testing.allocator.free(bytes);
-        var image = try load.load_png(testing.allocator, bytes);
+        var image = try image_codecs.load_png(testing.allocator, bytes, .{});
         defer image.deinit();
         // SDL expects RGBA32 (bytes 255/255/255/255).
         try expect_white(try image.surface.view.read(0, 0));

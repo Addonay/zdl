@@ -9,9 +9,10 @@
 //! decoding with whatever has been decoded so far (stb returns success there).
 //!
 //! Deliberate differences from stb/SDL:
-//! - Input is a borrowed byte slice. There are no I/O callbacks, no thread-local
-//!   failure strings and no SIMD kernels; the scalar kernels are the reference
-//!   that stb's SSE2/NEON paths are required to match.
+//! - Input is a borrowed byte slice. There are no I/O callbacks and no thread-local
+//!   failure strings. The IDCT, YCbCr conversion and vertical upsampler run as
+//!   lane-vector kernels in `jpeg_kernels.zig`, validated against scalar
+//!   references that match stb's SSE2/NEON results.
 //! - Corrupt input returns `error.CorruptJpeg` instead of stb's message string.
 //! - The NV12 writer (`decode_nv12`) addresses component samples with the
 //!   component's MCU-padded row stride. SDL's copy of stb's `output_jpeg_nv12`
@@ -26,6 +27,7 @@
 // Decoding behavior follows stb_image by Sean Barrett (MIT or public domain,
 // see docs/licenses/stb_image.txt), as bundled by upstream SDL.
 const std = @import("std");
+const kernels = @import("jpeg_kernels.zig");
 
 /// Decoder failures. stb's messages are represented by the error name.
 pub const Error = std.mem.Allocator.Error || error{
@@ -916,7 +918,7 @@ const Decoder = struct {
                     for (0..w) |i| {
                         try self.decode_block(&block, &self.huff_dc[hd], &self.huff_ac[ha], &self.fast_ac[ha], n, &self.dequant[tq]);
                         const stride = self.comp[n].w2;
-                        idct_block(self.comp[n].data[stride * j * 8 + i * 8 ..], stride, &block);
+                        kernels.idct_block(self.comp[n].data[stride * j * 8 + i * 8 ..], stride, &block);
                         if (try self.end_of_restart_interval()) return;
                     }
                 }
@@ -938,7 +940,7 @@ const Decoder = struct {
                                 const y2 = (j * comp_v + y) * 8;
                                 try self.decode_block(&block, &self.huff_dc[hd], &self.huff_ac[ha], &self.fast_ac[ha], n, &self.dequant[tq]);
                                 const stride = self.comp[n].w2;
-                                idct_block(self.comp[n].data[stride * y2 + x2 ..], stride, &block);
+                                kernels.idct_block(self.comp[n].data[stride * y2 + x2 ..], stride, &block);
                             }
                         }
                     }
@@ -1013,7 +1015,7 @@ const Decoder = struct {
                     const block = self.coeff_block(n, i, j);
                     for (block, quant) |*value, q| value.* = @truncate(@as(i32, value.*) * @as(i32, q));
                     const stride = self.comp[n].w2;
-                    idct_block(self.comp[n].data[stride * j * 8 + i * 8 ..], stride, block);
+                    kernels.idct_block(self.comp[n].data[stride * j * 8 + i * 8 ..], stride, block);
                 }
             }
         }
@@ -1089,7 +1091,7 @@ const Decoder = struct {
                         if (count == 4) out[i * count + 3] = 255;
                     }
                 } else {
-                    ycbcr_to_rgb_row(out, y, coutput[1], coutput[2], width, count);
+                    kernels.ycbcr_to_rgb_row(out, y, coutput[1], coutput[2], width, count);
                 }
             } else if (self.img_n == 4) {
                 if (self.app14_color_transform == 0) { // CMYK
@@ -1101,7 +1103,7 @@ const Decoder = struct {
                         if (count == 4) out[i * count + 3] = 255;
                     }
                 } else if (self.app14_color_transform == 2) { // YCCK
-                    ycbcr_to_rgb_row(out, y, coutput[1], coutput[2], width, count);
+                    kernels.ycbcr_to_rgb_row(out, y, coutput[1], coutput[2], width, count);
                     for (0..width) |i| {
                         const m = coutput[3][i];
                         out[i * count + 0] = blinn_8x8(255 - out[i * count + 0], m);
@@ -1109,7 +1111,7 @@ const Decoder = struct {
                         out[i * count + 2] = blinn_8x8(255 - out[i * count + 2], m);
                     }
                 } else { // YCbCr plus an ignored fourth channel
-                    ycbcr_to_rgb_row(out, y, coutput[1], coutput[2], width, count);
+                    kernels.ycbcr_to_rgb_row(out, y, coutput[1], coutput[2], width, count);
                 }
             } else {
                 for (0..width) |i| {
@@ -1221,7 +1223,46 @@ fn build_fast_ac(fast_ac: *[fast_size]i16, h: *const Huffman) void {
 
 /// stb's 8x8 integer IDCT: 12-bit fixed-point butterfly, two 1-D passes with
 /// different output shifts, clamped to 8 bits, written with `out_stride` rows.
+// Eight lanes process all columns, then all rows. Fixed-point operations and
+// shifts are identical to the scalar reference, including wrapping overflow.
 fn idct_block(out: []u8, out_stride: usize, data: *const [64]i16) void {
+    if (comptime (std.simd.suggestVectorLength(i32) orelse 1) < 4) {
+        return idct_block_scalar(out, out_stride, data);
+    }
+    const V = @Vector(8, i32);
+    var rows: [8]V = undefined;
+    inline for (0..8) |r| rows[r] = @intCast(@as(@Vector(8, i16), data[r * 8 ..][0..8].*));
+    const t = idct_1d(rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], rows[6], rows[7]);
+    const bias: V = @splat(512);
+    rows[0] = (t.x0 +% bias +% t.t3) >> @splat(10);
+    rows[7] = (t.x0 +% bias -% t.t3) >> @splat(10);
+    rows[1] = (t.x1 +% bias +% t.t2) >> @splat(10);
+    rows[6] = (t.x1 +% bias -% t.t2) >> @splat(10);
+    rows[2] = (t.x2 +% bias +% t.t1) >> @splat(10);
+    rows[5] = (t.x2 +% bias -% t.t1) >> @splat(10);
+    rows[3] = (t.x3 +% bias +% t.t0) >> @splat(10);
+    rows[4] = (t.x3 +% bias -% t.t0) >> @splat(10);
+    var columns: [8]V = undefined;
+    inline for (0..8) |c| {
+        inline for (0..8) |r| columns[c][r] = rows[r][c];
+    }
+    const u = idct_1d(columns[0], columns[1], columns[2], columns[3], columns[4], columns[5], columns[6], columns[7]);
+    const final_bias: V = @splat(65536 + (128 << 17));
+    columns[0] = (u.x0 +% final_bias +% u.t3) >> @splat(17);
+    columns[7] = (u.x0 +% final_bias -% u.t3) >> @splat(17);
+    columns[1] = (u.x1 +% final_bias +% u.t2) >> @splat(17);
+    columns[6] = (u.x1 +% final_bias -% u.t2) >> @splat(17);
+    columns[2] = (u.x2 +% final_bias +% u.t1) >> @splat(17);
+    columns[5] = (u.x2 +% final_bias -% u.t1) >> @splat(17);
+    columns[3] = (u.x3 +% final_bias +% u.t0) >> @splat(17);
+    columns[4] = (u.x3 +% final_bias -% u.t0) >> @splat(17);
+    inline for (0..8) |c| {
+        const clipped: @Vector(8, u8) = @intCast(@min(@max(columns[c], @as(V, @splat(0))), @as(V, @splat(255))));
+        inline for (0..8) |r| out[r * out_stride + c] = clipped[r];
+    }
+}
+
+fn idct_block_scalar(out: []u8, out_stride: usize, data: *const [64]i16) void {
     var val: [64]i32 = undefined;
     // Columns first. A column of zero AC terms is a constant, computed directly.
     for (0..8) |i| {
@@ -1265,29 +1306,36 @@ fn idct_block(out: []u8, out_stride: usize, data: *const [64]i16) void {
     }
 }
 
-const IdctOutputs = struct { x0: i32, x1: i32, x2: i32, x3: i32, t0: i32, t1: i32, t2: i32, t3: i32 };
+fn IdctOutputs(comptime T: type) type {
+    return struct { x0: T, x1: T, x2: T, x3: T, t0: T, t1: T, t2: T, t3: T };
+}
 
 /// One 1-D pass of stb's IDCT. Constants are stb's `stbi__f2f` values, i.e.
 /// round(c * 4096) computed in single precision. Wrapping arithmetic matches the
 /// C code's two's-complement behaviour on corrupt coefficient magnitudes.
-fn idct_1d(s0: anytype, s1: anytype, s2: anytype, s3: anytype, s4: anytype, s5: anytype, s6: anytype, s7: anytype) IdctOutputs {
-    const a0: i32 = s0;
-    const a1: i32 = s1;
-    const a2: i32 = s2;
-    const a3: i32 = s3;
-    const a4: i32 = s4;
-    const a5: i32 = s5;
-    const a6: i32 = s6;
-    const a7: i32 = s7;
+fn idct_constant(comptime T: type, comptime value: i32) T {
+    return if (@typeInfo(T) == .vector) @splat(value) else value;
+}
+
+fn idct_1d(s0: anytype, s1: anytype, s2: anytype, s3: anytype, s4: anytype, s5: anytype, s6: anytype, s7: anytype) IdctOutputs(if (@TypeOf(s0) == @Vector(8, i32)) @Vector(8, i32) else i32) {
+    const T = if (@TypeOf(s0) == @Vector(8, i32)) @Vector(8, i32) else i32;
+    const a0: T = s0;
+    const a1: T = s1;
+    const a2: T = s2;
+    const a3: T = s3;
+    const a4: T = s4;
+    const a5: T = s5;
+    const a6: T = s6;
+    const a7: T = s7;
     var p2 = a2;
     var p3 = a6;
-    var p1 = (p2 +% p3) *% 2217; // 0.5411961
-    var t2 = p1 +% p3 *% -7567; // -1.847759065
-    var t3 = p1 +% p2 *% 3135; // 0.765366865
+    var p1 = (p2 +% p3) *% idct_constant(T, 2217); // 0.5411961
+    var t2 = p1 +% p3 *% idct_constant(T, -7567); // -1.847759065
+    var t3 = p1 +% p2 *% idct_constant(T, 3135); // 0.765366865
     p2 = a0;
     p3 = a4;
-    var t0 = (p2 +% p3) *% 4096;
-    var t1 = (p2 -% p3) *% 4096;
+    var t0 = (p2 +% p3) *% idct_constant(T, 4096);
+    var t1 = (p2 -% p3) *% idct_constant(T, 4096);
     const x0 = t0 +% t3;
     const x3 = t0 -% t3;
     const x1 = t1 +% t2;
@@ -1300,15 +1348,15 @@ fn idct_1d(s0: anytype, s1: anytype, s2: anytype, s3: anytype, s4: anytype, s5: 
     var p4 = t1 +% t3;
     p1 = t0 +% t3;
     p2 = t1 +% t2;
-    const p5 = (p3 +% p4) *% 4816; // 1.175875602
-    t0 = t0 *% 1223; // 0.298631336
-    t1 = t1 *% 8410; // 2.053119869
-    t2 = t2 *% 12586; // 3.072711026
-    t3 = t3 *% 6149; // 1.501321110
-    p1 = p5 +% p1 *% -3685; // -0.899976223
-    p2 = p5 +% p2 *% -10497; // -2.562915447
-    p3 = p3 *% -8034; // -1.961570560
-    p4 = p4 *% -1597; // -0.390180644
+    const p5 = (p3 +% p4) *% idct_constant(T, 4816); // 1.175875602
+    t0 = t0 *% idct_constant(T, 1223); // 0.298631336
+    t1 = t1 *% idct_constant(T, 8410); // 2.053119869
+    t2 = t2 *% idct_constant(T, 12586); // 3.072711026
+    t3 = t3 *% idct_constant(T, 6149); // 1.501321110
+    p1 = p5 +% p1 *% idct_constant(T, -3685); // -0.899976223
+    p2 = p5 +% p2 *% idct_constant(T, -10497); // -2.562915447
+    p3 = p3 *% idct_constant(T, -8034); // -1.961570560
+    p4 = p4 *% idct_constant(T, -1597); // -0.390180644
     t3 +%= p1 +% p4;
     t2 +%= p2 +% p3;
     t1 +%= p2 +% p4;
@@ -1317,11 +1365,9 @@ fn idct_1d(s0: anytype, s1: anytype, s2: anytype, s3: anytype, s4: anytype, s5: 
 }
 
 fn clamp_u8(x: i32) u8 {
-    if (@as(u32, @bitCast(x)) > 255) {
-        if (x < 0) return 0;
-        return 255;
-    }
-    return @intCast(x);
+    // Explicit signed bounds avoid narrowing the interior [128,255] range
+    // incorrectly when the scalar reference is optimized/vectorized.
+    return @intCast(@min(@max(x, @as(i32, 0)), @as(i32, 255)));
 }
 
 /// stb's 8x8 alpha blend: (x * y) / 255 rounded.
@@ -1339,6 +1385,45 @@ fn compute_y(r: u8, g: u8, b: u8) u8 {
 /// into a 20-bit fraction with rounding. Output is written with `step` channels;
 /// alpha is written only for four-channel output.
 fn ycbcr_to_rgb_row(out: []u8, y: []const u8, pcb: []const u8, pcr: []const u8, count: usize, step: u8) void {
+    if (step == 4) return ycbcr_to_rgb_vector(4, out, y, pcb, pcr, count);
+    return ycbcr_to_rgb_vector(3, out, y, pcb, pcr, count);
+}
+
+fn ycbcr_to_rgb_vector(comptime step: usize, out: []u8, y: []const u8, pcb: []const u8, pcr: []const u8, count: usize) void {
+    const V = @Vector(8, i32);
+    var i: usize = 0;
+    if (comptime (std.simd.suggestVectorLength(i32) orelse 1) >= 4) {
+        while (i + 8 <= count) : (i += 8) {
+            const y8: @Vector(8, u8) = y[i..][0..8].*;
+            const cb8: @Vector(8, u8) = pcb[i..][0..8].*;
+            const cr8: @Vector(8, u8) = pcr[i..][0..8].*;
+            const yf = (@as(V, @intCast(y8)) << @splat(20)) + @as(V, @splat(1 << 19));
+            const cb = @as(V, @intCast(cb8)) - @as(V, @splat(128));
+            const cr = @as(V, @intCast(cr8)) - @as(V, @splat(128));
+            const r = (yf +% cr *% @as(V, @splat(1470208))) >> @splat(20);
+            const g = (yf +% cr *% @as(V, @splat(-748800)) +% ((cb *% @as(V, @splat(-360960))) & @as(V, @splat(-65536)))) >> @splat(20);
+            const b = (yf +% cb *% @as(V, @splat(1858048))) >> @splat(20);
+            const r8: @Vector(8, u8) = @intCast(@min(@max(r, @as(V, @splat(0))), @as(V, @splat(255))));
+            const g8: @Vector(8, u8) = @intCast(@min(@max(g, @as(V, @splat(0))), @as(V, @splat(255))));
+            const b8: @Vector(8, u8) = @intCast(@min(@max(b, @as(V, @splat(0))), @as(V, @splat(255))));
+            if (step == 4) {
+                const U = @Vector(8, u32);
+                var packed_rgba = @as(U, @intCast(r8)) | (@as(U, @intCast(g8)) << @splat(8)) | (@as(U, @intCast(b8)) << @splat(16)) | @as(U, @splat(0xff000000));
+                if (@import("builtin").target.cpu.arch.endian() == .big) packed_rgba = @byteSwap(packed_rgba);
+                @memcpy(out[i * 4 ..][0..32], &@as([32]u8, @bitCast(packed_rgba)));
+            } else {
+                inline for (0..8) |lane| {
+                    out[(i + lane) * 3 + 0] = r8[lane];
+                    out[(i + lane) * 3 + 1] = g8[lane];
+                    out[(i + lane) * 3 + 2] = b8[lane];
+                }
+            }
+        }
+    }
+    ycbcr_to_rgb_row_scalar(out[i * step ..], y[i..], pcb[i..], pcr[i..], count - i, step);
+}
+
+fn ycbcr_to_rgb_row_scalar(out: []u8, y: []const u8, pcb: []const u8, pcr: []const u8, count: usize, step: u8) void {
     for (0..count) |i| {
         const y_fixed: i32 = (@as(i32, y[i]) << 20) + (1 << 19);
         const cr: i32 = @as(i32, pcr[i]) - 128;
@@ -1364,7 +1449,7 @@ fn resample_row(kernel: Resampler, out: []u8, near: []const u8, far: []const u8,
     switch (kernel) {
         .one => return near,
         .v2 => {
-            for (0..w) |i| out[i] = @intCast((3 * @as(u32, near[i]) + far[i] + 2) >> 2);
+            kernels.resample_v2(out, near, far, w);
             return out[0..w];
         },
         .h2 => {
@@ -1421,4 +1506,63 @@ test "progressive JPEG refinement matches the baseline coefficients across block
     try testing.expectEqual(baseline.width, progressive.width);
     try testing.expectEqual(baseline.height, progressive.height);
     try testing.expectEqualSlices(u8, baseline.data, progressive.data);
+}
+
+test "vector IDCT is byte exact against scalar including sparse and extreme coefficients" {
+    var random: std.Random.DefaultPrng = .init(0x1284417);
+    for (0..4096) |iteration| {
+        var coefficients: [64]i16 = undefined;
+        for (&coefficients, 0..) |*v, i| {
+            v.* = if (iteration < 64 and i != iteration) 0 else if (iteration < 128) random.random().intRangeAtMost(i16, -1024, 1024) else random.random().int(i16);
+        }
+        var scalar: [8 * 13]u8 = @splat(0xcc);
+        var vector: [8 * 13]u8 = @splat(0xcc);
+        idct_block_scalar(&scalar, 13, &coefficients);
+        idct_block(&vector, 13, &coefficients);
+        try std.testing.expectEqualSlices(u8, &scalar, &vector);
+    }
+}
+
+test "JPEG synthetic corpus retains exact reference RGBA pixels" {
+    const fixtures = struct {
+        const baseline = @embedFile("testdata/jpeg-baseline.jpg");
+        const progressive = @embedFile("testdata/jpeg-progressive.jpg");
+        const noise = @embedFile("testdata/jpeg-noise.jpg");
+        const grey = @embedFile("testdata/jpeg-grey.jpg");
+    };
+    const cases = .{
+        .{ fixtures.baseline, @as(u64, 0xd13c12b807bc8ead) },
+        .{ fixtures.progressive, @as(u64, 0xd13c12b807bc8ead) },
+        .{ fixtures.noise, @as(u64, 0x975bc75566d6fb5b) },
+        .{ fixtures.grey, @as(u64, 0x4482a2e8bc7ba82d) },
+    };
+    inline for (cases) |case| {
+        var image = try decode(std.testing.allocator, case[0], .rgba);
+        defer image.deinit();
+        try std.testing.expectEqual(@as(u31, 769), image.width);
+        try std.testing.expectEqual(@as(u31, 513), image.height);
+        try std.testing.expectEqual(case[1], std.hash.Wyhash.hash(0, image.data));
+    }
+}
+
+test "JPEG vector YCbCr conversion matches scalar across tails and clipping" {
+    var random: std.Random.DefaultPrng = .init(0xaabbe442);
+    var y: [257]u8 = undefined;
+    var cb: [257]u8 = undefined;
+    var cr: [257]u8 = undefined;
+    for (0..256) |_| {
+        random.random().bytes(&y);
+        random.random().bytes(&cb);
+        random.random().bytes(&cr);
+        inline for (.{ 3, 4 }) |step| {
+            for (0..32) |tail| {
+                const count = 225 + tail;
+                var scalar: [257 * step]u8 = @splat(0xcc);
+                var vector: [257 * step]u8 = @splat(0xcc);
+                ycbcr_to_rgb_row_scalar(&scalar, &y, &cb, &cr, count, step);
+                ycbcr_to_rgb_row(&vector, &y, &cb, &cr, count, step);
+                try std.testing.expectEqualSlices(u8, &scalar, &vector);
+            }
+        }
+    }
 }

@@ -7,6 +7,9 @@
 //! clicks never reach the header's drag handling. The header description is set
 //! on every frame from the controls' geometry.
 //!
+//! `--frames N` renders a finite offscreen run for automation; native drag/resize
+//! interactions still require a desktop session.
+//!
 //! Set SDL_VIDEO_DRIVER=x11 to run on the X11 backend (for example under XWayland).
 const std = @import("std");
 const zdl = @import("zdl");
@@ -36,6 +39,7 @@ const App = struct {
     raster_height: u31,
     renderer: Renderer,
     frames: u64 = 0,
+    frame_limit: ?u64 = null,
 
     /// Pointer events on the header: the platform has already consumed presses in
     /// draggable areas, so only button and motion events on the controls and the
@@ -66,6 +70,7 @@ const App = struct {
         self.render() catch |err| {
             return fail("render", err);
         };
+        if (self.frame_limit) |limit| if (self.frames >= limit) return .success;
         return .@"continue";
     }
 
@@ -147,8 +152,18 @@ fn fail(comptime step: []const u8, err: anyerror) Result {
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    defer args.deinit();
+    _ = args.next();
+    var frame_limit: ?u64 = null;
+    while (args.next()) |argument| {
+        if (!std.mem.eql(u8, argument, "--frames")) return error.UnknownArgument;
+        frame_limit = try std.fmt.parseInt(u64, args.next() orelse return error.MissingFrameCount, 10);
+        if (frame_limit.? == 0) return error.InvalidFrameCount;
+    }
     const environment = init.minimal.environ;
     var platform = try zdl.linux.Platform.open(allocator, io, .{
+        .driver = if (frame_limit != null) .offscreen else .auto,
         .environment = .{
             .wayland_display = environment.getPosix("WAYLAND_DISPLAY"),
             .session_type = environment.getPosix("XDG_SESSION_TYPE"),
@@ -177,6 +192,7 @@ pub fn main(init: std.process.Init) !void {
     const height: u31 = size.height;
     var app: App = .{
         .allocator = allocator,
+        .frame_limit = frame_limit,
         .window = window,
         .controls = controls_lib.Controls.init(layout, .{}),
         .raster = try zdl.surface.Surface.init(allocator, width, height, .rgba8, null),

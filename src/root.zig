@@ -318,12 +318,8 @@ pub const app = struct {
     pub const lifecycle = @import("app/lifecycle.zig");
 };
 
-/// JPEG and PNG decoding (stb_image behavior), PNG encoding and MJPG camera frame conversion. Pure Zig.
-pub const image = struct {
-    pub const jpeg = @import("image/jpeg.zig");
-    pub const png = @import("image/png.zig");
-    pub const load = @import("image/load.zig");
-};
+/// Image codecs, bounded loading, output conversion and explicit pixel ownership.
+pub const image = @import("image/image.zig");
 
 test {
     reference_namespaces(@This(), 4);

@@ -126,6 +126,12 @@ pub fn build(b: *std.Build) void {
     const ui_tests = b.addTest(.{ .root_module = ui });
     test_apps.dependOn(&b.addRunArtifact(ui_tests).step);
     test_apps.dependOn(&b.addRunArtifact(media_tests).step);
+    const library_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("apps/player/library.zig"),
+        .target = target,
+        .optimize = optimize,
+    }) });
+    test_apps.dependOn(&b.addRunArtifact(library_tests).step);
     const player_assets = b.createModule(.{ .root_source_file = b.path("apps/player/assets.zig"), .target = target, .optimize = optimize });
     const player_ui = b.createModule(.{
         .root_source_file = b.path("apps/player/main.zig"),

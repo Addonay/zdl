@@ -1,0 +1,118 @@
+{
+  "avif": [
+    {
+      "crf": 30,
+      "encoder": "ffmpeg libaom-av1 -still-picture 1 (AVIF written by make_fixtures.py)",
+      "file": "avif-420-96x64.avif",
+      "pix_fmt": "yuv420p",
+      "reference": null,
+      "reference_raw": null,
+      "source": "grad-96x64.png",
+      "tolerance": {
+        "max_abs": 2,
+        "min_psnr_db": 38
+      }
+    },
+    {
+      "crf": 30,
+      "encoder": "ffmpeg libaom-av1 -still-picture 1 (AVIF written by make_fixtures.py)",
+      "file": "avif-444-96x64.avif",
+      "pix_fmt": "yuv444p",
+      "reference": null,
+      "reference_raw": null,
+      "source": "grad-96x64.png",
+      "tolerance": {
+        "max_abs": 2,
+        "min_psnr_db": 38
+      }
+    },
+    {
+      "crf": 30,
+      "encoder": "ffmpeg libaom-av1 -still-picture 1 (AVIF written by make_fixtures.py)",
+      "file": "avif-10bit-96x64.avif",
+      "pix_fmt": "yuv420p10le",
+      "reference": null,
+      "reference_raw": null,
+      "source": "grad-96x64.png",
+      "tolerance": {
+        "max_abs": 2,
+        "min_psnr_db": 38
+      }
+    },
+    {
+      "crf": 24,
+      "encoder": "ffmpeg libaom-av1 -still-picture 1 (AVIF written by make_fixtures.py)",
+      "file": "avif-420-shapes.avif",
+      "pix_fmt": "yuv420p",
+      "reference": null,
+      "reference_raw": null,
+      "source": "shapes-128x96.png",
+      "tolerance": {
+        "max_abs": 2,
+        "min_psnr_db": 38
+      }
+    },
+    {
+      "crf": 20,
+      "encoder": "ffmpeg libaom-av1 -still-picture 1 (AVIF written by make_fixtures.py)",
+      "file": "avif-444-allval.avif",
+      "pix_fmt": "yuv444p",
+      "reference": null,
+      "reference_raw": null,
+      "source": "allval-64x64.png",
+      "tolerance": {
+        "max_abs": 2,
+        "min_psnr_db": 38
+      }
+    },
+    {
+      "crf": 30,
+      "encoder": "ffmpeg libaom-av1 -still-picture 1 (AVIF written by make_fixtures.py)",
+      "file": "avif-422-96x64.avif",
+      "pix_fmt": "yuv422p",
+      "reference": null,
+      "reference_raw": null,
+      "source": "grad-96x64.png",
+      "tolerance": {
+        "max_abs": 2,
+        "min_psnr_db": 38
+      }
+    },
+    {
+      "crf": 30,
+      "encoder": "ffmpeg libaom-av1 -still-picture 1 (AVIF written by make_fixtures.py)",
+      "file": "avif-420-odd.avif",
+      "pix_fmt": "yuv420p",
+      "reference": null,
+      "reference_raw": null,
+      "source": "odd-17x13.png",
+      "tolerance": {
+        "max_abs": 2,
+        "min_psnr_db": 38
+      }
+    },
+    {
+      "crf": 30,
+      "encoder": "ffmpeg libaom-av1 -still-picture 1 (AVIF written by make_fixtures.py)",
+      "file": "avif-420-1x9.avif",
+      "pix_fmt": "yuv420p",
+      "reference": null,
+      "reference_raw": null,
+      "source": "odd-1x9.png",
+      "tolerance": {
+        "max_abs": 2,
+        "min_psnr_db": 38
+      }
+    },
+    {
+      "file": "avif-grid-2x2.avif",
+      "note": "2x2 image grid, dimg references",
+      "reference": null,
+      "reference_raw": null,
+      "tolerance": {
+        "max_abs": 3,
+        "min_psnr_db": 34
+      }
+    }
+  ]
+}

@@ -81,7 +81,7 @@ const Program = struct {
     drag_row: ?usize = null,
     scratch: [256][128]u8 = undefined,
     scratch_count: usize = 0,
-    avatar: ?zdl.image.load.Image = null,
+    avatar: ?zdl.image.Image = null,
     avatar_custom: ui.Custom = undefined,
     avatar_color_custom: ui.Custom = undefined,
     chart_custom: ui.Custom = undefined,
@@ -789,7 +789,7 @@ const Program = struct {
 };
 pub fn main(init: std.process.Init) !void {
     var p = Program.init();
-    p.avatar = try zdl.image.load.load_jpg(init.gpa, assets.avatar_jpg);
+    p.avatar = try zdl.image.load_jpg(init.gpa, assets.avatar_jpg, .{});
     defer if (p.avatar) |*photo| photo.deinit();
     var args = std.process.Args.Iterator.init(init.minimal.args);
     defer args.deinit();

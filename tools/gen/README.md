@@ -18,6 +18,7 @@ then `zig fmt` the output.
 | `render_gpu_shaders.py` | `src/render/gpu/shader_blobs.zig` | `render_gpu_shaders.py .ref/SDL > src/render/gpu/shader_blobs.zig` |
 | `hint_names.py` | `src/core/hint_names.zig` | `hint_names.py .ref/SDL > src/core/hint_names.zig` |
 | `render_debug_font.py` | `src/render/debug_font_data.zig` | `render_debug_font.py .ref/SDL/src/render/SDL_render_debug_font.h` |
+| `webp_tables.py` | `src/image/webp_tables.zig` | `webp_tables.py ~/.cargo/registry/src/*/image-webp-0.2.4/src` (RFC 6386/9649 tables) |
 | `planar_audio_assets.py` | `examples/assets/planar-left.u8`, `examples/assets/planar-right.u8` | `planar_audio_assets.py .ref/SDL/examples/audio/05-planar-data/planar-data.c` |
 
 `jpeg_fixtures.py` uses Pillow to generate the original baseline/progressive JPEG

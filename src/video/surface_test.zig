@@ -22,7 +22,7 @@ const images = @import("../testdata/images.zig");
 const support = @import("../testdata/support.zig");
 const bmp = @import("bmp.zig");
 const png = @import("../image/png.zig");
-const load = @import("../image/load.zig");
+const image_codecs = @import("../image/image.zig");
 const geometry = @import("geometry.zig");
 
 const Color = pixels.Color;
@@ -599,7 +599,7 @@ test "sdl surface: save and load BMP and PNG" {
 
     const png_bytes = try png.encode(a, face.view);
     defer a.free(png_bytes);
-    var from_png = try load.load_png(a, png_bytes);
+    var from_png = try image_codecs.load_png(a, png_bytes, .{});
     defer from_png.deinit();
     try testing.expectEqual(face.view.width, from_png.surface.view.width);
     try testing.expectEqual(face.view.height, from_png.surface.view.height);
@@ -613,7 +613,7 @@ test "sdl surface: save and load BMP and PNG" {
 
     const png8 = try png.encode(a, paletted.view);
     defer a.free(png8);
-    var loaded8 = try load.load_png(a, png8);
+    var loaded8 = try image_codecs.load_png(a, png8, .{});
     defer loaded8.deinit();
     try testing.expect(loaded8.surface.view.format == .indexed);
     try expect_color(.{ .r = 0, .g = 255, .b = 0, .a = 255 }, try loaded8.surface.view.read(0, 0));
@@ -631,5 +631,5 @@ test "sdl surface: save and load BMP and PNG" {
 // surface_testLoadFailure
 test "sdl surface: load failure" {
     try testing.expectError(error.InvalidContainer, bmp.decode(testing.allocator, "not a bitmap", .{}));
-    try testing.expectError(error.NotPng, load.load_png(testing.allocator, "not a png"));
+    try testing.expectError(error.NotPng, image_codecs.load_png(testing.allocator, "not a png", .{}));
 }

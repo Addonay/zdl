@@ -14,10 +14,10 @@ pub const Vertex = zdl.render.renderer.Vertex;
 pub const Blend = zdl.render.renderer.Blend;
 
 /// Loads the shared SDL test image and transfers decoded pixels to the caller.
-pub fn load_sample(allocator: std.mem.Allocator, io: std.Io) !zdl.image.load.Image {
+pub fn load_sample(allocator: std.mem.Allocator, io: std.Io) !zdl.image.Image {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, "assets/sample.png", allocator, .unlimited);
     defer allocator.free(bytes);
-    return zdl.image.load.load_png(allocator, bytes);
+    return zdl.image.load_png(allocator, bytes, .{});
 }
 
 /// The originals animate from SDL_GetTicks; headless playback uses a fixed
