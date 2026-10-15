@@ -39,4 +39,5 @@ test {
     _ = text;
     _ = svg;
     _ = theme;
+    _ = widgets;
 }

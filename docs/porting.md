@@ -289,3 +289,31 @@ hardware.
   iteration.
 - Clipboard example: a failed paste keeps the previous text, which is freed
   once. Pasted text is truncated at character boundaries.
+
+## Native applications and runtime follow-up (2026-10-15)
+
+- `platform/hit_test.zig` and `platform/window_controls.zig`: owned drag/no-drag
+  regions, resize edges, desktop button order, caption state/actions, window menu
+  and custom decorations for Wayland/X11. Geometry/state tests run without a
+  display. Windows/macOS integration remains pending.
+- `examples/apps/ui`: zlay layout, runtime-loaded FreeType/HarfBuzz, SVG masks,
+  antialiased canvas, theme tokens, focus/keyboard activation, clipping and
+  frame-owned text copies. Copies fix stack-local badge text lifetime; popovers
+  flip above anchors near the window bottom. No OS accessibility tree yet.
+- Dashboard and VLC-style player are runnable native views. Their source,
+  dependencies, commands, interactions and remaining fidelity gaps are in
+  `examples/apps/README.md`. No claim of exact reference parity is made.
+- Media runtime probing exposed and fixed a chunk double-free during shutdown,
+  pause/device state handling and seek keyframe preroll. ALSA symbol names now
+  resolve their real `snd_pcm_hw_params_*` APIs, and explicit PCM pause preserves
+  queued samples when supported. Unsupported hardware pause falls back to
+  seeking at the frozen timestamp on resume.
+- X11 smoke presentation exposed a dangling `XShmSegmentInfo` retained by XImage.
+  It now has stable allocator-owned storage, with a move/retained-pointer
+  regression test. SysV mapping tests use a fake X backend, not an X server.
+- Final Debug verification runs 249 native tests, including the SHM regression.
+  ReleaseSafe application tests run 16 cases across toolkit, dashboard and media.
+  Native smoke rendering passes on Wayland and X11; H.264 and 10-bit FFV1 probes
+  advance frames, freeze on pause and resume beyond a 0.5-second seek target.
+  KMS/DRM, physical controllers and camera runtime remain unverified. Decoder
+  layout access rejects unverified FFmpeg versions.

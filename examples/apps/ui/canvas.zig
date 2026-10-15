@@ -390,9 +390,9 @@ test "rounded distance is negative inside and zero on the edge" {
     const square: Radii = .{};
     try std.testing.expect(rounded_distance(0, 0, 10, 10, square) < 0);
     try std.testing.expectApproxEqAbs(@as(f32, 0), rounded_distance(10, 0, 10, 10, square), 1e-5);
-    // A fully rounded corner keeps the diagonal point at the arc, 10 - 10/sqrt(2) out.
+    // With radius equal to the half extents, the box is a circle centered at zero.
     const round: Radii = Radii.all(10);
-    try std.testing.expectApproxEqAbs(@as(f32, 0), rounded_distance(10 - 10 / @sqrt(2.0) * 1.0, 10 - 10 / @sqrt(2.0) * 1.0, 10, 10, round), 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), rounded_distance(10.0 / @sqrt(@as(f32, 2)), 10.0 / @sqrt(@as(f32, 2)), 10, 10, round), 1e-4);
 }
 
 test "erfc matches known values" {

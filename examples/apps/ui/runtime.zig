@@ -196,8 +196,13 @@ pub const Ui = struct {
     layout: *zlay.Context,
     text: *Text,
     icons: *Icons,
-    theme: *const Theme,
-    decors: *const Decors,
+    theme: *Theme,
+    decors: *Decors,
+    window: ?zdl.linux.Window = null,
+    activated: u32 = 0,
+    text_storage: [65536]u8 = undefined,
+    text_used: usize = 0,
+    drag_regions: zdl.linux.HitTest = .{},
     /// Device pixels per logical point.
     scale: f32 = 1,
     /// zlay id of the element with keyboard focus, or 0.
@@ -224,7 +229,11 @@ pub const Ui = struct {
 
     /// Declares a line of text inside the current element.
     pub fn text_run(self: *Ui, string: []const u8, style: TextStyle) void {
-        self.layout.text(string, .{
+        if (string.len > self.text_storage.len - self.text_used) @panic("UI frame text storage exhausted");
+        const owned = self.text_storage[self.text_used..][0..string.len];
+        @memcpy(owned, string);
+        self.text_used += string.len;
+        self.layout.text(owned, .{
             .font_id = style.font,
             .font_size = style.size,
             .line_height = style.line_height,
@@ -253,7 +262,12 @@ pub const Ui = struct {
 
     /// True on the frame the primary button went down over the element.
     pub fn pressed(self: *Ui, id: zlay.ElementId) bool {
-        return self.layout.pointerState().state == .pressed_this_frame and self.layout.pointerOver(id);
+        return self.activated == id.id or (self.layout.pointerState().state == .pressed_this_frame and self.layout.pointerOver(id));
+    }
+
+    /// True on the frame the primary button went down anywhere in the window.
+    pub fn pointer_pressed(self: *Ui) bool {
+        return self.layout.pointerState().state == .pressed_this_frame;
     }
 
     /// Pointer position in logical points.
@@ -299,6 +313,12 @@ pub const Ui = struct {
         return .{ .ascent = raw.ascent / self.scale, .descent = raw.descent / self.scale };
     }
 
+    pub fn toggle_theme(self: *Ui) void {
+        self.theme.* = if (self.theme.dark) Theme.light() else Theme.dark_theme();
+        self.decors.build(self.theme);
+        self.redraw = true;
+    }
+
     /// Requests another frame even if no event arrives (for animations).
     pub fn request_redraw(self: *Ui) void {
         self.redraw = true;
@@ -320,6 +340,12 @@ pub const Options = struct {
     /// SVG icon sources by icon index, borrowed for the run.
     icons: []const []const u8,
     dark: bool = false,
+    custom_titlebar: bool = true,
+    titlebar_height: u16 = 48,
+    /// Open a native window, present one frame and close for runtime QA.
+    smoke: bool = false,
+    /// Write a deterministic first frame without opening a display.
+    snapshot_path: ?[]const u8 = null,
     /// Frame rate while an animation runs. Idle windows block in `wait_event`.
     animation_hz: f64 = 60,
 };
@@ -337,7 +363,9 @@ pub fn run(comptime Program: type, program: *Program, init: std.process.Init, op
 
     const environment = init.minimal.environ;
     var platform = try zdl.linux.Platform.open(allocator, io, .{
+        .driver = if (options.snapshot_path != null) .offscreen else .auto,
         .environment = .{
+            .video_driver = environment.getPosix("SDL_VIDEO_DRIVER"),
             .wayland_display = environment.getPosix("WAYLAND_DISPLAY"),
             .session_type = environment.getPosix("XDG_SESSION_TYPE"),
             .x11_display = environment.getPosix("DISPLAY"),
@@ -351,8 +379,10 @@ pub fn run(comptime Program: type, program: *Program, init: std.process.Init, op
         .size = .{ .width = options.width, .height = options.height },
         .min_size = .{ .width = options.min_width, .height = options.min_height },
         .resizable = true,
+        .borderless = options.custom_titlebar,
     });
     defer window.deinit();
+    if (options.snapshot_path == null) try window.start_text_input();
 
     var text = try Text.init(allocator, options.fonts);
     defer text.deinit();
@@ -377,6 +407,7 @@ pub fn run(comptime Program: type, program: *Program, init: std.process.Init, op
         .icons = &icons,
         .theme = &theme,
         .decors = &decors,
+        .window = window,
     };
     var measured_options = layout_options;
     measured_options.measure_text = measure_callback;
@@ -394,6 +425,14 @@ pub fn run(comptime Program: type, program: *Program, init: std.process.Init, op
         .ui = &ui,
         .surface = &surface,
         .animation_hz = options.animation_hz,
+        .snapshot_path = options.snapshot_path,
+        .custom_titlebar = options.custom_titlebar,
+        .smoke = options.smoke,
+        .controls = zdl.linux.window_controls.Controls.init(zdl.linux.window_controls.load(allocator, io, .{
+            .current = environment.getPosix("XDG_CURRENT_DESKTOP"),
+            .home = environment.getPosix("HOME"),
+            .config_home = environment.getPosix("XDG_CONFIG_HOME"),
+        }), .{ .height = options.titlebar_height }),
     };
     const result = try zdl.app.callbacks.run(Frame(Program), &frame, platform, io, .{
         .pacing = .wait_event,
@@ -427,6 +466,10 @@ fn Frame(comptime Program: type) type {
         ui: *Ui,
         surface: *zdl.surface.Surface,
         animation_hz: f64,
+        snapshot_path: ?[]const u8,
+        custom_titlebar: bool,
+        smoke: bool,
+        controls: zdl.linux.window_controls.Controls,
 
         pointer: zlay.Vec2 = .{ .x = -1, .y = -1 },
         pointer_down: bool = false,
@@ -439,6 +482,23 @@ fn Frame(comptime Program: type) type {
         pub fn event(self: *Self, context: *zdl.app.callbacks.Context, value: Event) zdl.app.callbacks.Result {
             _ = context;
             self.needs_frame = true;
+            if (self.custom_titlebar) switch (value) {
+                .mouse_motion => |m| self.controls.pointer_moved(.{ .x = @intFromFloat(m.x), .y = @intFromFloat(m.y) }),
+                .mouse_button => |b| if (b.button == 1) {
+                    const point = zdl.geometry.Point(i32){ .x = @intFromFloat(b.x), .y = @intFromFloat(b.y) };
+                    if (b.kind == .down) {
+                        if (self.controls.press(point)) return .@"continue";
+                    } else if (self.controls.release(point)) |action| {
+                        switch (action) {
+                            .minimize => self.window.minimize() catch {},
+                            .toggle_maximize => self.window.set_maximized(!self.controls.maximized) catch {},
+                            .close_request => return .success,
+                        }
+                        return .@"continue";
+                    }
+                },
+                else => {},
+            };
             switch (value) {
                 .mouse_motion => |motion| self.pointer = .{ .x = motion.x, .y = motion.y },
                 .mouse_button => |button| {
@@ -449,7 +509,9 @@ fn Frame(comptime Program: type) type {
                     self.wheel.x += wheel.x * wheel_step;
                     self.wheel.y += wheel.y * wheel_step;
                 },
-                .key => |key| if (key.kind == .down and key.keycode == .tab and !key.repeat) {
+                .key => |key| if (key.kind == .down and (key.scancode == .@"return" or key.scancode == .space) and self.ui.focus != 0) {
+                    self.ui.activated = self.ui.focus;
+                } else if (key.kind == .down and key.keycode == .tab and !key.repeat) {
                     self.advance_focus(key.modifiers.left_shift or key.modifiers.right_shift);
                     return .@"continue";
                 },
@@ -464,15 +526,15 @@ fn Frame(comptime Program: type) type {
                 std.debug.print("frame failed: {s}\n", .{@errorName(err)});
                 return .failure;
             };
-            return .@"continue";
+            return if (self.snapshot_path != null or self.smoke) .success else .@"continue";
         }
 
         fn advance_focus(self: *Self, backwards: bool) void {
             const ui = self.ui;
-            const count = ui.previous_focusable_count;
+            const count = ui.focusable_count;
             if (count == 0) return;
             var index: usize = 0;
-            for (ui.previous_focusables[0..count], 0..) |id, i| {
+            for (ui.focusables[0..count], 0..) |id, i| {
                 if (id == ui.focus) index = i;
             }
             const next = if (ui.focus == 0)
@@ -481,7 +543,7 @@ fn Frame(comptime Program: type) type {
                 (index + count - 1) % count
             else
                 (index + 1) % count;
-            ui.focus = ui.previous_focusables[next];
+            ui.focus = ui.focusables[next];
             self.needs_frame = true;
         }
 
@@ -491,8 +553,9 @@ fn Frame(comptime Program: type) type {
             const pixels = try self.window.size_in_pixels();
             if (pixels.width == 0 or pixels.height == 0) return;
             if (pixels.width != self.raster_size.width or pixels.height != self.raster_size.height) {
+                const replacement = try zdl.surface.Surface.init(self.allocator, @intCast(pixels.width), @intCast(pixels.height), .rgba8, null);
                 self.surface.deinit();
-                self.surface.* = try zdl.surface.Surface.init(self.allocator, @intCast(pixels.width), @intCast(pixels.height), .rgba8, null);
+                self.surface.* = replacement;
                 self.raster_size = pixels;
                 self.needs_frame = true;
             }
@@ -532,8 +595,11 @@ fn Frame(comptime Program: type) type {
             ui.previous_focusable_count = ui.focusable_count;
             ui.focusable_count = 0;
             ui.interactive_count = 0;
+            ui.text_used = 0;
             ui.layout.beginLayout();
+            ui.drag_regions = .{ .resize_border = 6 };
             self.program.build(ui);
+            ui.activated = 0;
             const commands = ui.layout.endLayout(dt);
             if (ui.focus != 0 and !contains(ui.focusables[0..ui.focusable_count], ui.focus)) ui.focus = 0;
             self.update_cursor();
@@ -543,6 +609,25 @@ fn Frame(comptime Program: type) type {
             var painter: Painter = .{ .canvas = &canvas, .text = ui.text, .icons = ui.icons, .scale = scale };
             for (commands) |command| painter.draw(command);
 
+            if (self.custom_titlebar) {
+                self.controls.set_width(logical.width);
+                self.controls.set_window_state(try self.window.flags());
+                var regions = ui.drag_regions;
+                for (self.controls.geometry.placed()) |placed| try regions.add(.{ .rect = placed.rect, .kind = .not_draggable });
+                try self.window.set_hit_test(regions);
+                var renderer = zdl.render.renderer.Renderer.init(self.allocator, self.surface.view);
+                try renderer.set_scale(scale, scale);
+                try self.controls.draw(&renderer, .{
+                    .symbol = to_renderer_color(ui.theme.foreground),
+                    .inactive_symbol = to_renderer_color(ui.theme.muted_foreground),
+                    .hover = to_renderer_color(ui.theme.accent),
+                });
+            }
+            if (self.snapshot_path) |path| {
+                const bytes = try zdl.image.png.encode(self.allocator, self.surface.view);
+                defer self.allocator.free(bytes);
+                try std.Io.Dir.cwd().writeFile(context.io, .{ .sub_path = path, .data = bytes });
+            }
             try self.window.present(self.surface.view);
             self.needs_frame = false;
             context.pacing = if (animating or ui.redraw) .{ .rate_hz = self.animation_hz } else .wait_event;
@@ -660,3 +745,7 @@ const Painter = struct {
         }
     }
 };
+
+fn to_renderer_color(color: Color) zdl.render.renderer.Color {
+    return .{ .r = @intFromFloat(color.r), .g = @intFromFloat(color.g), .b = @intFromFloat(color.b), .a = @intFromFloat(color.a) };
+}

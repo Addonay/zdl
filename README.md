@@ -3,8 +3,8 @@
 SDL functionality being converted into a native, std-only Zig library.
 This is an altered SDL port, not an upstream SDL distribution.
 
-The conversion is incomplete and nothing has been exercised at runtime yet;
-everything below compiles and links. Linux is the first target.
+The conversion is incomplete. Linux is the first target; native unit tests and
+selected windowing/rendering/media paths have been exercised at runtime.
 
 - Core: identifiers, diagnostics, spinlocks, calendar time, geometry, typed
   properties, Unicode case folding (`zdl.casefold`).
@@ -28,12 +28,12 @@ everything below compiles and links. Linux is the first target.
   boxes.
 
 The offscreen software framebuffer has a display-free unit test. KMS/DRM,
-offscreen EGL, and the other system backends are compile-checked only; no
-hardware or graphics driver was exercised. `docs/porting.md` lists, per area,
+offscreen EGL and most device backends remain compile-checked only. Selected
+Wayland/X11 application presentation and ALSA media playback have runtime checks. `docs/porting.md` lists, per area,
 what is implemented, what deliberately differs from SDL and what remains. Other
 platforms are deferred until Linux is complete.
 
-Use Zig master, currently `0.18.0-dev.246+05671ced9`. A build dependency exposes
+Use Zig master, currently `0.18.0-dev.253+16d31ceed`. A build dependency exposes
 source so each consumer compiles only the declarations it uses:
 
 ```zig
@@ -57,9 +57,10 @@ prelinked SDL archive, dynapi, process-global allocator or hidden initialization
 Use std directly for allocators, atomics, containers, random numbers, hashing,
 sorting, strings, Unicode, OS I/O and dynamic library loading.
 
-`zig build` and `zig build check` compile without running tests. Existing native
-unit tests can be run explicitly with `zig build test`; they have not been run
-as part of this compile-only conversion. Linux devices have not been exercised.
+`zig build` and `zig build check` compile without running tests. Run native
+unit tests with `zig build test`. Selected native application presentation and
+ALSA playback have runtime smoke checks; most physical device paths remain
+unverified.
 
 [Architecture and conventions](docs/idiomatic-zig.md) describe the target.
 [Conversion ledger](docs/porting.md) maps source areas and records remaining work.
@@ -77,3 +78,12 @@ SDL-derived code retains the [SDL license](LICENSE.txt).
 
 [Working guide](AGENTS.md) explains the checkout layout, references, ownership
 conventions and compile-only continuation workflow.
+
+## Native application examples
+
+[Application guide](examples/apps/README.md): `apps-dashboard` implements the
+shadcn dashboard reference with zlay, Geist, FreeType/HarfBuzz and SVG icons.
+`apps-player` uses the supplied VLC Figma design assets and a threaded FFmpeg
+playback pipeline. Both use inlined controls and native window drag/resize on
+Linux. These applications are under active refinement; exact visual/interaction
+parity and Windows/macOS chrome support are not claimed.

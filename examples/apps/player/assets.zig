@@ -1,0 +1,33 @@
+//! Assets from the supplied VLC Figma design; fonts retain OFL licenses.
+pub const fonts = [_][]const u8{
+    @embedFile("assets/fonts/Inter-Regular.otf"),
+    @embedFile("assets/fonts/Inter-Medium.otf"),
+    @embedFile("assets/fonts/Inter-SemiBold.otf"),
+    @embedFile("assets/fonts/Inter-SemiBold.otf"),
+    @embedFile("assets/fonts/DMMono-Regular.ttf"),
+};
+pub const Icon = enum(u16) { play, pause, previous, next, fullscreen, playlist, settings, volume, home, videos, music, streaming, recent, folder, subtitles, more, sidebar, search, sort, list, preferences, add };
+pub const icons = [_][]const u8{
+    @embedFile("assets/icons/play.svg"),
+    @embedFile("assets/icons/pause.svg"),
+    @embedFile("assets/icons/previous.svg"),
+    @embedFile("assets/icons/next.svg"),
+    @embedFile("assets/icons/fullscreen.svg"),
+    @embedFile("assets/icons/playlist.svg"),
+    @embedFile("assets/icons/settings.svg"),
+    @embedFile("assets/icons/volume.svg"),
+    @embedFile("assets/icons/home.svg"),
+    @embedFile("assets/icons/videos.svg"),
+    @embedFile("assets/icons/music.svg"),
+    @embedFile("assets/icons/streaming.svg"),
+    @embedFile("assets/icons/recent.svg"),
+    @embedFile("assets/icons/folder.svg"),
+    @embedFile("assets/icons/subtitles.svg"),
+    @embedFile("assets/icons/more.svg"),
+    @embedFile("assets/icons/sidebar.svg"),
+    @embedFile("assets/icons/search.svg"),
+    @embedFile("assets/icons/sort.svg"),
+    @embedFile("assets/icons/list.svg"),
+    @embedFile("assets/icons/preferences.svg"),
+    @embedFile("assets/icons/add.svg"),
+};

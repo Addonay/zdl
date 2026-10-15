@@ -51,6 +51,10 @@ pub const ButtonOptions = struct {
     /// Fixed width in points; null sizes to the content.
     width: ?f32 = null,
     disabled: bool = false,
+    align_left: bool = false,
+    font: Role = .medium,
+    icon_size: f32 = 16,
+    radius: f32 = radius_md,
 };
 
 const ButtonColors = struct { background: Color, foreground: Color, border: Color };
@@ -99,8 +103,10 @@ pub fn button(ui: *Ui, id: Id, options: ButtonOptions) bool {
     };
     const colors = button_colors(ui.theme, options.variant, ui.hovered(id));
     const clicked = !options.disabled and ui.pressed(id);
-    ui.focusable(id);
-    if (!options.disabled) ui.clickable(id);
+    if (!options.disabled) {
+        ui.focusable(id);
+        ui.clickable(id);
+    }
 
     const width: zlay.SizingAxis = if (options.width) |fixed|
         .fixed(fixed)
@@ -113,16 +119,16 @@ pub fn button(ui: *Ui, id: Id, options: ButtonOptions) bool {
             .sizing = .{ .width = width, .height = .fixed(height) },
             .padding = .axes(@intFromFloat(padding), 0),
             .child_gap = if (options.icon != null and !icon_only) 8 else 0,
-            .child_alignment = .center,
+            .child_alignment = .{ .x = if (options.align_left) .left else .center, .y = .center },
         },
         .background_color = if (options.disabled) with_alpha(colors.background, 0.5) else colors.background,
-        .corner_radius = .all(radius_md),
-        .border = if (colors.border.a > 0) .{ .color = colors.border, .width = .outside(1) } else .{},
+        .corner_radius = .all(options.radius),
+        .border = if (ui.is_focused(id)) .{ .color = ui.theme.ring, .width = .outside(2) } else if (colors.border.a > 0) .{ .color = colors.border, .width = .outside(1) } else .{},
         .user_data = if (options.variant == .outline) @constCast(&ui.decors.xs) else null,
     });
     const foreground = if (options.disabled) with_alpha(colors.foreground, 0.5) else colors.foreground;
-    if (options.icon) |index| ui.icon(Id.seeded("button-icon", id.id), index, 16, foreground);
-    if (!icon_only and options.label.len > 0) ui.text_run(options.label, style(.medium, 14, 20, foreground));
+    if (options.icon) |index| ui.icon(Id.seeded("button-icon", id.id), index, options.icon_size, foreground);
+    if (!icon_only and options.label.len > 0) ui.text_run(options.label, style(options.font, 14, 20, foreground));
     ui.close();
     return clicked;
 }
@@ -234,7 +240,7 @@ pub fn tab(ui: *Ui, id: Id, options: TabOptions) bool {
             .child_gap = 6,
             .child_alignment = .center,
         },
-        .background_color = if (options.active) (if (theme.dark) with_alpha(theme.input, 1) else theme.background) else Color.transparent,
+        .background_color = if (options.active) (if (theme.dark) theme.input else theme.background) else Color.transparent,
         .corner_radius = .all(radius_md),
         .user_data = if (options.active) @constCast(&ui.decors.sm) else null,
     });
@@ -369,8 +375,12 @@ pub fn select_trigger(ui: *Ui, id: Id, value: []const u8, width: f32, size_small
     return clicked;
 }
 
-/// Popover panel anchored below `anchor` (floating, above other content).
-pub fn popover_begin(ui: *Ui, id: Id, anchor: Id, width: f32, shadow: *const runtime.Decor, z_index: i16) void {
+/// Popover panel anchored below `anchor` (floating, above other content). With
+/// `align_end` the panel's right edge meets the anchor's right edge, as shadcn's
+/// `align="end"`. The panel must be declared last so it draws on top.
+pub fn popover_begin(ui: *Ui, id: Id, anchor: Id, width: f32, decor: *const runtime.Decor, align_end: bool) void {
+    const anchor_box = if (ui.layout.elementData(anchor)) |data| data.bounding_box else zlay.BoundingBox{};
+    const above = anchor_box.y > ui.layout.getLayoutDimensions().height - 260;
     ui.open(id, .{
         .layout = .{
             .sizing = .{ .width = .fixed(width), .height = .fit(.{}) },
@@ -381,13 +391,16 @@ pub fn popover_begin(ui: *Ui, id: Id, anchor: Id, width: f32, shadow: *const run
         .background_color = ui.theme.popover,
         .corner_radius = .all(radius_md),
         .border = .{ .color = ui.theme.border, .width = .outside(1) },
-        .user_data = @constCast(shadow),
+        .user_data = @constCast(decor),
         .floating = .{
             .attach_to = .element_with_id,
             .parent_id = anchor.id,
-            .attach_points = .{ .element = .left_top, .parent = .left_bottom },
-            .offset = .{ .x = 0, .y = 4 },
-            .z_index = z_index,
+            .attach_points = .{
+                .element = if (above) (if (align_end) .right_bottom else .left_bottom) else (if (align_end) .right_top else .left_top),
+                .parent = if (above) (if (align_end) .right_top else .left_top) else (if (align_end) .right_bottom else .left_bottom),
+            },
+            .offset = .{ .x = 0, .y = if (above) -4 else 4 },
+            .z_index = 100,
             .pointer_capture_mode = .capture,
         },
     });

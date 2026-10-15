@@ -68,4 +68,74 @@ pub fn build(b: *std.Build) void {
         run.addPassthruArgs();
         b.step(b.fmt("run-{s}", .{example.name}), b.fmt("Run the {s} example", .{example.name})).dependOn(&run.step);
     }
+    const media = b.createModule(.{
+        .root_source_file = b.path("apps/player/media/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "zdl", .module = zdl }},
+    });
+
+    // Native UI toolkit (apps/ui) and the shadcn/ui dashboard-01 app (apps/dashboard).
+    const assets = b.createModule(.{
+        .root_source_file = b.path("apps/assets.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const ui = b.createModule(.{
+        .root_source_file = b.path("apps/ui/ui.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zdl", .module = zdl },
+            .{ .name = "zlay", .module = zlay },
+        },
+    });
+    const dashboard = b.createModule(.{
+        .root_source_file = b.path("apps/dashboard/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zdl", .module = zdl },
+            .{ .name = "zlay", .module = zlay },
+            .{ .name = "ui", .module = ui },
+            .{ .name = "assets", .module = assets },
+        },
+    });
+    const dashboard_exe = b.addExecutable(.{ .name = "apps-dashboard", .root_module = dashboard });
+    b.installArtifact(dashboard_exe);
+    const run_dashboard = b.addRunArtifact(dashboard_exe);
+    run_dashboard.addPassthruArgs();
+    b.step("run-apps-dashboard", "Run the shadcn/ui dashboard-01 app").dependOn(&run_dashboard.step);
+    const playback = b.createModule(.{
+        .root_source_file = b.path("apps/player/playback_check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "zdl", .module = zdl }, .{ .name = "media", .module = media } },
+    });
+    b.installArtifact(b.addExecutable(.{ .name = "playback-check", .root_module = playback }));
+    const apps_tests = b.addTest(.{ .root_module = dashboard });
+    const run_apps_tests = b.addRunArtifact(apps_tests);
+    const media_tests = b.addTest(.{ .root_module = media });
+    const test_apps = b.step("test-apps", "Run toolkit, dashboard and media unit tests");
+    test_apps.dependOn(&run_apps_tests.step);
+    const ui_tests = b.addTest(.{ .root_module = ui });
+    test_apps.dependOn(&b.addRunArtifact(ui_tests).step);
+    test_apps.dependOn(&b.addRunArtifact(media_tests).step);
+    const player_assets = b.createModule(.{ .root_source_file = b.path("apps/player/assets.zig"), .target = target, .optimize = optimize });
+    const player_ui = b.createModule(.{
+        .root_source_file = b.path("apps/player/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "zdl", .module = zdl }, .{ .name = "zlay", .module = zlay }, .{ .name = "ui", .module = ui }, .{ .name = "media", .module = media }, .{ .name = "player-assets", .module = player_assets } },
+    });
+    const player_exe = b.addExecutable(.{ .name = "apps-player", .root_module = player_ui });
+    b.installArtifact(player_exe);
+    const run_player = b.addRunArtifact(player_exe);
+    run_player.addPassthruArgs();
+    b.step("run-apps-player", "Run the VLC-style native media player").dependOn(&run_player.step);
 }

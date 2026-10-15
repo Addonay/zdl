@@ -198,7 +198,7 @@ not make the rest of its old subsystem complete.
 
 ## Build and verification
 
-The source uses Zig master, currently `0.18.0-dev.246+05671ced9`. The shell's `zig`
+The source uses Zig master, currently `0.18.0-dev.253+16d31ceed`. The shell's `zig`
 may point to 0.17 because the user changes their default for other work. Invoke
 master explicitly and do not change their global selection:
 
