@@ -124,6 +124,8 @@ pub const AtomName = enum {
     _NET_WM_STATE_SKIP_PAGER,
     _NET_WM_ICON,
     _NET_WM_WINDOW_OPACITY,
+    _NET_WM_MOVERESIZE,
+    _GTK_SHOW_WINDOW_MENU,
     _NET_WM_WINDOW_TYPE,
     _NET_WM_WINDOW_TYPE_DIALOG,
     _NET_WM_WINDOW_TYPE_POPUP_MENU,
@@ -561,7 +563,14 @@ pub const Connection = struct {
         while (self.shm_outstanding > 0) {
             try self.pump();
             if (self.shm_outstanding == 0) break;
-            if (!try self.wait_readable(wait_timeout_ms)) return error.SharedMemoryUnavailable;
+            if (!try self.wait_readable(wait_timeout_ms)) {
+                // The server never reported the put (observed under XWayland with
+                // KWin). Stop using MIT-SHM for this connection and let presentation
+                // fall back to XPutImage rather than failing the frame.
+                self.shm_outstanding = 0;
+                self.shm_enabled = false;
+                return;
+            }
         }
     }
 
@@ -570,6 +579,7 @@ pub const Connection = struct {
     /// key press) are appended to the queue, after the one returned.
     fn translate(self: *Connection, raw: *xlib.Event) Error!?Event {
         const api = &self.library.functions;
+        std.debug.print("DEBUG raw kind={d}\n", .{raw.kind});
         const window: WindowId = @fromBackingInt(@intCast(raw.any.window));
         if (raw.kind == xlib.generic_event) {
             // Only XInput2 generic events are selected by this backend; others are ignored.
@@ -615,6 +625,7 @@ pub const Connection = struct {
             },
             xlib.button_press, xlib.button_release => {
                 const button = raw.key.keycode;
+                std.debug.print("DEBUG button raw kind={d} keycode={d} state={d} window={d}\n", .{ raw.kind, raw.key.keycode, raw.key.state, raw.any.window });
                 if (raw.kind == xlib.button_press and button >= 4 and button <= 7) {
                     return .{ .window = window, .payload = .{ .wheel = .{
                         .x = if (button == 6) 1 else if (button == 7) -1 else 0,
@@ -1223,6 +1234,51 @@ pub const Window = struct {
             hints.len,
         );
         try self.connection.flush();
+    }
+
+    /// Directions of _NET_WM_MOVERESIZE (EWMH): the corner or edge a resize
+    /// drags, or move. Values are the protocol's.
+    pub const MoveResize = enum(c_long) {
+        size_top_left = 0,
+        size_top = 1,
+        size_top_right = 2,
+        size_right = 3,
+        size_bottom_right = 4,
+        size_bottom = 5,
+        size_bottom_left = 6,
+        size_left = 7,
+        move = 8,
+    };
+
+    /// Starts an interactive move or resize that the window manager runs
+    /// (_NET_WM_MOVERESIZE). `x` and `y` are the press position in window
+    /// coordinates and `button` the pressed button; the pointer is ungrabbed
+    /// first so the manager can take it, as SDL does.
+    pub fn begin_move_resize(self: *Window, x: i32, y: i32, action: MoveResize, button: u32) Error!void {
+        try self.require_alive();
+        const root = try self.root_point(x, y);
+        _ = self.connection.library.functions.XUngrabPointer(self.connection.display, xlib.current_time);
+        try self.send_root_message(self.connection.atom(._NET_WM_MOVERESIZE), .{ root.x, root.y, @backingInt(action), @intCast(button), 1 });
+        try self.connection.flush();
+    }
+
+    /// Shows the window manager's window menu at window point (x, y) through the
+    /// GTK-compatible _GTK_SHOW_WINDOW_MENU message, which KWin and GNOME honor.
+    pub fn show_window_menu(self: *Window, x: i32, y: i32) Error!void {
+        try self.require_alive();
+        const root = try self.root_point(x, y);
+        try self.send_root_message(self.connection.atom(._GTK_SHOW_WINDOW_MENU), .{ 0, root.x, root.y, 0, 0 });
+        try self.connection.flush();
+    }
+
+    /// Translates a window point to root coordinates (XTranslateCoordinates).
+    fn root_point(self: *const Window, x: i32, y: i32) Error!struct { x: c_long, y: c_long } {
+        var root_x: c_int = 0;
+        var root_y: c_int = 0;
+        var child: xlib.Window = 0;
+        const root: xlib.Window = @intCast(@backingInt(self.connection.root));
+        _ = self.connection.library.functions.XTranslateCoordinates(self.connection.display, @backingInt(self.id), root, x, y, &root_x, &root_y, &child);
+        return .{ .x = root_x, .y = root_y };
     }
 
     /// Applies a cursor to this window (XDefineCursor). Pass null to use the parent's.

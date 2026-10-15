@@ -8,4 +8,6 @@ comptime {
     _ = @import("video/blit_test.zig");
     _ = @import("render/renderer_test.zig");
     _ = @import("core/properties_test.zig");
+    _ = @import("platform/hit_test.zig");
+    _ = @import("platform/window_controls.zig");
 }
