@@ -579,7 +579,6 @@ pub const Connection = struct {
     /// key press) are appended to the queue, after the one returned.
     fn translate(self: *Connection, raw: *xlib.Event) Error!?Event {
         const api = &self.library.functions;
-        std.debug.print("DEBUG raw kind={d}\n", .{raw.kind});
         const window: WindowId = @fromBackingInt(@intCast(raw.any.window));
         if (raw.kind == xlib.generic_event) {
             // Only XInput2 generic events are selected by this backend; others are ignored.
@@ -1376,7 +1375,7 @@ pub const Window = struct {
             frame.deinit(extension, display);
             self.frame = null;
         }
-        self.frame = shm.Frame.create(extension, display, self.connection.visual, self.connection.depth, self.size.width, self.size.height) catch {
+        self.frame = shm.Frame.create(self.connection.library.allocator, extension, display, self.connection.visual, self.connection.depth, self.size.width, self.size.height) catch {
             self.shm_failed = true;
             return null;
         };

@@ -262,6 +262,13 @@ pub const Device = struct {
         self.last_status = 0;
     }
 
+    /// Suspends/resumes hardware playback while retaining queued samples.
+    /// Plugins or devices without pause support return an error; callers may
+    /// instead drop/reprepare and seek their source to the paused timestamp.
+    pub fn set_paused(self: *Device, paused: bool) Error!void {
+        try check(self.library, self.diagnostic, self.library.native.functions.pcm_pause(self.pcm, @intFromBool(paused)));
+    }
+
     /// Restarts a prepared PCM stream after an explicit stop/discontinuity.
     pub fn prepare(self: *Device) Error!void {
         try check(self.library, self.diagnostic, self.library.native.functions.pcm_prepare(self.pcm));
@@ -339,15 +346,15 @@ fn negotiated_spec(library: *Library, pcm: *binding.Pcm, diagnostic: ?*Diagnosti
     var maybe_params: ?*binding.HwParams = null;
     try check(library, diagnostic, library.native.functions.pcm_hw_params_malloc(&maybe_params));
     const params = maybe_params orelse return error.DeviceFailure;
-    defer library.native.functions.hw_params_free(params);
+    defer library.native.functions.pcm_hw_params_free(params);
     try check(library, diagnostic, library.native.functions.pcm_hw_params_current(pcm, params));
     var raw_format: i32 = 0;
     var channels: u32 = 0;
     var rate: u32 = 0;
     var direction: i32 = 0;
-    try check(library, diagnostic, library.native.functions.hw_params_get_format(params, &raw_format));
-    try check(library, diagnostic, library.native.functions.hw_params_get_channels(params, &channels));
-    try check(library, diagnostic, library.native.functions.hw_params_get_rate(params, &rate, &direction));
+    try check(library, diagnostic, library.native.functions.pcm_hw_params_get_format(params, &raw_format));
+    try check(library, diagnostic, library.native.functions.pcm_hw_params_get_channels(params, &channels));
+    try check(library, diagnostic, library.native.functions.pcm_hw_params_get_rate(params, &rate, &direction));
     if (direction < -1 or direction > 1) return error.InvalidConfiguration;
     const spec: audio.Spec = .{
         .format = format_from_alsa(raw_format) orelse return error.InvalidConfiguration,

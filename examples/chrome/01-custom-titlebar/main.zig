@@ -64,7 +64,6 @@ const App = struct {
     pub fn iterate(self: *App, context: *Context) Result {
         _ = context;
         self.render() catch |err| {
-            std.debug.print("DEBUG frame {d}\n", .{self.frames});
             return fail("render", err);
         };
         return .@"continue";

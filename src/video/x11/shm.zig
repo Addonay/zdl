@@ -27,7 +27,9 @@ const shm_mode: usize = 0o600;
 const z_pixmap: c_int = 2;
 
 pub const Frame = struct {
-    info: xlib.XShmSegmentInfo,
+    allocator: std.mem.Allocator,
+    /// XShmCreateImage retains this address in XImage.object_data.
+    info: *xlib.XShmSegmentInfo,
     image: *xlib.Image,
     address: [*]u8,
     byte_length: usize,
@@ -38,6 +40,7 @@ pub const Frame = struct {
     /// Creates an image with a server-attached segment sized for `width` x
     /// `height` at the visual's depth. Requires a prior successful XShmQueryExtension.
     pub fn create(
+        allocator: std.mem.Allocator,
         extension: *const xlib.Xext,
         display: *xlib.Display,
         visual: *xlib.Visual,
@@ -45,8 +48,10 @@ pub const Frame = struct {
         width: u16,
         height: u16,
     ) Error!Frame {
-        var info: xlib.XShmSegmentInfo = std.mem.zeroes(xlib.XShmSegmentInfo);
-        const image = extension.XShmCreateImage(display, visual, depth, z_pixmap, null, &info, width, height) orelse return error.SharedMemoryUnavailable;
+        const info = try allocator.create(xlib.XShmSegmentInfo);
+        errdefer allocator.destroy(info);
+        info.* = std.mem.zeroes(xlib.XShmSegmentInfo);
+        const image = extension.XShmCreateImage(display, visual, depth, z_pixmap, null, info, width, height) orelse return error.SharedMemoryUnavailable;
         errdefer destroy_image(image);
         if (image.bytes_per_line <= 0 or image.height <= 0) return error.SharedMemoryUnavailable;
         const bytes_per_line: usize = @intCast(image.bytes_per_line);
@@ -67,10 +72,11 @@ pub const Frame = struct {
         // The server copies pixels from this mapping, so it must be attached
         // before the image is used. Removal is requested now; the segment
         // lives until both sides detach.
-        _ = extension.XShmAttach(display, &info);
+        _ = extension.XShmAttach(display, info);
         _ = std.os.linux.syscall3(.shmctl, segment, ipc_rmid, 0);
         image.data = address;
         return .{
+            .allocator = allocator,
             .info = info,
             .image = image,
             .address = address,
@@ -83,10 +89,11 @@ pub const Frame = struct {
 
     /// Detaches the segment on the server, unmaps it and frees the image metadata.
     pub fn deinit(self: *Frame, extension: *const xlib.Xext, display: *xlib.Display) void {
-        _ = extension.XShmDetach(display, &self.info);
+        _ = extension.XShmDetach(display, self.info);
         self.image.data = null;
         destroy_image(self.image);
         _ = std.os.linux.syscall1(.shmdt, @intFromPtr(self.address));
+        self.allocator.destroy(self.info);
         self.* = undefined;
     }
 
@@ -108,4 +115,54 @@ fn syscall_value(result: usize) Error!usize {
         .SUCCESS => result,
         else => error.SharedMemoryUnavailable,
     };
+}
+
+// Xlib retains the segment descriptor rather than copying it. This fake image
+// backend exercises the same ownership with real process-local SysV mappings,
+// without an X server or display/device access.
+test "a moved frame preserves XImage's retained segment descriptor" {
+    const Fake = struct {
+        fn query(_: *xlib.Display) callconv(.c) xlib.Bool {
+            return 1;
+        }
+        fn event_base(_: *xlib.Display) callconv(.c) c_int {
+            return 0;
+        }
+        fn create(_: *xlib.Display, _: *xlib.Visual, _: c_uint, _: c_int, _: ?*anyopaque, info: *xlib.XShmSegmentInfo, width: c_uint, height: c_uint) callconv(.c) ?*xlib.Image {
+            const image = std.testing.allocator.create(xlib.Image) catch return null;
+            image.* = undefined;
+            image.bytes_per_line = @intCast(width * 4);
+            image.height = @intCast(height);
+            image.data = null;
+            image.object_data = info;
+            image.functions.destroy = destroy;
+            return image;
+        }
+        fn destroy(image: *xlib.Image) callconv(.c) c_int {
+            std.testing.allocator.destroy(image);
+            return 1;
+        }
+        fn attach(_: *xlib.Display, info: *xlib.XShmSegmentInfo) callconv(.c) xlib.Status {
+            info.shmseg = 123;
+            return 1;
+        }
+        fn detach(_: *xlib.Display, _: *xlib.XShmSegmentInfo) callconv(.c) xlib.Status {
+            return 1;
+        }
+        fn put(_: *xlib.Display, _: xlib.Drawable, _: *xlib.Gc, image: *xlib.Image, _: c_int, _: c_int, _: c_int, _: c_int, _: c_uint, _: c_uint, _: xlib.Bool) callconv(.c) xlib.Status {
+            const retained: *xlib.XShmSegmentInfo = @ptrCast(@alignCast(image.object_data.?));
+            std.debug.assert(retained.shmseg == 123);
+            return 1;
+        }
+    };
+    const extension: xlib.Xext = .{ .XShmQueryExtension = Fake.query, .XShmGetEventBase = Fake.event_base, .XShmCreateImage = Fake.create, .XShmAttach = Fake.attach, .XShmDetach = Fake.detach, .XShmPutImage = Fake.put };
+    const display: *xlib.Display = @ptrFromInt(8);
+    const visual: *xlib.Visual = @ptrFromInt(8);
+    var original = try Frame.create(std.testing.allocator, &extension, display, visual, 24, 4, 4);
+    var moved = original;
+    original = undefined;
+    defer moved.deinit(&extension, display);
+    try std.testing.expectEqual(@intFromPtr(moved.info), @intFromPtr(moved.image.object_data.?));
+    const gc: *xlib.Gc = @ptrFromInt(8);
+    try std.testing.expectEqual(@as(xlib.Status, 1), extension.XShmPutImage(display, 1, gc, moved.image, 0, 0, 0, 0, 4, 4, 0));
 }

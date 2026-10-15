@@ -166,7 +166,6 @@ pub fn cursor_shape(shape: platform.SystemCursor) x11.CursorShape {
 /// Drains every event the X server has delivered and queues its platform events.
 pub fn pump(p: *platform.Platform, session: *Session) platform.Error!void {
     while (try session.connection.poll()) |ev| {
-        std.debug.print("DEBUG ev {s}\n", .{@tagName(ev.payload)});
         try handle(p, session, ev);
     }
 }
