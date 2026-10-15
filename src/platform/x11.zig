@@ -165,7 +165,10 @@ pub fn cursor_shape(shape: platform.SystemCursor) x11.CursorShape {
 
 /// Drains every event the X server has delivered and queues its platform events.
 pub fn pump(p: *platform.Platform, session: *Session) platform.Error!void {
-    while (try session.connection.poll()) |ev| try handle(p, session, ev);
+    while (try session.connection.poll()) |ev| {
+        std.debug.print("DEBUG ev {s}\n", .{@tagName(ev.payload)});
+        try handle(p, session, ev);
+    }
 }
 
 /// The platform's pen source for an XInput2 device id.
@@ -246,6 +249,7 @@ fn handle(p: *platform.Platform, session: *Session, ev: x11.Event) platform.Erro
         }, .{ .keycode = key.keycode, .modifiers = key.modifiers }),
         .motion => |motion| try p.mouse_move(id, @floatFromInt(motion.position.x), @floatFromInt(motion.position.y), false),
         .button => |button| {
+            std.debug.print("DEBUG x11 button {d} pressed={}\n", .{ button.button, button.pressed });
             // Buttons 4-7 are wheel ticks and arrive as `.wheel` on press only.
             if (button.button >= 4 and button.button <= 7) return;
             try p.mouse_move(id, @floatFromInt(button.position.x), @floatFromInt(button.position.y), false);

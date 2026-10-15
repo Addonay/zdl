@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
         .{ .name = "audio-04-multiple-streams", .path = "audio/04-multiple-streams/main.zig" },
         .{ .name = "audio-05-planar-data", .path = "audio/05-planar-data/main.zig" },
         .{ .name = "demo-01-snake", .path = "demo/01-snake/main.zig" },
+        .{ .name = "chrome-01-custom-titlebar", .path = "chrome/01-custom-titlebar/main.zig" },
     };
     for (examples) |example| {
         const module = b.createModule(.{

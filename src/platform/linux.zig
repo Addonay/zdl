@@ -88,6 +88,17 @@ const wayland_backend = @import("wayland.zig");
 const graphics = @import("graphics.zig");
 const gpu_device = @import("../gpu/vulkan/device.zig");
 const vulkan_surface = @import("../video/vulkan_surface/surface.zig");
+const hit = @import("hit_test.zig");
+
+/// Custom title bar support: the regions an application declares for dragging
+/// and resizing, and the window controls drawn into its own header.
+pub const window_controls = @import("window_controls.zig");
+/// Application-declared draggable and non-draggable regions (see `Window.set_hit_test`).
+pub const HitTest = hit.HitTest;
+/// One rectangle of a `HitTest` description.
+pub const HitRegion = hit.Region;
+/// What a press means under a `HitTest`: normal, draggable or resize from edges.
+pub const HitResult = hit.Hit;
 
 /// Upper bound on live windows; sizes the poll set in `wait_event`.
 pub const max_windows = 64;
@@ -263,6 +274,18 @@ const KeyRepeat = struct {
     interval_ns: u64,
 };
 
+/// A press on a draggable title area, kept to recognize a double-click.
+const TitlebarPress = struct {
+    window: event.WindowId,
+    time_ns: event.Timestamp,
+    point: hit.Point,
+};
+
+/// Two presses on a title area within this time and distance are a double-click
+/// (GTK's defaults; the desktop setting is not read).
+const double_click_ns: u64 = 400_000_000;
+const double_click_distance: u32 = 4;
+
 /// The desktop mode of an X11 output saved before an exclusive fullscreen switch.
 const SavedX11Mode = struct {
     display: u32,
@@ -304,6 +327,11 @@ pub const Record = struct {
     drag_dropped: ?bool = null,
     /// EGL surface of a window used with OpenGL (see `graphics.zig`).
     gl: ?*graphics.GlWindow = null,
+    /// Custom title bar description: draggable regions and the resize border.
+    hit_regions: hit.HitTest = .{},
+    /// Last pointer position in window coordinates (absolute motion only); the
+    /// hit test on a press uses it.
+    pointer: ?hit.Point = null,
 };
 
 /// Links a backend pen source (the XInput2 device id on X11, the tool id on
@@ -374,6 +402,10 @@ pub const Platform = struct {
     touch_device_added: bool = false,
     /// OpenGL contexts, the shared X11 EGL display and GPU claims.
     graphics: graphics.State = .{},
+    /// Buttons (bit per index) whose press a hit-test region consumed; their releases are consumed too.
+    consumed_buttons: u32 = 0,
+    /// The last press on a draggable area, for double-click detection.
+    titlebar_press: ?TitlebarPress = null,
 
     /// Creates a platform on the backend chosen by `options`. With `.auto`,
     /// `environment.video_driver` can select x11, wayland, offscreen or kmsdrm;
@@ -1123,6 +1155,7 @@ pub const Platform = struct {
     /// Mouse motion from a backend. Relative motion is in device units.
     pub fn mouse_move(self: *Platform, window_id: event.WindowId, x: f32, y: f32, relative: bool) Error!void {
         const record = self.find(window_id) orelse return;
+        if (!relative) record.pointer = .{ .x = std.math.lossyCast(i32, @floor(x)), .y = std.math.lossyCast(i32, @floor(y)) };
         const size = record.state.current;
         const viewport: mouse.Viewport = .{ .window = window_id, .width = size.width, .height = size.height };
         if (self.mouse.motion(self.now_ns(), viewport, .global, relative, x, y)) |ev| try self.emit(ev);
@@ -1138,12 +1171,109 @@ pub const Platform = struct {
     /// Mouse button transition. Indices outside 1..32 are ignored.
     pub fn mouse_button(self: *Platform, window_id: event.WindowId, index: u8, pressed: bool) Error!void {
         if (index < 1 or index > 32) return;
+        if (try self.hit_test_button(window_id, index, pressed)) return;
         self.mouse.set_focus(window_id);
         const ev = self.mouse.button(self.now_ns(), .global, index, pressed, null) catch |err| switch (err) {
             error.InvalidButton => return,
             error.OutOfMemory => return error.OutOfMemory,
         };
         if (ev) |value| try self.emit(value);
+    }
+
+    /// Applies the window's hit-test description to a button transition. Returns
+    /// true when the transition is consumed: a press started a compositor move or
+    /// resize or showed the window menu, or completed a double-click on the title
+    /// area, and the matching release is consumed too. The application then sees
+    /// neither as a click, as SDL's hit-test handling does.
+    fn hit_test_button(self: *Platform, window_id: event.WindowId, index: u8, pressed: bool) Error!bool {
+        const bit = @as(u32, 1) << @intCast(index - 1);
+        if (!pressed) {
+            const consumed = self.consumed_buttons & bit != 0;
+            self.consumed_buttons &= ~bit;
+            return consumed;
+        }
+        self.consumed_buttons &= ~bit;
+        const record = self.find(window_id) orelse return false;
+        std.debug.print("DEBUG transition index={d} pressed={} active={} pointer={?}\n", .{ index, pressed, record.hit_regions.is_active(), record.pointer });
+        if (!record.hit_regions.is_active()) return false;
+        const point = record.pointer orelse return false;
+        const flags = record.state.flags;
+        const size = record.state.current;
+        // A maximized or fullscreen window is not resized by its edges.
+        const resizable = flags.resizable and !flags.fullscreen and !flags.maximized;
+        const result = hit.classify(record.hit_regions, size.width, size.height, point, resizable);
+        std.debug.print("DEBUG press index={d} point={d},{d} size={d}x{d} result={any}\n", .{ index, point.x, point.y, size.width, size.height, result });
+        switch (result) {
+            .normal => return false,
+            .resize => {
+                if (index != 1) return false;
+                self.consumed_buttons |= bit;
+                try begin_hit_action(record, point, result);
+                return true;
+            },
+            .draggable => {
+                if (index != 1 and index != 3) return false;
+                self.consumed_buttons |= bit;
+                if (index == 3) {
+                    try show_window_menu_at(record, point);
+                } else if (self.is_titlebar_double_click(window_id, point)) {
+                    self.titlebar_press = null;
+                    try (Window{ .platform = self, .id = window_id }).set_maximized(!flags.maximized);
+                } else {
+                    self.titlebar_press = .{ .window = window_id, .time_ns = self.now_ns(), .point = point };
+                    try begin_hit_action(record, point, result);
+                }
+                return true;
+            },
+        }
+    }
+
+    fn is_titlebar_double_click(self: *const Platform, window_id: event.WindowId, point: hit.Point) bool {
+        const previous = self.titlebar_press orelse return false;
+        if (previous.window != window_id) return false;
+        const now = self.now_ns();
+        if (now < previous.time_ns or now - previous.time_ns > double_click_ns) return false;
+        const dx = @abs(previous.point.x - point.x);
+        const dy = @abs(previous.point.y - point.y);
+        return dx <= double_click_distance and dy <= double_click_distance;
+    }
+
+    /// Starts the compositor's interactive move (draggable) or resize (resize) from a press.
+    fn begin_hit_action(record: *Record, point: hit.Point, action: hit.Hit) Error!void {
+        switch (record.native) {
+            .x11 => |*window| switch (action) {
+                .draggable => try window.begin_move_resize(point.x, point.y, .move, 1),
+                .resize => |edges| try window.begin_move_resize(point.x, point.y, x11_direction(edges), 1),
+                .normal => {},
+            },
+            .wayland => |*window| switch (action) {
+                .draggable => try window.begin_move(),
+                .resize => |edges| try window.begin_resize(edges.bits()),
+                .normal => {},
+            },
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
+        }
+    }
+
+    /// Shows the window manager's menu at a window point.
+    fn show_window_menu_at(record: *Record, point: hit.Point) Error!void {
+        switch (record.native) {
+            .x11 => |*window| try window.show_window_menu(point.x, point.y),
+            .wayland => |*window| try window.show_window_menu(point.x, point.y),
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
+        }
+    }
+
+    /// Maps resize edges to _NET_WM_MOVERESIZE directions (corners first).
+    fn x11_direction(edges: hit.Edges) x11.Window.MoveResize {
+        if (edges.top and edges.left) return .size_top_left;
+        if (edges.top and edges.right) return .size_top_right;
+        if (edges.bottom and edges.right) return .size_bottom_right;
+        if (edges.bottom and edges.left) return .size_bottom_left;
+        if (edges.top) return .size_top;
+        if (edges.bottom) return .size_bottom;
+        if (edges.left) return .size_left;
+        return .size_right;
     }
 
     /// Wheel travel in ticks (positive y is up, positive x is right). Fractional
@@ -1919,6 +2049,25 @@ pub const Window = struct {
             },
             .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
+    }
+
+    /// Describes the draggable and resize areas of a custom title bar (see
+    /// `hit_test.zig`). The platform checks it on every button press: a press on a
+    /// draggable area starts the compositor's move, a double-click there toggles
+    /// maximize, a right press shows the window menu, and a press on the resize
+    /// border starts a resize. Consumed presses and their releases are not
+    /// delivered as mouse events. Replace the description whenever the layout
+    /// changes; it is copied, so it can be rebuilt each frame.
+    pub fn set_hit_test(self: Window, regions: HitTest) Error!void {
+        const target = try self.record();
+        target.hit_regions = regions;
+    }
+
+    /// Shows the window manager's window menu at (x, y) in window coordinates.
+    /// Needs a recent pointer press on the window, as the compositors require.
+    pub fn show_window_menu(self: Window, x: i32, y: i32) Error!void {
+        const target = try self.record();
+        try Platform.show_window_menu_at(target, .{ .x = x, .y = y });
     }
 
     /// Shows or hides window decorations. Removing them makes the window borderless.

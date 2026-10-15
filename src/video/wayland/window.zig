@@ -835,6 +835,38 @@ pub const Window = struct {
         try self.flush();
     }
 
+    // ---- interactive move, resize and window menu ----
+
+    /// Starts an interactive move with the most recent pointer press
+    /// (xdg_toplevel.move). The compositor then owns the pointer until release.
+    pub fn begin_move(self: *Window) Error!void {
+        const toplevel = self.toplevel orelse return error.NotConfigured;
+        const seat = self.seat orelse return error.Unsupported;
+        if (self.input_serial == 0) return error.NoSerial;
+        protocol.XdgToplevel.move(self.lib, toplevel, seat, self.input_serial);
+        try self.flush();
+    }
+
+    /// Starts an interactive resize from `edges`, given as the xdg_toplevel
+    /// resize-edge bitmask (top 1, bottom 2, left 4, right 8), with the most
+    /// recent pointer press.
+    pub fn begin_resize(self: *Window, edges: u32) Error!void {
+        const toplevel = self.toplevel orelse return error.NotConfigured;
+        const seat = self.seat orelse return error.Unsupported;
+        if (self.input_serial == 0) return error.NoSerial;
+        protocol.XdgToplevel.resize(self.lib, toplevel, seat, self.input_serial, @fromBackingInt(edges));
+        try self.flush();
+    }
+
+    /// Shows the compositor's window menu at (x, y) in surface coordinates.
+    pub fn show_window_menu(self: *Window, x: i32, y: i32) Error!void {
+        const toplevel = self.toplevel orelse return error.NotConfigured;
+        const seat = self.seat orelse return error.Unsupported;
+        if (self.input_serial == 0) return error.NoSerial;
+        protocol.XdgToplevel.show_window_menu(self.lib, toplevel, seat, self.input_serial, x, y);
+        try self.flush();
+    }
+
     /// Asks for fullscreen on `output` (null lets the compositor choose).
     pub fn set_fullscreen(self: *Window, fullscreen: bool, output: ?Proxy) Error!void {
         const toplevel = self.toplevel orelse return error.NotConfigured;
