@@ -74,6 +74,8 @@ pub fn main() !void {
     if (@import("builtin").target.os.tag == .linux) try @import("checks/graphics.zig").check();
     try @import("checks/lifecycle.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/video_x11_ext.zig").check();
+    try @import("checks/offscreen.zig").check();
+    if (@import("builtin").target.os.tag == .linux) try @import("checks/kmsdrm.zig").check();
 }
 
 fn keyboard() !void {

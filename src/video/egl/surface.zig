@@ -32,6 +32,8 @@ pub const NativeWindow = union(enum) {
     /// `wl_surface*` from libwayland-client. A wl_egl_window of `size` is
     /// created on it and owned by the WindowSurface.
     wayland: *anyopaque,
+    /// `gbm_surface*` from a `kmsdrm.GbmWindow`; borrowed.
+    gbm: *anyopaque,
 };
 
 /// An EGL window surface and the native window bookkeeping it needs.
@@ -64,6 +66,10 @@ pub const WindowSurface = struct {
                 errdefer egl.destroy(wl_window);
                 const handle = display.library.functions.eglCreateWindowSurface(display.handle, config.handle, @intFromPtr(wl_window), request.ptr) orelse return error.SurfaceCreationFailed;
                 return .{ .display = display, .handle = handle, .wayland_window = wl_window };
+            },
+            .gbm => |surface| {
+                const handle = display.library.functions.eglCreateWindowSurface(display.handle, config.handle, @intFromPtr(surface), request.ptr) orelse return error.SurfaceCreationFailed;
+                return .{ .display = display, .handle = handle, .wayland_window = null };
             },
         }
     }

@@ -34,6 +34,11 @@ pub const Pbuffer = struct {
         return .{ .display = display, .handle = handle };
     }
 
+    /// Swaps the pbuffer's EGL buffers when the selected config is double buffered.
+    pub fn swap_buffers(self: *Pbuffer) display_mod.Error!void {
+        if (self.display.library.functions.eglSwapBuffers(self.display.handle, self.handle) != binding.true_value) return error.SwapBuffersFailed;
+    }
+
     /// Destroys the pbuffer. It must not be current when the display is closed.
     pub fn deinit(self: *Pbuffer) void {
         _ = self.display.library.functions.eglDestroySurface(self.display.handle, self.handle);

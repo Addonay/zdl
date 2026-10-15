@@ -1,10 +1,10 @@
-//! Linux platform layer: backend selection (Wayland or X11), the backend
+//! Linux platform layer: backend selection (Wayland, X11, offscreen or KMS/DRM), the backend
 //! connection, keyboard/mouse/touch state, the event queue, displays, message
 //! boxes and a backend-independent window handle.
 //!
 //! This is the integration layer SDL_video.c and SDL_events.c provide on Linux.
 //! It ties together the X11 backend (`video/x11`), the Wayland backend
-//! (`video/wayland`, with `input/xkb` keymaps), the shared window model
+//! (`video/wayland`, with `input/xkb` keymaps), the offscreen and KMS/DRM video paths, the shared window model
 //! (`video/window_state.zig`), displays, message boxes and the caller-owned
 //! event model (`events/`). Backend adapters live in `x11.zig` and `wayland.zig`
 //! in this directory.
@@ -70,6 +70,9 @@ const keyboard_state = @import("../input/keyboard_state.zig");
 const display = @import("../video/display.zig");
 const geometry = @import("../video/geometry.zig");
 const surface = @import("../video/surface.zig");
+const offscreen = @import("../video/offscreen/framebuffer.zig");
+const kms_device = @import("../video/kmsdrm/device.zig");
+const evdev = @import("evdev.zig");
 const window_state = @import("../video/window_state.zig");
 const x11 = @import("../video/x11/window.zig");
 const x11_displays = @import("../video/x11/displays.zig");
@@ -91,7 +94,7 @@ pub const max_windows = 64;
 
 /// Every failure the platform layer reports. Backend sets are included so
 /// the caller sees the precise cause.
-pub const Error = std.mem.Allocator.Error || queue.PushError || display.Error || surface.Error ||
+pub const Error = std.mem.Allocator.Error || queue.PushError || display.Error || surface.Error || offscreen.Error || kms_device.Error ||
     x11.Error || x11_displays.Error || wayland.Error || xkb_library.Error || zenity.Error ||
     graphics.GraphicsError ||
     error{
@@ -110,11 +113,11 @@ pub const Error = std.mem.Allocator.Error || queue.PushError || display.Error ||
     };
 
 /// Video backends the platform can run on.
-pub const Backend = enum { x11, wayland };
+pub const Backend = enum { x11, wayland, offscreen, kmsdrm };
 
 /// Explicit backend choice. `auto` applies the environment rules; the other
 /// values force a backend and fail with `BackendUnavailable` when it cannot connect.
-pub const Driver = enum { auto, x11, wayland };
+pub const Driver = enum { auto, x11, wayland, offscreen, kmsdrm };
 
 /// Process environment the platform reads. The caller reads it, so the platform
 /// never calls getenv and tests can supply any combination.
@@ -127,6 +130,16 @@ pub const Environment = struct {
     x11_display: ?[:0]const u8 = null,
     /// XCURSOR_THEME for Wayland cursors when the compositor lacks cursor-shape-v1.
     xcursor_theme: ?[]const u8 = null,
+    /// SDL_VIDEO_DRIVER-style override: "x11", "wayland", "offscreen" or "kmsdrm".
+    /// Supplying it avoids an implicit getenv call and makes backend choice testable.
+    video_driver: ?[]const u8 = null,
+    /// DRM card node used when `video_driver` selects "kmsdrm".
+    kmsdrm_node: []const u8 = "/dev/dri/card0",
+    /// Optional DRM connector id for direct display selection.
+    kmsdrm_connector_id: ?u32 = null,
+    /// Optional initial KMS mode dimensions; null uses the preferred mode.
+    kmsdrm_width: ?u16 = null,
+    kmsdrm_height: ?u16 = null,
 };
 
 /// Platform creation options.
@@ -139,6 +152,9 @@ pub const Options = struct {
     /// Optional SIGINT/SIGTERM source. The platform owns it from `open` on and
     /// uninstalls it in `close`; its descriptor is waited on by `wait_event`.
     signals: ?quit.Signals = null,
+    /// Null scans `/dev/input/event*` for a direct KMSDRM session; an explicit
+    /// slice limits the nodes, and an empty slice disables evdev input.
+    evdev_paths: ?[]const []const u8 = null,
 };
 
 /// Drag data offered by `Window.start_drag` (SDL has no X11 drag source; Wayland only).
@@ -259,13 +275,16 @@ pub const Native = union(enum) {
     none,
     x11: x11.Window,
     wayland: wayland.Window,
+    offscreen: offscreen.Window,
+    kmsdrm: void,
     wayland_popup: struct { parent: event.WindowId, popup: wayland.PopupId },
 
     fn deinit(self: *Native) void {
         switch (self.*) {
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .kmsdrm => {},
             .x11 => |*window| window.deinit(),
             .wayland => |*window| window.deinit(),
+            .offscreen => |*window| window.deinit(),
         }
         self.* = .none;
     }
@@ -302,6 +321,8 @@ pub const Platform = struct {
     backend: Backend,
     x11: ?*x11_backend.Session = null,
     wayland: ?*wayland_backend.Session = null,
+    kmsdrm: ?*kms_device.Device = null,
+    evdev_input: ?evdev.Input = null,
     keyboard: keyboard_state.KeyboardState = .{},
     mouse: mouse.Mouse,
     touches: touch.Touches,
@@ -330,8 +351,9 @@ pub const Platform = struct {
     graphics: graphics.State = .{},
 
     /// Creates a platform on the backend chosen by `options`. With `.auto`,
-    /// Wayland is used when the environment names it and a connection succeeds;
-    /// otherwise X11. The clock is read from `io` for every event timestamp.
+    /// `environment.video_driver` can select x11, wayland, offscreen or kmsdrm;
+    /// otherwise Wayland is used when named and reachable, with X11 as fallback.
+    /// The clock is read from `io` for every event timestamp.
     pub fn open(allocator: std.mem.Allocator, io: std.Io, options: Options) Error!*Platform {
         const self = try allocator.create(Platform);
         errdefer allocator.destroy(self);
@@ -350,23 +372,99 @@ pub const Platform = struct {
         errdefer self.release_resources();
 
         const env = options.environment;
+        const selected_driver: Driver = if (options.driver != .auto) options.driver else if (env.video_driver) |name|
+            parse_driver(name) orelse return error.BackendUnavailable
+        else
+            .auto;
+        if (selected_driver == .offscreen) {
+            self.backend = .offscreen;
+            return self;
+        }
+        if (selected_driver == .kmsdrm) {
+            self.backend = .kmsdrm;
+            const device = try allocator.create(kms_device.Device);
+            var platform_owns_device = false;
+            errdefer if (!platform_owns_device) allocator.destroy(device);
+            device.* = try kms_device.Device.open(allocator, .{
+                .node = env.kmsdrm_node,
+                .connector_id = env.kmsdrm_connector_id,
+                .width = env.kmsdrm_width,
+                .height = env.kmsdrm_height,
+            });
+            self.kmsdrm = device;
+            platform_owns_device = true;
+            try self.refresh_kms_display(device);
+            self.evdev_input = if (options.evdev_paths) |paths|
+                try evdev.Input.open_paths(allocator, paths)
+            else
+                try evdev.Input.open_all(allocator, io);
+            return self;
+        }
         const wants_wayland = (env.wayland_display != null and env.wayland_display.?.len > 0) or
             (env.session_type != null and std.mem.eql(u8, env.session_type.?, "wayland"));
-        const use_wayland = switch (options.driver) {
+        const use_wayland = switch (selected_driver) {
             .wayland => true,
             .x11 => false,
+            .offscreen, .kmsdrm => unreachable,
             .auto => wants_wayland and probe_wayland(),
         };
         if (use_wayland) {
             self.backend = .wayland;
             self.wayland = try wayland_backend.Session.open(allocator, env.xcursor_theme);
         } else {
-            if (options.driver == .wayland) return error.BackendUnavailable;
+            if (selected_driver == .wayland) return error.BackendUnavailable;
             self.backend = .x11;
             self.x11 = try x11_backend.Session.open(allocator, env.x11_display);
             try self.refresh_x11_displays(self.x11.?);
         }
         return self;
+    }
+
+    fn parse_driver(name: []const u8) ?Driver {
+        if (std.mem.eql(u8, name, "auto")) return .auto;
+        if (std.mem.eql(u8, name, "x11")) return .x11;
+        if (std.mem.eql(u8, name, "wayland")) return .wayland;
+        if (std.mem.eql(u8, name, "offscreen")) return .offscreen;
+        if (std.mem.eql(u8, name, "kmsdrm")) return .kmsdrm;
+        return null;
+    }
+
+    fn refresh_kms_display(self: *Platform, device: *const kms_device.Device) Error!void {
+        const id: event.DisplayId = @fromBackingInt(@max(device.connector_id, 1));
+        const mode = device.selected_mode();
+        const name = try std.fmt.allocPrint(self.allocator, "DRM connector {d}", .{device.connector_id});
+        var desktop: display.Mode = .{
+            .display_id = id,
+            .width = mode.width,
+            .height = mode.height,
+            .refresh_rate = @as(f32, @floatFromInt(mode.refresh_millihz)) / 1000.0,
+        };
+        desktop.finalize();
+        var entry: DisplayEntry = .{
+            .name = name,
+            .display = .{
+                .id = id,
+                .name = name,
+                .bounds = .{ .x = 0, .y = 0, .width = mode.width, .height = mode.height },
+                .desktop_mode = desktop,
+            },
+        };
+        var appended = false;
+        var committed = false;
+        errdefer if (!committed) {
+            if (appended) {
+                var owned = self.displays_list.pop().?;
+                owned.deinit(self.allocator);
+            } else {
+                entry.deinit(self.allocator);
+            }
+        };
+        _ = try entry.display.add_fullscreen_mode(self.allocator, desktop);
+        try self.displays_list.append(self.allocator, entry);
+        appended = true;
+        self.primary_display = 0;
+        try self.emit_display(.added, id);
+        committed = true;
     }
 
     /// Destroys every window, backend session and queued state, then frees the platform.
@@ -391,13 +489,26 @@ pub const Platform = struct {
         self.events.deinit();
         if (self.signals) |*signals| signals.uninstall();
         self.signals = null;
+        if (self.evdev_input) |*input| input.deinit();
+        self.evdev_input = null;
         if (self.x11) |session| session.close(self.allocator);
         if (self.wayland) |session| session.close(self.allocator);
+        if (self.kmsdrm) |device| {
+            device.deinit();
+            self.allocator.destroy(device);
+            self.kmsdrm = null;
+        }
     }
 
     /// The backend in use.
     pub fn active_backend(self: *const Platform) Backend {
         return self.backend;
+    }
+
+    /// The direct-display KMS device, or null on other backends. Its lifetime
+    /// is owned by the Platform and it must not be deinitialized by callers.
+    pub fn kmsdrm_device(self: *Platform) ?*kms_device.Device {
+        return self.kmsdrm;
     }
 
     /// Monotonic time in nanoseconds from the clock passed to `open`.
@@ -432,20 +543,26 @@ pub const Platform = struct {
     /// fullscreen) are applied when the window is shown, as SDL does.
     pub fn create_window(self: *Platform, options: WindowOptions) Error!Window {
         if (self.records.items.len >= max_windows) return error.TooManyWindows;
-        if (options.size.width == 0 or options.size.height == 0) return error.InvalidSize;
+        if (self.backend == .kmsdrm and self.records.items.len != 0) return error.UnsupportedOperation;
+        var actual_options = options;
+        if (self.backend == .kmsdrm) {
+            const size = self.kmsdrm.?.size();
+            actual_options.size = .{ .width = size.width, .height = size.height };
+        }
+        if (actual_options.size.width == 0 or actual_options.size.height == 0) return error.InvalidSize;
         const id: event.WindowId = @fromBackingInt(self.next_window);
         self.next_window += 1;
 
         const flags: window_state.Flags = .{
             .resizable = options.resizable,
             .borderless = options.borderless,
-            .hidden = self.backend == .x11,
+            .hidden = self.backend == .x11 or (self.backend == .offscreen and options.hidden),
         };
-        const rect: window_state.Rect = .{ .x = 0, .y = 0, .width = options.size.width, .height = options.size.height };
+        const rect: window_state.Rect = .{ .x = 0, .y = 0, .width = actual_options.size.width, .height = actual_options.size.height };
         const record = try self.allocator.create(Record);
         record.* = .{ .id = id, .state = window_state.State.init(id, rect, flags) };
         errdefer self.discard_record(record);
-        record.native = try self.open_native(options);
+        record.native = try self.open_native(actual_options);
         try self.records.append(self.allocator, record);
 
         const handle: Window = .{ .platform = self, .id = id };
@@ -471,6 +588,8 @@ pub const Platform = struct {
         return switch (self.backend) {
             .x11 => .{ .x11 = try x11_backend.create_window(self.x11.?, options) },
             .wayland => .{ .wayland = try wayland_backend.create_window(self.allocator, self.wayland.?, options) },
+            .offscreen => .{ .offscreen = try offscreen.Window.init(self.allocator, options.size.width, options.size.height) },
+            .kmsdrm => .{ .kmsdrm = {} },
         };
     }
 
@@ -594,6 +713,17 @@ pub const Platform = struct {
             },
             else => {},
         };
+        try self.pump_evdev();
+        if (self.kmsdrm) |device| if (device.poll_vt()) |transition| switch (transition) {
+            .release => {
+                try device.release_vt();
+                try device.acknowledge_vt(.release);
+            },
+            .acquire => {
+                try device.acquire_vt();
+                try device.acknowledge_vt(.acquire);
+            },
+        };
         try self.advance_key_repeat();
         if (self.signals) |*signals| {
             if (signals.poll(self.now_ns())) |ev| try self.emit(ev);
@@ -603,6 +733,100 @@ pub const Platform = struct {
         while (self.pens.next_pending_proximity(self.now_ns())) |batch| try self.emit_batch(batch);
     }
 
+    /// Reads direct-display evdev batches into the same keyboard and mouse
+    /// state machines used by X11 and Wayland. Kernel event timestamps are
+    /// intentionally replaced by this platform's monotonic nanosecond clock.
+    fn pump_evdev(self: *Platform) Error!void {
+        const input = if (self.evdev_input) |*reader| reader else return;
+        const record = for (self.records.items) |candidate| {
+            if (std.meta.activeTag(candidate.native) == .kmsdrm) break candidate;
+        } else return;
+        var dx: f32 = 0;
+        var dy: f32 = 0;
+        var wheel_x: f32 = 0;
+        var wheel_y: f32 = 0;
+        var high_res_x: f32 = 0;
+        var high_res_y: f32 = 0;
+        var has_high_res_x = false;
+        var has_high_res_y = false;
+
+        for (input.poll()) |raw| switch (raw.type) {
+            .key => {
+                if (raw.code < 0x100) {
+                    try self.key_input(record.id, .{
+                        .scancode = @import("../input/linux_keys.zig").evdev_scancode(raw.code),
+                        .down = raw.value != 0,
+                        .raw = raw.code,
+                        .source = .hardware,
+                        .now_ns = self.now_ns(),
+                    }, null);
+                } else if (evdev_button_index(raw.code)) |button| {
+                    try self.mouse_button(record.id, button, raw.value != 0);
+                }
+            },
+            .relative => switch (raw.code) {
+                0 => dx += @floatFromInt(raw.value), // REL_X
+                1 => dy += @floatFromInt(raw.value), // REL_Y
+                6 => wheel_x += @floatFromInt(raw.value), // REL_HWHEEL
+                8 => wheel_y += @floatFromInt(raw.value), // REL_WHEEL
+                11 => {
+                    high_res_y += @as(f32, @floatFromInt(raw.value)) / 120.0; // REL_WHEEL_HI_RES
+                    has_high_res_y = true;
+                },
+                12 => {
+                    high_res_x += @as(f32, @floatFromInt(raw.value)) / 120.0; // REL_HWHEEL_HI_RES
+                    has_high_res_x = true;
+                },
+                else => {},
+            },
+            .sync => if (raw.code == 3) { // SYN_DROPPED
+                try self.release_keys(record.id);
+            } else if (raw.code == 0) { // SYN_REPORT
+                try self.flush_evdev_motion(record.id, &dx, &dy, &wheel_x, &wheel_y, &high_res_x, &high_res_y, &has_high_res_x, &has_high_res_y);
+            },
+            .absolute, .other => {},
+        };
+        try self.flush_evdev_motion(record.id, &dx, &dy, &wheel_x, &wheel_y, &high_res_x, &high_res_y, &has_high_res_x, &has_high_res_y);
+    }
+
+    fn flush_evdev_motion(
+        self: *Platform,
+        window_id: event.WindowId,
+        dx: *f32,
+        dy: *f32,
+        wheel_x: *f32,
+        wheel_y: *f32,
+        high_res_x: *f32,
+        high_res_y: *f32,
+        has_high_res_x: *bool,
+        has_high_res_y: *bool,
+    ) Error!void {
+        if (dx.* != 0 or dy.* != 0) try self.mouse_move(window_id, dx.*, dy.*, true);
+        const x = if (has_high_res_x.*) high_res_x.* else wheel_x.*;
+        const y = if (has_high_res_y.*) -high_res_y.* else -wheel_y.*;
+        if (x != 0 or y != 0) try self.mouse_wheel(window_id, x, y);
+        dx.* = 0;
+        dy.* = 0;
+        wheel_x.* = 0;
+        wheel_y.* = 0;
+        high_res_x.* = 0;
+        high_res_y.* = 0;
+        has_high_res_x.* = false;
+        has_high_res_y.* = false;
+    }
+
+    fn evdev_button_index(code: u16) ?u8 {
+        return switch (code) {
+            0x110 => 1, // BTN_LEFT
+            0x111 => 3, // BTN_RIGHT
+            0x112 => 2, // BTN_MIDDLE
+            0x113 => 4, // BTN_SIDE
+            0x114 => 5, // BTN_EXTRA
+            0x100...0x109 => @intCast(code - 0x100 + 1), // BTN_0 through BTN_9
+            else => null,
+        };
+    }
+
     /// Pumps, then waits up to `timeout_ns` (null waits indefinitely) for backend
     /// activity, a quit signal or a key-repeat deadline. Returns true when an event
     /// is queued.
@@ -610,12 +834,17 @@ pub const Platform = struct {
         try self.pump();
         if (self.events.len() > 0) return true;
 
-        var descriptors: [max_windows + 2]std.posix.pollfd = undefined;
+        var descriptors: [max_windows + evdev.max_devices + 2]std.posix.pollfd = undefined;
         var count: usize = 0;
         if (self.x11) |session| {
             descriptors[count] = .{ .fd = session.connection.file_descriptor() catch return error.PollFailed, .events = std.posix.POLL.IN, .revents = 0 };
             count += 1;
         }
+        if (self.evdev_input) |*input| count += input.append_pollfds(descriptors[count..]);
+        if (self.kmsdrm) |device| if (device.vt_poll_fd()) |fd| {
+            descriptors[count] = .{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 };
+            count += 1;
+        };
         for (self.records.items) |record| switch (record.native) {
             .wayland => |*window| {
                 descriptors[count] = .{ .fd = window.lib.fd(window.display), .events = std.posix.POLL.IN, .revents = 0 };
@@ -1185,7 +1414,7 @@ pub const Platform = struct {
         switch (record.native) {
             .x11 => |*window| try window.set_fullscreen(enabled),
             .wayland => |*window| try window.set_fullscreen(enabled, null),
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
     }
 
@@ -1210,7 +1439,7 @@ pub const Platform = struct {
                 try window.set_maximum_size(x_max);
             },
             .wayland => |*window| try wayland_backend.set_limits(window, min, max),
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
     }
 
@@ -1219,7 +1448,7 @@ pub const Platform = struct {
         switch (record.native) {
             .x11 => |*window| try window.set_bordered(bordered),
             .wayland => |*window| try wayland_backend.set_bordered(window, bordered),
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
     }
 
@@ -1482,7 +1711,7 @@ pub const Window = struct {
                 const point = try r.state.request_position(.{ .value = x }, .{ .value = y }, null, null, false);
                 try window.move(.{ .x = point.x, .y = point.y });
             },
-            .wayland, .wayland_popup => return error.UnsupportedOperation,
+            .wayland, .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
     }
@@ -1492,7 +1721,7 @@ pub const Window = struct {
         switch (r.native) {
             .x11 => |*window| try window.set_title(title),
             .wayland => |*window| try window.set_title(title),
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
     }
 
@@ -1503,7 +1732,7 @@ pub const Window = struct {
         switch (r.native) {
             .x11 => |*window| try window.show(),
             .wayland => |*window| try window.show(),
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
         try self.platform.emit_window(r.state.send(.shown, 0, 0));
         const actions = r.state.take_shown_actions();
@@ -1526,6 +1755,9 @@ pub const Window = struct {
                 if (!r.state.begin_hide()) return;
                 try window.hide();
             },
+            .offscreen, .kmsdrm => {
+                if (!r.state.begin_hide()) return;
+            },
             .wayland_popup => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
@@ -1539,10 +1771,16 @@ pub const Window = struct {
     pub fn resize(self: Window, new_size: Size) Error!void {
         const r = try self.record();
         if (new_size.width == 0 or new_size.height == 0) return error.InvalidSize;
-        if (std.meta.activeTag(r.native) == .wayland) return error.UnsupportedOperation;
+        if (std.meta.activeTag(r.native) == .wayland or std.meta.activeTag(r.native) == .kmsdrm) return error.UnsupportedOperation;
         const pending = try r.state.request_size(new_size.width, new_size.height);
         switch (r.native) {
             .x11 => |*window| try window.resize(.{ .width = @intCast(pending.width), .height = @intCast(pending.height) }),
+            .offscreen => |*window| {
+                try window.resize(@intCast(pending.width), @intCast(pending.height));
+                try self.platform.emit_window(r.state.send(.resized, pending.width, pending.height));
+                try self.platform.check_pixels(r);
+            },
+            .kmsdrm => unreachable,
             else => {},
         }
     }
@@ -1614,7 +1852,7 @@ pub const Window = struct {
                 try window.set_maximized(false);
                 try self.platform.emit_window(r.state.send(.restored, 0, 0));
             },
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
         if (r.state.flags.fullscreen) {
             if (r.state.request_fullscreen(false)) |step| try self.platform.apply_fullscreen(r, step);
@@ -1632,7 +1870,7 @@ pub const Window = struct {
                 const kind: event.WindowKind = if (enabled) .maximized else .restored;
                 try self.platform.emit_window(r.state.send(kind, 0, 0));
             },
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
     }
 
@@ -1646,7 +1884,7 @@ pub const Window = struct {
                 try self.platform.emit_window(r.state.send(.minimized, 0, 0));
                 if (r.state.after_minimized()) |step| try self.platform.apply_fullscreen(r, step);
             },
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
     }
 
@@ -1667,7 +1905,7 @@ pub const Window = struct {
         const r = try self.record();
         switch (r.native) {
             .x11 => |*window| try window.set_always_on_top(enabled),
-            .wayland, .wayland_popup => return error.UnsupportedOperation,
+            .wayland, .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
         r.state.flags.always_on_top = enabled;
@@ -1679,7 +1917,7 @@ pub const Window = struct {
         const r = try self.record();
         switch (r.native) {
             .x11 => |*window| try window.set_opacity(opacity),
-            .wayland, .wayland_popup => return error.UnsupportedOperation,
+            .wayland, .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
     }
@@ -1690,7 +1928,7 @@ pub const Window = struct {
         const r = try self.record();
         switch (r.native) {
             .x11 => |*window| try window.set_icon(self.platform.allocator, view),
-            .wayland, .wayland_popup => return error.UnsupportedOperation,
+            .wayland, .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
     }
@@ -1706,7 +1944,7 @@ pub const Window = struct {
         };
         switch (r.native) {
             .x11 => |*window| try window.flash(native_operation),
-            .wayland, .wayland_popup => return error.UnsupportedOperation,
+            .wayland, .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
     }
@@ -1718,7 +1956,7 @@ pub const Window = struct {
         const r = try self.record();
         switch (r.native) {
             .x11 => |*window| try window.set_mouse_grab(grabbed),
-            .wayland, .wayland_popup => return error.UnsupportedOperation,
+            .wayland, .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
         r.state.flags.mouse_grabbed = grabbed;
@@ -1730,7 +1968,7 @@ pub const Window = struct {
         const r = try self.record();
         switch (r.native) {
             .x11 => |*window| try window.set_keyboard_grab(grabbed),
-            .wayland, .wayland_popup => return error.UnsupportedOperation,
+            .wayland, .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
         r.state.flags.keyboard_grabbed = grabbed;
@@ -1743,7 +1981,7 @@ pub const Window = struct {
         switch (r.native) {
             .x11 => |*window| try window.warp_mouse(.{ .x = @intFromFloat(x), .y = @intFromFloat(y) }),
             .wayland => |*window| try window.warp_pointer(x, y),
-            .wayland_popup => return error.UnsupportedOperation,
+            .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
     }
@@ -1761,7 +1999,7 @@ pub const Window = struct {
                 self.platform.mouse.set_relative_mode(enabled);
             },
             .wayland => |*window| try window.set_relative_mouse_mode(enabled),
-            .wayland_popup => return error.UnsupportedOperation,
+            .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
     }
@@ -1777,7 +2015,7 @@ pub const Window = struct {
                 try session.connection.set_text_input_spot(window, .{ .x = area.x, .y = area.y + area.height });
             },
             .wayland => |*window| try window.set_text_input_area(.{ .x = area.x, .y = area.y, .width = area.width, .height = area.height }),
-            .wayland_popup => return error.UnsupportedOperation,
+            .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
     }
@@ -1839,6 +2077,8 @@ pub const Window = struct {
         switch (r.native) {
             .x11 => |*window| try window.present(self.platform.allocator, view),
             .wayland => |*window| try window.present(view),
+            .offscreen => |*window| try window.present(view),
+            .kmsdrm => try self.platform.kmsdrm.?.present(view),
             .wayland_popup => |popup| {
                 const parent = self.platform.find(popup.parent) orelse return error.WindowClosed;
                 switch (parent.native) {
@@ -1848,6 +2088,17 @@ pub const Window = struct {
             },
             .none => return error.WindowClosed,
         }
+    }
+
+    /// Borrows the software framebuffer of a headless offscreen window.
+    /// The view remains valid until resize or window destruction.
+    pub fn offscreen_framebuffer(self: Window) Error!surface.View {
+        const r = try self.record();
+        return switch (r.native) {
+            .offscreen => |*window| window.view(),
+            .x11, .wayland, .wayland_popup, .kmsdrm => error.UnsupportedOperation,
+            .none => error.WindowClosed,
+        };
     }
 
     /// Opens a popup (tooltip or menu) positioned relative to this window. The
@@ -1877,7 +2128,7 @@ pub const Window = struct {
                 errdefer window.close_popup(popup_id) catch {};
                 return owner.add_popup_record(.{ .wayland_popup = .{ .parent = self.id, .popup = popup_id } }, options, true);
             },
-            .wayland_popup => return error.UnsupportedOperation,
+            .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
     }
@@ -1889,7 +2140,7 @@ pub const Window = struct {
         const r = try self.record();
         switch (r.native) {
             .x11 => |*window| try window.set_shape(self.platform.allocator, view),
-            .wayland, .wayland_popup => return error.UnsupportedOperation,
+            .wayland, .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
     }
@@ -1908,7 +2159,7 @@ pub const Window = struct {
                 r.drag_dropped = null;
                 try window.start_drag(converted);
             },
-            .x11, .wayland_popup => return error.UnsupportedOperation,
+            .x11, .wayland_popup, .offscreen, .kmsdrm => return error.UnsupportedOperation,
             .none => return error.WindowClosed,
         }
     }
@@ -1936,7 +2187,7 @@ pub const Window = struct {
                 try window.set_cursor(&r.x11_cursor.?);
             },
             .wayland => |*window| try window.set_cursor(.{ .system = wayland_backend.cursor_shape(cursor) }),
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
     }
 
@@ -1946,7 +2197,7 @@ pub const Window = struct {
         switch (r.native) {
             .x11 => |*window| try self.platform.x11.?.connection.enable_text_input(window),
             .wayland => |*window| try window.start_text_input(),
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
         r.text_input = true;
     }
@@ -1956,7 +2207,7 @@ pub const Window = struct {
         switch (r.native) {
             .x11 => |*window| self.platform.x11.?.connection.disable_text_input(window),
             .wayland => |*window| try window.stop_text_input(),
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
         r.text_input = false;
     }
@@ -1970,7 +2221,7 @@ pub const Window = struct {
                 try session.clipboard.set_text(&session.connection, window, .clipboard, text);
             },
             .wayland => |*window| try wayland_backend.set_clipboard(window, text),
-            .none, .wayland_popup => {},
+            .none, .wayland_popup, .offscreen, .kmsdrm => {},
         }
     }
 
@@ -1981,7 +2232,7 @@ pub const Window = struct {
         return switch (r.native) {
             .x11 => |*window| try x11_backend.clipboard_text(self.platform, allocator, window),
             .wayland => |*window| try wayland_backend.clipboard_text(allocator, window),
-            .wayland_popup => error.UnsupportedOperation,
+            .wayland_popup, .offscreen, .kmsdrm => error.UnsupportedOperation,
             .none => error.WindowClosed,
         };
     }
@@ -2012,5 +2263,6 @@ fn show_message_box_for(platform_ref: *Platform, parent: ?Window, data: message_
             return x11_message_box.show(platform_ref.allocator, &session.connection, x_parent, data);
         },
         .wayland => return zenity.show(platform_ref.allocator, platform_ref.io, data),
+        .offscreen, .kmsdrm => return error.UnsupportedOperation,
     }
 }

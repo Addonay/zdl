@@ -68,11 +68,19 @@ has less functionality; the conversion ledger must distinguish these states.
   presentation and RandR displays; requires libc.
 - `src/video/wayland/` (`zdl.wayland`): libwayland-client binding (private),
   generated protocol tables, Window, cursors, clipboard, text input; requires libc.
+- `src/video/kmsdrm/` (`zdl.kmsdrm`): private runtime-loaded libdrm/libgbm,
+  connected output/mode selection, saved CRTC restore, VT release/acquire,
+  atomic/legacy modeset and page flips, GBM scanout/EGL windows and hardware
+  cursor; EGL targets must be rebuilt after a VT change; requires libc.
+- `src/video/offscreen/` (`zdl.offscreen`): headless software framebuffer and
+  optional surfaceless EGL pbuffer/context; the framebuffer needs no display or
+  C library.
 - `src/render/software.zig`: immediate clipped primitives, colored/nearest-textured
   triangle batches, top-left coverage and explicit alias snapshots. Antialiasing
   and remaining renderer integration are pending.
 - `src/platform/` (`zdl.linux`): unified Linux Platform/Window/event pump over
-  the X11 and Wayland backends; requires libc.
+  X11, Wayland, offscreen and KMS/DRM backends; KMS uses `platform/evdev.zig`
+  to route relative input through the shared keyboard/mouse state; requires libc.
 - `src/app/` (`zdl.app`): device registries, render coordinate conversion, the
   main-callbacks loop, app metadata and the subsystem `Lifecycle`/`Services`.
 - `src/io/stream.zig` (`zdl.iostream`): memory streams and endian helpers.
@@ -91,7 +99,8 @@ has less functionality; the conversion ledger must distinguish these states.
 - `src/gpu/` (`zdl.gpu`): GPU API types and the Vulkan backend foundation;
   binding private in `gpu/vulkan/binding.zig`; requires libc.
 - `src/video/egl/`, `src/video/vulkan_surface/` (`zdl.egl`, `zdl.vulkan_surface`):
-  EGL contexts and Vulkan surfaces for X11/Wayland windows; requires libc.
+  EGL contexts and Vulkan surfaces for X11/Wayland/GBM windows plus pbuffer
+  surfaces for offscreen rendering; requires libc.
 - `src/video/{display,window_state,blit_yuv}.zig` (`zdl.video`): displays and
   modes, backend-independent window state, camera frame conversion,
   colorspaces/transfer functions, wide and float formats, P010 YUV and RLE.

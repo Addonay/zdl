@@ -238,6 +238,25 @@ pub const video = struct {
     pub const yuv_more = @import("video/yuv_more.zig");
 };
 
+/// Headless windows and software framebuffers; this module does not load a
+/// display server or a C library.
+pub const offscreen = struct {
+    pub const framebuffer = @import("video/offscreen/framebuffer.zig");
+    pub const egl = @import("video/offscreen/egl.zig");
+    pub const Framebuffer = framebuffer.Framebuffer;
+    pub const EglTarget = @import("video/offscreen/egl.zig").Target;
+};
+
+/// Linux DRM/KMS connector selection, GBM scanout, page flips and hardware cursor.
+/// Open only on an explicitly selected direct-display backend; requires libc.
+pub const kmsdrm = struct {
+    pub const device = @import("video/kmsdrm/device.zig");
+    pub const Device = device.Device;
+    pub const Options = device.Options;
+    pub const Mode = device.Mode;
+    pub const GbmWindow = device.GbmWindow;
+};
+
 /// OpenGL contexts over runtime-loaded GLX or EGL, and OpenGL ES over EGL;
 /// config selection, window/pbuffer surfaces and swap control (requires libc).
 pub const egl = struct {

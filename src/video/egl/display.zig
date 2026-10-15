@@ -27,6 +27,10 @@ pub const Platform = union(enum) {
     x11: *anyopaque,
     /// `wl_display*` from libwayland-client.
     wayland: *anyopaque,
+    /// `gbm_device*` from the KMS/DRM backend.
+    gbm: *anyopaque,
+    /// EGL_MESA_platform_surfaceless; no native display handle is used.
+    surfaceless,
 };
 
 /// EGL and loader failures. Read the EGL error code with `Display.error_code`
@@ -297,9 +301,11 @@ fn is_scored_channel(name: i32) bool {
 /// The EGL display for `platform` (see Display.open). Returns null when every
 /// strategy fails.
 fn get_display(library: *const binding.Library, platform: Platform) ?*binding.Display {
-    const native: *anyopaque, const kind: binding.Enum = switch (platform) {
+    const native: ?*anyopaque, const kind: binding.Enum = switch (platform) {
         .x11 => |display| .{ display, binding.egl_platform_x11 },
         .wayland => |display| .{ display, binding.egl_platform_wayland },
+        .gbm => |display| .{ display, binding.egl_platform_gbm },
+        .surfaceless => .{ null, binding.egl_platform_surfaceless },
     };
     if (library.get_platform_display) |get| {
         if (get(kind, native, null)) |display| return display;
@@ -308,5 +314,5 @@ fn get_display(library: *const binding.Library, platform: Platform) ?*binding.Di
         const get: binding.GetPlatformDisplay = @ptrCast(raw);
         if (get(kind, native, null)) |display| return display;
     }
-    return library.functions.eglGetDisplay(@intFromPtr(native));
+    return library.functions.eglGetDisplay(if (native) |handle| @intFromPtr(handle) else 0);
 }

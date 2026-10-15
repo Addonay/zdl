@@ -239,6 +239,7 @@ fn native_handles(p: *Platform, record: *Record) Error!NativeHandles {
             return .{ .display = window.display, .window = .{ .wayland = surface } };
         },
         .wayland_popup => return error.UnsupportedOperation,
+        .offscreen, .kmsdrm => return error.UnsupportedOperation,
         .none => return error.WindowClosed,
     }
 }
@@ -544,10 +545,11 @@ pub fn resize_surface(p: *Platform, record: *Record) Error!void {
 
 /// The Vulkan instance extensions the active backend needs.
 pub fn instance_extensions(backend: platform.Backend) []const [:0]const u8 {
-    return vulkan_extensions.required(switch (backend) {
-        .x11 => .x11,
-        .wayland => .wayland,
-    });
+    return switch (backend) {
+        .x11 => vulkan_extensions.required(.x11),
+        .wayland => vulkan_extensions.required(.wayland),
+        .offscreen, .kmsdrm => &.{},
+    };
 }
 
 /// Creates a VkSurfaceKHR for `record` on `instance` (SDL_Vulkan_CreateSurface).
