@@ -94,11 +94,15 @@ pub fn check() !void {
     // Events from JACK (xrun, shutdown, rate and buffer-size changes).
     while (output.poll_event()) |event| switch (event) {
         .xrun => |count| _ = count,
-        .sample_rate_changed => |rate| _ = rate,
-        .buffer_size_changed => |frames| _ = frames,
+        .sample_rate_changed => try output.refresh(),
+        .buffer_size_changed => try output.refresh(),
+        .ports_changed => try output.refresh(),
         .shutdown => {},
     };
     while (input.poll_event()) |event| switch (event) {
-        .xrun, .sample_rate_changed, .buffer_size_changed, .shutdown => {},
+        .xrun => {},
+        .sample_rate_changed, .buffer_size_changed => try input.refresh(),
+        .ports_changed => try input.refresh(),
+        .shutdown => {},
     };
 }

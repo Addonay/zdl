@@ -284,7 +284,7 @@ fn byte_count(spec: audio.Spec, frames: usize) Error!usize {
     return std.math.mul(usize, try spec.frame_size(), frames) catch error.Overflow;
 }
 fn silence(format: audio.Format) u8 {
-    return if (format == .unsigned8) 128 else 0;
+    return format.silence_byte();
 }
 fn overlaps(a: []const u8, b: []const u8) bool {
     if (a.len == 0 or b.len == 0) return false;

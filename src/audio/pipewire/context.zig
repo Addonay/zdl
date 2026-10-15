@@ -22,7 +22,9 @@
 //! Ownership: a `Connection` borrows the `Library`, which must outlive
 //! it. Streams created from the connection must be destroyed before it.
 const std = @import("std");
+const builtin = @import("builtin");
 const binding = @import("binding.zig");
+const pod = @import("pod.zig");
 
 /// Loader for libpipewire-0.3. Must outlive every `Connection` made from it and
 /// must not move while a Connection borrows it.
@@ -66,6 +68,8 @@ pub const Device = struct {
     name: []u8,
     /// Human-readable `node.description`, falling back to the node nick or name.
     description: []u8,
+    /// True when the session manager marks this source as a sink monitor.
+    monitor: bool,
 };
 
 /// Owned snapshot of devices. Free with `deinit`.
@@ -124,6 +128,7 @@ const Node = struct {
     class: Class,
     name: []u8,
     description: []u8,
+    monitor: bool,
 };
 
 /// Heap-allocated state shared with PipeWire callbacks. The address must stay
@@ -142,6 +147,7 @@ pub const Shared = struct {
     metadata_proxy: ?*binding.Proxy = null,
     metadata_id: ?u32 = null,
     sync_sequence: c_int = 1,
+    sync_done: bool = false,
     initial_done: bool = false,
     /// Set when an allocation failed inside a callback; the event is lost.
     lost_event: bool = false,
@@ -158,6 +164,7 @@ pub const Shared = struct {
     /// Core `done` for the initial sync: wake the thread waiting in `open`.
     pub fn on_done(self: *Shared, id: u32, seq: c_int) void {
         if (id != 0 or seq != self.sync_sequence) return;
+        self.sync_done = true;
         self.initial_done = true;
         self.library.signal(self.thread);
     }
@@ -226,7 +233,8 @@ pub const Shared = struct {
             self.allocator.free(name);
             return self.lost();
         };
-        const node: Node = .{ .class = class, .name = name, .description = description };
+        const monitor = std.mem.eql(u8, props.get("device.class") orelse "", "monitor") or is_true(props.get("node.monitor")) or is_true(props.get("stream.monitor"));
+        const node: Node = .{ .class = class, .name = name, .description = description, .monitor = monitor };
         const previous = self.nodes.fetchPut(self.allocator, id, node) catch {
             self.free_node(node);
             return self.lost();
@@ -335,9 +343,10 @@ pub const Connection = struct {
 
         library.lock(loop_thread);
         defer library.unlock(loop_thread);
+        shared.sync_done = false;
         shared.sync_sequence = try library.core_sync(core, shared.sync_sequence);
         const deadline = try library.deadline(loop_thread, @as(i64, options.timeout_seconds) * std.time.ns_per_s);
-        while (!shared.initial_done) {
+        while (!shared.sync_done) {
             if (try library.expired(loop_thread, deadline)) return error.Unavailable;
             _ = try library.wait_until(loop_thread, deadline);
         }
@@ -393,6 +402,40 @@ pub const Connection = struct {
         return try allocator.dupe(u8, name);
     }
 
+    /// Queries the EnumFormat pods advertised by one node. The returned
+    /// capabilities are values and own no PipeWire memory. `null` means the
+    /// node had no readable raw-audio EnumFormat params; callers can still ask
+    /// PipeWire to negotiate from their preferred spec.
+    pub fn node_capabilities(self: *Connection, class: Class, name: []const u8) Error!?pod.Capabilities {
+        self.lock();
+        defer self.unlock();
+        var node_id: ?u32 = null;
+        var iterator = self.shared.nodes.iterator();
+        while (iterator.next()) |entry| {
+            if (entry.value_ptr.class == class and std.mem.eql(u8, entry.value_ptr.name, name)) {
+                node_id = entry.key_ptr.*;
+                break;
+            }
+        }
+        const id = node_id orelse return null;
+        const proxy = try self.library.registry_bind(self.shared.registry, id, "PipeWire:Interface:Node", binding.version_node);
+        defer self.library.proxy_destroy(proxy);
+        var request: NodeFormatRequest = .{};
+        var hook: binding.Hook = .{};
+        self.library.node_listener(proxy, &hook, &node_format_events, &request);
+        try self.library.node_enum_formats(proxy);
+
+        self.shared.sync_done = false;
+        self.shared.sync_sequence = try self.library.core_sync(self.shared.core, self.shared.sync_sequence +% 1);
+        const deadline = try self.library.deadline(self.shared.thread, 5 * std.time.ns_per_s);
+        while (!self.shared.sync_done) {
+            if (try self.library.expired(self.shared.thread, deadline)) return error.Timeout;
+            _ = try self.library.wait_until(self.shared.thread, deadline);
+        }
+        if (request.failed) return error.Failed;
+        return request.capabilities;
+    }
+
     /// Takes the queued changes since the previous call. Events are reported in
     /// the order they arrived. Empty lists are normal and cost no allocation.
     pub fn poll_events(self: *Connection, allocator: std.mem.Allocator) Error!EventList {
@@ -444,16 +487,53 @@ pub const Connection = struct {
     }
 };
 
+const NodeFormatRequest = struct {
+    capabilities: ?pod.Capabilities = null,
+    failed: bool = false,
+
+    fn from_callback(data: ?*anyopaque) *NodeFormatRequest {
+        return @ptrCast(@alignCast(data.?));
+    }
+
+    fn param(self: *NodeFormatRequest, id: u32, raw: ?*const anyopaque) void {
+        if (id != pod.param_enum_format) return;
+        const ptr: [*]const u8 = @ptrCast(raw orelse return);
+        const size = std.mem.readInt(u32, ptr[0..4], builtin.target.cpu.arch.endian());
+        if (size > 65536) return self.fail();
+        const total = std.math.add(usize, 8, size) catch return self.fail();
+        const parsed = pod.read_enum_format(ptr[0..total]) catch return self.fail();
+        if (self.capabilities) |*previous|
+            previous.merge(parsed)
+        else
+            self.capabilities = parsed;
+    }
+
+    fn fail(self: *NodeFormatRequest) void {
+        self.failed = true;
+    }
+};
+
+fn node_format_param(data: ?*anyopaque, _: c_int, id: u32, _: u32, _: u32, param: ?*const anyopaque) callconv(.c) void {
+    NodeFormatRequest.from_callback(data).param(id, param);
+}
+
+const node_format_events: binding.NodeEvents = .{ .param = node_format_param };
+
 fn copy_device(allocator: std.mem.Allocator, id: u32, node: Node) std.mem.Allocator.Error!Device {
     const name = try allocator.dupe(u8, node.name);
     errdefer allocator.free(name);
     const description = try allocator.dupe(u8, node.description);
-    return .{ .id = id, .class = node.class, .name = name, .description = description };
+    return .{ .id = id, .class = node.class, .name = name, .description = description, .monitor = node.monitor };
+}
+
+fn is_true(value: ?[]const u8) bool {
+    const text = value orelse return false;
+    return std.mem.eql(u8, text, "true") or std.mem.eql(u8, text, "1");
 }
 
 fn copy_event(allocator: std.mem.Allocator, event: Event) std.mem.Allocator.Error!Event {
     return switch (event) {
-        .device_added => |device| .{ .device_added = try copy_device(allocator, device.id, .{ .class = device.class, .name = device.name, .description = device.description }) },
+        .device_added => |device| .{ .device_added = try copy_device(allocator, device.id, .{ .class = device.class, .name = device.name, .description = device.description, .monitor = device.monitor }) },
         .device_removed => |id| .{ .device_removed = id },
         .default_changed => |change| .{ .default_changed = .{ .class = change.class, .name = try allocator.dupe(u8, change.name) } },
     };

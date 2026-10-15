@@ -20,11 +20,11 @@
 //!
 //! Format and timing:
 //!   JACK fixes the format: 32-bit float in native byte order, one buffer per
-//!   port. `spec()` reports the server sample rate and the device's channel
-//!   count at open. `period_frames()` is the server's live period, and changes
-//!   when JACK changes its buffer size. A sample-rate change is reported as an
-//!   event but does not reconfigure the device: `spec()` keeps the opened rate
-//!   and the caller reopens. (SDL reconfigures streams in place instead.)
+//!   port. `spec()` reports the server sample rate from open or the last
+//!   `refresh`, and the device's fixed channel count. `period_frames()` is the live period, and changes
+//!   when JACK changes its buffer size. After rate, buffer-size or port events,
+//!   the owner calls `refresh` to reconfigure bound streams and remap physical
+//!   ports in place without replacing the JACK client.
 //!
 //! Realtime path:
 //!   JACK calls `process` on its own realtime thread. Each device keeps a
@@ -37,7 +37,7 @@
 //!   `pump` never blocks; `wait` polls with a 1 ms sleep up to the timeout.
 //!
 //! Events: `poll_event` returns JACK-side notifications (xruns, shutdown,
-//! sample-rate and buffer-size changes) from atomics written by the callbacks.
+//! sample-rate, buffer-size and port-registration changes) from callback atomics.
 //! Repeated xruns are coalesced into a count between polls. Shutdown makes
 //! `pump` and `wait` fail with `error.Disconnected`.
 //!
@@ -115,12 +115,14 @@ pub const Options = struct {
 pub const Event = union(enum) {
     /// JACK reported this many xruns (missed cycles) since the previous poll.
     xrun: u32,
-    /// The server changed its sample rate. The device keeps the opened rate.
+    /// The server changed its sample rate; `refresh` applies it to the device.
     sample_rate_changed: u32,
     /// The server changed its buffer size; `period_frames` reports the new value.
     buffer_size_changed: u32,
     /// The JACK server shut down or dropped the client.
     shutdown,
+    /// A JACK port changed; call `refresh` to reconcile the endpoint mapping.
+    ports_changed,
 };
 
 /// One physical device: the physical audio ports of one JACK client.
@@ -213,6 +215,58 @@ fn select_device(devices: []const Device, endpoint: ?[]const u8) Error!*const De
     return &devices[0];
 }
 
+fn free_port_names(comptime channels: usize, allocator: std.mem.Allocator, names: *[channels]?[:0]u8) void {
+    for (names) |maybe_name| if (maybe_name) |name| allocator.free(name);
+}
+
+/// Connects changed local ports to a new physical mapping before disconnecting
+/// old peers. On connection failure, newly added graph edges are rolled back.
+fn reconcile_ports(comptime channels: usize, comptime direction: Direction, allocator: std.mem.Allocator, client: *binding.Client, local_ports: [channels]?*binding.PortHandle, previous: [channels]?[:0]u8, requested: []const [:0]u8) Error![channels]?[:0]u8 {
+    var next: [channels]?[:0]u8 = @splat(null);
+    errdefer free_port_names(channels, allocator, &next);
+    var connected: [channels]bool = @splat(false);
+    errdefer for (connected, 0..) |did_connect, index| {
+        if (!did_connect) continue;
+        const local = local_ports[index] orelse continue;
+        const local_name = client.port_full_name(local) catch continue;
+        const remote_name = next[index] orelse continue;
+        switch (direction) {
+            .playback => client.disconnect(local_name, remote_name.ptr),
+            .capture => client.disconnect(remote_name.ptr, local_name),
+        }
+    };
+
+    for (0..@min(channels, requested.len)) |index| {
+        const name = try allocator.dupeSentinel(u8, requested[index], 0);
+        next[index] = name;
+        const local = local_ports[index] orelse return error.PortUnavailable;
+        if (previous[index]) |old| {
+            if (std.mem.eql(u8, old, name)) {
+                const is_connected = client.port_connected_to(local, name.ptr);
+                if (is_connected == null or is_connected == true) continue;
+            }
+        }
+        const local_name = try client.port_full_name(local);
+        switch (direction) {
+            .playback => try client.connect(local_name, name.ptr),
+            .capture => try client.connect(name.ptr, local_name),
+        }
+        connected[index] = true;
+    }
+
+    for (previous, 0..) |maybe_old, index| {
+        const old = maybe_old orelse continue;
+        if (next[index]) |replacement| if (std.mem.eql(u8, old, replacement)) continue;
+        const local = local_ports[index] orelse continue;
+        const local_name = client.port_full_name(local) catch continue;
+        switch (direction) {
+            .playback => client.disconnect(local_name, old.ptr),
+            .capture => client.disconnect(old.ptr, local_name),
+        }
+    }
+    return next;
+}
+
 /// Values shared between the owner and the JACK thread that do not need a ring.
 /// The callback writes them with atomics; the owner polls them. `xruns_reported`
 /// is touched only by the owner, in `poll`.
@@ -230,6 +284,8 @@ const Control = struct {
     rate_pending: std.atomic.Value(u32),
     /// New buffer size waiting for `poll` (0: none).
     buffer_pending: std.atomic.Value(u32),
+    /// A physical or local JACK port was registered or unregistered.
+    ports_changed_pending: std.atomic.Value(bool),
     /// Playback underruns (cycles without enough ring data) or capture overruns
     /// (cycles dropped because the ring was full). Incremented by the callback.
     ring_faults: std.atomic.Value(usize),
@@ -242,6 +298,7 @@ const Control = struct {
             .xruns = .init(0),
             .rate_pending = .init(0),
             .buffer_pending = .init(0),
+            .ports_changed_pending = .init(false),
             .ring_faults = .init(0),
         };
     }
@@ -261,6 +318,7 @@ const Control = struct {
         if (rate != 0) return .{ .sample_rate_changed = rate };
         const period = self.buffer_pending.swap(0, .acq_rel);
         if (period != 0) return .{ .buffer_size_changed = period };
+        if (self.ports_changed_pending.swap(false, .acq_rel)) return .ports_changed;
         const total = self.xruns.load(.acquire);
         if (total != self.xruns_reported) {
             const delta = total -% self.xruns_reported;
@@ -360,6 +418,10 @@ fn Shared(comptime channels: usize, comptime direction: Direction) type {
             self.control.buffer_pending.store(frames, .release);
         }
 
+        pub fn jack_ports_changed(self: *Self) void {
+            self.control.ports_changed_pending.store(true, .release);
+        }
+
         /// Copies `frames` frames from the ring into the port buffers. Missing
         /// frames become silence and count as one ring fault for the cycle.
         fn play(self: *Self, frames: u32) void {
@@ -450,8 +512,10 @@ pub fn Output(comptime layout: audio.Layout) type {
 
         allocator: std.mem.Allocator,
         name: [:0]u8,
+        follows_default: bool,
         client: binding.Client,
         state: *State,
+        remote_ports: [channels]?[:0]u8,
         spec_value: audio.Spec,
         /// Bound streams, gain, pause and mixing (scratch sized like the ring).
         mixer: Mixer,
@@ -479,11 +543,8 @@ pub fn Output(comptime layout: audio.Layout) type {
             try client.install(State, state);
             try client.activate();
             errdefer client.deactivate();
-            for (state.ports, 0..) |maybe_port, index| {
-                if (index >= chosen.ports.items.len) break;
-                const port = maybe_port orelse return error.PortUnavailable;
-                try client.connect(try client.port_full_name(port), chosen.ports.items[index].ptr);
-            }
+            var remote_ports = try reconcile_ports(channels, .playback, allocator, &client, state.ports, @splat(null), chosen.ports.items);
+            errdefer free_port_names(channels, allocator, &remote_ports);
 
             const spec_value: audio.Spec = .{ .format = native_format, .channels = channel_count, .sample_rate = client.sample_rate() };
             var mixer = try Mixer.init(allocator, spec_value, state.scratch.len);
@@ -491,8 +552,10 @@ pub fn Output(comptime layout: audio.Layout) type {
             return .{
                 .allocator = allocator,
                 .name = name,
+                .follows_default = options.endpoint == null,
                 .client = client,
                 .state = state,
+                .remote_ports = remote_ports,
                 .spec_value = spec_value,
                 .mixer = mixer,
             };
@@ -505,6 +568,7 @@ pub fn Output(comptime layout: audio.Layout) type {
             self.client.close();
             self.state.destroy();
             self.mixer.deinit();
+            free_port_names(channels, self.allocator, &self.remote_ports);
             self.allocator.free(self.name);
             self.* = undefined;
         }
@@ -514,7 +578,46 @@ pub fn Output(comptime layout: audio.Layout) type {
             return self.name;
         }
 
-        /// Format, channels and sample rate fixed at open.
+        /// True when this output uses JACK's default (`system` or first client).
+        pub fn opened_as_default(self: *const Self) bool {
+            return self.follows_default;
+        }
+
+        /// Applies current JACK server rate and physical port layout in place.
+        /// Call after handling sample-rate, buffer-size or ports-changed events.
+        /// Bound producer queues survive the format boundary; stale ring audio
+        /// is discarded before it could play at a different server rate.
+        pub fn refresh(self: *Self) Error!void {
+            if (self.state.control.is_disconnected()) return error.Disconnected;
+            const new_rate = self.client.sample_rate();
+            if (new_rate == 0) return error.Disconnected;
+            if (new_rate != self.spec_value.sample_rate) {
+                try self.drop();
+                var replacement = self.spec_value;
+                replacement.sample_rate = new_rate;
+                try self.mixer.reconfigure(replacement, self.state.scratch.len);
+                self.spec_value = replacement;
+            }
+
+            var devices = try list_devices(self.allocator, &self.client, .playback);
+            defer devices.deinit();
+            const chosen = try select_device(devices.items, if (self.follows_default) null else self.name);
+            const changed_name = !std.mem.eql(u8, self.name, chosen.name);
+            const new_name = if (changed_name) try self.allocator.dupeSentinel(u8, chosen.name, 0) else self.name;
+            errdefer if (changed_name) self.allocator.free(new_name);
+            const remote_ports = try reconcile_ports(channels, .playback, self.allocator, &self.client, self.state.ports, self.remote_ports, chosen.ports.items);
+
+            var old_ports = self.remote_ports;
+            self.remote_ports = remote_ports;
+            if (changed_name) {
+                const old_name = self.name;
+                self.name = new_name;
+                self.allocator.free(old_name);
+            }
+            free_port_names(channels, self.allocator, &old_ports);
+        }
+
+        /// Format/channel count fixed at open and sample rate from the last refresh.
         pub fn spec(self: *const Self) audio.Spec {
             return self.spec_value;
         }
@@ -630,8 +733,10 @@ pub fn Input(comptime layout: audio.Layout) type {
 
         allocator: std.mem.Allocator,
         name: [:0]u8,
+        follows_default: bool,
         client: binding.Client,
         state: *State,
+        remote_ports: [channels]?[:0]u8,
         spec_value: audio.Spec,
         /// Bound destination streams and the owner-side copy of captured frames
         /// (sized like the ring).
@@ -658,11 +763,8 @@ pub fn Input(comptime layout: audio.Layout) type {
             try client.install(State, state);
             try client.activate();
             errdefer client.deactivate();
-            for (state.ports, 0..) |maybe_port, index| {
-                if (index >= chosen.ports.items.len) break;
-                const port = maybe_port orelse return error.PortUnavailable;
-                try client.connect(chosen.ports.items[index].ptr, try client.port_full_name(port));
-            }
+            var remote_ports = try reconcile_ports(channels, .capture, allocator, &client, state.ports, @splat(null), chosen.ports.items);
+            errdefer free_port_names(channels, allocator, &remote_ports);
 
             const spec_value: audio.Spec = .{ .format = native_format, .channels = channel_count, .sample_rate = client.sample_rate() };
             var fanout = try Fanout.init(allocator, spec_value, state.scratch.len);
@@ -670,8 +772,10 @@ pub fn Input(comptime layout: audio.Layout) type {
             return .{
                 .allocator = allocator,
                 .name = name,
+                .follows_default = options.endpoint == null,
                 .client = client,
                 .state = state,
+                .remote_ports = remote_ports,
                 .spec_value = spec_value,
                 .fanout = fanout,
             };
@@ -684,6 +788,7 @@ pub fn Input(comptime layout: audio.Layout) type {
             self.client.close();
             self.state.destroy();
             self.fanout.deinit();
+            free_port_names(channels, self.allocator, &self.remote_ports);
             self.allocator.free(self.name);
             self.* = undefined;
         }
@@ -693,7 +798,44 @@ pub fn Input(comptime layout: audio.Layout) type {
             return self.name;
         }
 
-        /// Format, channels and sample rate fixed at open.
+        /// True when this input uses JACK's default (`system` or first client).
+        pub fn opened_as_default(self: *const Self) bool {
+            return self.follows_default;
+        }
+
+        /// Applies the current JACK rate and physical capture-port layout in
+        /// place. Call after rate, buffer-size or ports-changed events.
+        pub fn refresh(self: *Self) Error!void {
+            if (self.state.control.is_disconnected()) return error.Disconnected;
+            const new_rate = self.client.sample_rate();
+            if (new_rate == 0) return error.Disconnected;
+            if (new_rate != self.spec_value.sample_rate) {
+                self.state.ring.discard();
+                var replacement = self.spec_value;
+                replacement.sample_rate = new_rate;
+                try self.fanout.reconfigure(replacement, self.state.scratch.len);
+                self.spec_value = replacement;
+            }
+
+            var devices = try list_devices(self.allocator, &self.client, .capture);
+            defer devices.deinit();
+            const chosen = try select_device(devices.items, if (self.follows_default) null else self.name);
+            const changed_name = !std.mem.eql(u8, self.name, chosen.name);
+            const new_name = if (changed_name) try self.allocator.dupeSentinel(u8, chosen.name, 0) else self.name;
+            errdefer if (changed_name) self.allocator.free(new_name);
+            const remote_ports = try reconcile_ports(channels, .capture, self.allocator, &self.client, self.state.ports, self.remote_ports, chosen.ports.items);
+
+            var old_ports = self.remote_ports;
+            self.remote_ports = remote_ports;
+            if (changed_name) {
+                const old_name = self.name;
+                self.name = new_name;
+                self.allocator.free(old_name);
+            }
+            free_port_names(channels, self.allocator, &old_ports);
+        }
+
+        /// Format/channel count fixed at open and sample rate from the last refresh.
         pub fn spec(self: *const Self) audio.Spec {
             return self.spec_value;
         }
@@ -771,4 +913,15 @@ pub fn Input(comptime layout: audio.Layout) type {
             return self.state.control.ring_faults.load(.monotonic);
         }
     };
+}
+
+test "JACK control coalesces configuration and port change notifications" {
+    var control = Control.init(128);
+    control.rate_pending.store(48000, .release);
+    control.buffer_pending.store(256, .release);
+    control.ports_changed_pending.store(true, .release);
+    try std.testing.expectEqual(@as(u32, 48000), control.poll().?.sample_rate_changed);
+    try std.testing.expectEqual(@as(u32, 256), control.poll().?.buffer_size_changed);
+    try std.testing.expect(control.poll().? == .ports_changed);
+    try std.testing.expect(control.poll() == null);
 }

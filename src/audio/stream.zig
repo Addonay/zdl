@@ -95,6 +95,21 @@ pub fn Stream(comptime source_layout: audio.Layout, comptime destination_layout:
             return .{ .format = self.options.format, .sample_rate = self.options.sample_rate, .channels = destination_channels };
         }
 
+        /// Changes the device-facing format and rate after a physical device
+        /// migration. Queued producer audio is retained; already converted
+        /// pending output and resampler phase are discarded at the boundary.
+        /// The destination channel count is fixed by this stream's type.
+        pub fn reconfigure_destination(self: *Self, spec: audio.Spec) Error!void {
+            try spec.validate();
+            if (spec.channels != destination_channels) return error.InvalidChannels;
+            self.options.format = spec.format;
+            self.options.sample_rate = spec.sample_rate;
+            self.resampler.reset();
+            self.active = false;
+            self.pending_cursor = 0;
+            self.pending_length = 0;
+        }
+
         /// Copies complete input frames. Rate/format/effective-map changes flush
         /// the previous input stream automatically. Failure appends nothing.
         pub fn write(self: *Self, source: Source, bytes: []const u8) Error!void {

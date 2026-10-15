@@ -161,16 +161,22 @@ pub const BufferAttr = extern struct {
     fragsize: u32,
 };
 
-/// Prefix of pa_sink_info (introspect.h). Fields after channel_map are never read.
+/// Prefix of pa_sink_info (introspect.h) through latency.
 pub const RawSinkInfo = extern struct {
     name: ?[*:0]const u8,
     index: u32,
     description: ?[*:0]const u8,
     sample_spec: SampleSpec,
     channel_map: ChannelMap,
+    owner_module: u32,
+    volume: CVolume,
+    mute: c_int,
+    monitor_source: u32,
+    monitor_source_name: ?[*:0]const u8,
+    latency: u64,
 };
 
-/// Prefix of pa_source_info (introspect.h) through monitor_of_sink.
+/// Prefix of pa_source_info (introspect.h) through latency.
 pub const RawSourceInfo = extern struct {
     name: ?[*:0]const u8,
     index: u32,
@@ -181,6 +187,8 @@ pub const RawSourceInfo = extern struct {
     volume: CVolume,
     mute: c_int,
     monitor_of_sink: u32,
+    monitor_of_sink_name: ?[*:0]const u8,
+    latency: u64,
 };
 
 /// Prefix of pa_server_info (introspect.h) through the default device names.
@@ -238,6 +246,8 @@ pub const Functions = struct {
     context_disconnect: *const fn (*PaContext) callconv(.c) void,
     context_unref: *const fn (*PaContext) callconv(.c) void,
     context_get_server_info: *const fn (*PaContext, ServerInfoNotify, ?*anyopaque) callconv(.c) ?*Operation,
+    context_set_sink_volume_by_index: *const fn (*PaContext, u32, *const CVolume, ?ContextSuccess, ?*anyopaque) callconv(.c) ?*Operation,
+    context_set_source_volume_by_index: *const fn (*PaContext, u32, *const CVolume, ?ContextSuccess, ?*anyopaque) callconv(.c) ?*Operation,
     context_get_sink_info_list: *const fn (*PaContext, SinkInfoNotify, ?*anyopaque) callconv(.c) ?*Operation,
     context_get_source_info_list: *const fn (*PaContext, SourceInfoNotify, ?*anyopaque) callconv(.c) ?*Operation,
     context_get_sink_info_by_index: *const fn (*PaContext, u32, SinkInfoNotify, ?*anyopaque) callconv(.c) ?*Operation,
@@ -255,6 +265,7 @@ pub const Functions = struct {
     stream_unref: *const fn (*StreamHandle) callconv(.c) void,
     stream_get_state: *const fn (*const StreamHandle) callconv(.c) StreamState,
     stream_get_buffer_attr: *const fn (*StreamHandle) callconv(.c) ?*const BufferAttr,
+    stream_get_latency: *const fn (*StreamHandle, *u64, *c_int) callconv(.c) c_int,
     stream_writable_size: *const fn (*const StreamHandle) callconv(.c) usize,
     stream_readable_size: *const fn (*const StreamHandle) callconv(.c) usize,
     stream_write: *const fn (*StreamHandle, *const anyopaque, usize, ?*anyopaque, i64, i32) callconv(.c) c_int,
@@ -263,6 +274,8 @@ pub const Functions = struct {
     stream_cork: *const fn (*StreamHandle, c_int, ?StreamSuccess, ?*anyopaque) callconv(.c) ?*Operation,
     stream_peek: *const fn (*StreamHandle, *?*const anyopaque, *usize) callconv(.c) c_int,
     stream_drop: *const fn (*StreamHandle) callconv(.c) c_int,
+    cvolume_set: *const fn (*CVolume, u32, u32) callconv(.c) ?*CVolume,
+    sw_volume_from_linear: *const fn (f64) callconv(.c) u32,
 };
 
 /// An opened libpulse shared object and its resolved function table. Load once
@@ -360,6 +373,12 @@ pub fn on_request_server_info(_: *PaContext, info: ?*const RawServerInfo, userda
     pulse_context.Request.from_userdata(userdata).set_server(server.default_sink_name, server.default_source_name);
 }
 
+/// Completion callback for a server volume change.
+pub fn on_volume_success(_: *PaContext, success: c_int, userdata: ?*anyopaque) callconv(.c) void {
+    const request: *pulse_context.VolumeRequest = @ptrCast(@alignCast(userdata.?));
+    request.complete(success != 0);
+}
+
 pub fn on_request_sink(_: *PaContext, info: ?*const RawSinkInfo, _: c_int, userdata: ?*anyopaque) callconv(.c) void {
     const sink = info orelse return;
     pulse_context.Request.from_userdata(userdata).add(.playback, sink_device(sink));
@@ -378,6 +397,9 @@ fn sink_device(info: *const RawSinkInfo) pulse_context.RawDevice {
         .sample_spec = info.sample_spec,
         .channel_map = info.channel_map,
         .monitor_of_sink = null,
+        .volume = info.volume,
+        .muted = info.mute != 0,
+        .latency_microseconds = info.latency,
     };
 }
 
@@ -389,5 +411,8 @@ fn source_device(info: *const RawSourceInfo) pulse_context.RawDevice {
         .sample_spec = info.sample_spec,
         .channel_map = info.channel_map,
         .monitor_of_sink = if (info.monitor_of_sink == invalid_index) null else info.monitor_of_sink,
+        .volume = info.volume,
+        .muted = info.mute != 0,
+        .latency_microseconds = info.latency,
     };
 }

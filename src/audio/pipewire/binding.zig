@@ -40,6 +40,23 @@ pub const Properties = opaque {};
 pub const Context = opaque {};
 pub const Stream = opaque {};
 
+/// `struct pw_time` from pipewire/stream.h. For raw audio, delay, queued and
+/// buffered are expressed in frames at `rate`.
+pub const StreamTime = extern struct {
+    now: i64,
+    rate: extern struct { num: u32, den: u32 },
+    ticks: u64,
+    delay: i64,
+    queued: u64,
+    buffered: u64,
+    queued_buffers: u32,
+    available_buffers: u32,
+    size: u64,
+};
+comptime {
+    if (@sizeOf(StreamTime) != 64 or @alignOf(StreamTime) != 8) @compileError("pw_time ABI layout mismatch");
+}
+
 /// Absolute time in CLOCK_MONOTONIC. Construct once
 /// per finite wait and reuse after every signal, including spurious ones.
 pub const Deadline = struct {
@@ -142,6 +159,13 @@ const RegistryMethods = extern struct {
     destroy: *const fn (?*anyopaque, u32) callconv(.c) c_int,
 };
 
+const NodeMethods = extern struct {
+    version: u32,
+    add_listener: ?*const anyopaque,
+    subscribe_params: ?*const anyopaque,
+    enum_params: *const fn (?*anyopaque, c_int, u32, u32, u32, ?*const anyopaque) callconv(.c) c_int,
+};
+
 /// `struct spa_interface` header; the callbacks pair follows at offset 16.
 const SpaInterface = extern struct {
     kind: ?*anyopaque,
@@ -200,6 +224,12 @@ const MetadataEvents = extern struct {
     property: *const fn (?*anyopaque, u32, ?[*:0]const u8, ?[*:0]const u8, ?[*:0]const u8) callconv(.c) c_int,
 };
 
+pub const NodeEvents = extern struct {
+    version: u32 = 0,
+    info: ?*const anyopaque = null,
+    param: *const fn (?*anyopaque, c_int, u32, u32, u32, ?*const anyopaque) callconv(.c) void,
+};
+
 const StreamEvents = extern struct {
     version: u32 = 2,
     destroy: ?*const anyopaque = null,
@@ -231,6 +261,7 @@ pub const stream_state_streaming: c_int = 3;
 /// PipeWire when binding objects.
 pub const version_registry: u32 = 3;
 pub const version_metadata: u32 = 3;
+pub const version_node: u32 = 3;
 
 const Functions = struct {
     init: *const fn (?*c_int, ?*anyopaque) callconv(.c) void,
@@ -259,6 +290,8 @@ const Functions = struct {
     stream_destroy: *const fn (*Stream) callconv(.c) void,
     stream_connect: *const fn (*Stream, c_int, u32, u32, ?[*]const *const anyopaque, u32) callconv(.c) c_int,
     stream_disconnect: *const fn (*Stream) callconv(.c) c_int,
+    stream_set_active: *const fn (*Stream, bool) callconv(.c) c_int,
+    stream_get_time_n: *const fn (*Stream, *StreamTime, usize) callconv(.c) c_int,
     stream_dequeue_buffer: *const fn (*Stream) callconv(.c) ?*Buffer,
     stream_queue_buffer: *const fn (*Stream, *Buffer) callconv(.c) c_int,
 };
@@ -414,6 +447,16 @@ pub const Library = struct {
     pub fn proxy_listener(self: *Library, proxy: *Proxy, hook: *Hook, events: *const MetadataEvents, data: ?*anyopaque) void {
         self.functions.proxy_add_object_listener(proxy, hook, events, data);
     }
+    pub fn node_listener(self: *Library, proxy: *Proxy, hook: *Hook, events: *const NodeEvents, data: ?*anyopaque) void {
+        self.functions.proxy_add_object_listener(proxy, hook, events, data);
+    }
+    /// Starts enumeration of a bound node's SPA_PARAM_EnumFormat pods.
+    pub fn node_enum_formats(self: *Library, proxy: *Proxy) Error!void {
+        _ = self;
+        const interface: *SpaInterface = @ptrCast(@alignCast(proxy));
+        const methods: *const NodeMethods = @ptrCast(@alignCast(interface.funcs.?));
+        if (methods.enum_params(interface.data, 0, 3, 0, 0, null) < 0) return error.Failed;
+    }
     pub fn proxy_destroy(self: *Library, proxy: *Proxy) void {
         self.functions.proxy_destroy(proxy);
     }
@@ -440,6 +483,14 @@ pub const Library = struct {
     }
     pub fn stream_disconnect(self: *Library, stream_object: *Stream) void {
         _ = self.functions.stream_disconnect(stream_object);
+    }
+    pub fn stream_set_active(self: *Library, stream_object: *Stream, active: bool) Error!void {
+        if (self.functions.stream_set_active(stream_object, active) < 0) return error.Failed;
+    }
+    pub fn stream_time(self: *Library, stream_object: *Stream) Error!StreamTime {
+        var result: StreamTime = undefined;
+        if (self.functions.stream_get_time_n(stream_object, &result, @sizeOf(StreamTime)) < 0) return error.Failed;
+        return result;
     }
     /// Returns null when no buffer is available; pair with queue_buffer.
     pub fn stream_dequeue(self: *Library, stream_object: *Stream) ?*Buffer {

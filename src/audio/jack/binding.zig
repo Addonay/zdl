@@ -61,15 +61,18 @@ const Functions = struct {
     set_xrun_callback: *const fn (*ClientHandle, *const fn (?*anyopaque) callconv(.c) c_int, ?*anyopaque) callconv(.c) c_int,
     set_sample_rate_callback: *const fn (*ClientHandle, *const fn (u32, ?*anyopaque) callconv(.c) c_int, ?*anyopaque) callconv(.c) c_int,
     set_buffer_size_callback: *const fn (*ClientHandle, *const fn (u32, ?*anyopaque) callconv(.c) c_int, ?*anyopaque) callconv(.c) c_int,
+    set_port_registration_callback: ?*const fn (*ClientHandle, *const fn (u32, c_int, ?*anyopaque) callconv(.c) void, ?*anyopaque) callconv(.c) c_int,
     get_sample_rate: *const fn (*ClientHandle) callconv(.c) u32,
     get_buffer_size: *const fn (*ClientHandle) callconv(.c) u32,
     port_register: *const fn (*ClientHandle, [*:0]const u8, [*:0]const u8, c_ulong, c_ulong) callconv(.c) ?*PortHandle,
     port_by_name: *const fn (*ClientHandle, [*:0]const u8) callconv(.c) ?*PortHandle,
     port_name: *const fn (*const PortHandle) callconv(.c) ?[*:0]const u8,
     port_type: *const fn (*const PortHandle) callconv(.c) ?[*:0]const u8,
+    port_connected_to: ?*const fn (*const PortHandle, [*:0]const u8) callconv(.c) c_int,
     port_get_buffer: *const fn (*PortHandle, u32) callconv(.c) ?*anyopaque,
     get_ports: *const fn (*ClientHandle, ?[*:0]const u8, ?[*:0]const u8, c_ulong) callconv(.c) ?[*:null]?[*:0]const u8,
     connect: *const fn (*ClientHandle, [*:0]const u8, [*:0]const u8) callconv(.c) c_int,
+    disconnect: *const fn (*ClientHandle, [*:0]const u8, [*:0]const u8) callconv(.c) c_int,
     free: *const fn (?*anyopaque) callconv(.c) void,
 };
 
@@ -141,6 +144,11 @@ pub fn Callbacks(comptime Target: type) type {
             target.jack_buffer_size(frames);
             return 0;
         }
+
+        fn port_registration(_: u32, _: c_int, arg: ?*anyopaque) callconv(.c) void {
+            const target: *Target = @ptrCast(@alignCast(arg.?));
+            target.jack_ports_changed();
+        }
     };
 }
 
@@ -175,6 +183,9 @@ pub const Client = struct {
         if (functions.set_sample_rate_callback(self.raw, hooks.sample_rate, target) != 0) return error.CallbackFailed;
         if (functions.set_process_callback(self.raw, hooks.process, target) != 0) return error.CallbackFailed;
         if (functions.set_xrun_callback(self.raw, hooks.xrun, target) != 0) return error.CallbackFailed;
+        if (functions.set_port_registration_callback) |set_port_registration| {
+            if (set_port_registration(self.raw, hooks.port_registration, target) != 0) return error.CallbackFailed;
+        }
         functions.on_shutdown(self.raw, hooks.shutdown, target);
     }
 
@@ -214,6 +225,18 @@ pub const Client = struct {
     /// unknown ports or wrong directions as a failure.
     pub fn connect(self: *Client, source: [*:0]const u8, destination: [*:0]const u8) Error!void {
         if (self.library.functions.connect(self.raw, source, destination) != 0) return error.ConnectFailed;
+    }
+
+    /// Disconnects two port names. A missing old connection is harmless when
+    /// reconciling a device whose graph changed between enumeration and refresh.
+    pub fn disconnect(self: *Client, source: [*:0]const u8, destination: [*:0]const u8) void {
+        _ = self.library.functions.disconnect(self.raw, source, destination);
+    }
+
+    /// Whether `port` currently has a graph edge to the named port.
+    pub fn port_connected_to(self: *const Client, port: *const PortHandle, other: [*:0]const u8) ?bool {
+        const connected_to = self.library.functions.port_connected_to orelse return null;
+        return connected_to(port, other) > 0;
     }
 
     /// True when the named port exists and its type is an audio type (ends in "audio").

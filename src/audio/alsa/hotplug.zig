@@ -167,3 +167,14 @@ fn free_endpoint(allocator: std.mem.Allocator, endpoint: device.Endpoint) void {
     allocator.free(endpoint.name);
     allocator.free(endpoint.description);
 }
+
+test "ALSA default selection prefers the alias and skips capture-only entries" {
+    const endpoints = [_]device.Endpoint{
+        .{ .name = "capture-only", .description = "input", .supports_playback = false, .supports_capture = true },
+        .{ .name = "speaker-a", .description = "first output", .supports_playback = true, .supports_capture = false },
+        .{ .name = "default", .description = "configured output", .supports_playback = true, .supports_capture = true },
+    };
+    try std.testing.expectEqualStrings("default", choose_default(&endpoints).?.name);
+    try std.testing.expectEqualStrings("speaker-a", choose_default(endpoints[0..2]).?.name);
+    try std.testing.expect(choose_default(endpoints[0..1]) == null);
+}

@@ -1,11 +1,11 @@
 //! Audio sample/channel representations, conversion, mixing and resampling.
 //! This is allocation-free scalar processing except for the explicit convert
-//! helper. Device backends and streams remain to be ported; importing this module does not open or initialize an audio device.
+//! helper. Device backends are separate and never open during module import.
 // Ported from audio/SDL_audiotypecvt.c, SDL_mixer.c and SDL_audioresample.c.
-// TODO: integrate stream/history ownership and Linux device backends.
 // SIMD dispatch stays out of the public API.
 const std = @import("std");
 const Endian = std.lang.Endian;
+const builtin = @import("builtin");
 
 /// Borrowed WAVE parsing and explicit owned decoding of supported codecs.
 pub const Wave = @import("wave.zig").Wave;
@@ -64,16 +64,25 @@ pub const Format = enum {
     signed8,
     signed16_le,
     signed16_be,
+    signed24_le,
+    signed24_be,
+    /// Signed 24-bit PCM sign-extended in a 32-bit word.
+    signed24_32_le,
+    signed24_32_be,
     signed32_le,
     signed32_be,
     float32_le,
     float32_be,
+    /// G.711 logarithmic PCM encodings.
+    alaw,
+    mulaw,
 
     /// Storage needed for one sample, independent of the number of channels.
     pub fn bytes_per_sample(self: Format) usize {
         return switch (self) {
-            .unsigned8, .signed8 => 1,
+            .unsigned8, .signed8, .alaw, .mulaw => 1,
             .signed16_le, .signed16_be => 2,
+            .signed24_le, .signed24_be => 3,
             else => 4,
         };
     }
@@ -81,21 +90,150 @@ pub const Format = enum {
     /// Endianness of multibyte formats; single-byte formats are order-agnostic.
     pub fn byte_order(self: Format) Endian {
         return switch (self) {
-            .signed16_be, .signed32_be, .float32_be => .big,
+            .signed16_be, .signed24_be, .signed24_32_be, .signed32_be, .float32_be => .big,
             else => .little,
         };
     }
 
-    fn encoding(self: Format) enum { unsigned8, signed8, signed16, signed32, float32 } {
+    /// Format-correct byte for silence, including G.711's encoded zero.
+    pub fn silence_byte(self: Format) u8 {
+        return switch (self) {
+            .unsigned8 => 0x80,
+            .alaw => 0xd5,
+            .mulaw => 0xff,
+            else => 0,
+        };
+    }
+
+    fn encoding(self: Format) enum { unsigned8, signed8, signed16, signed24, signed24_32, signed32, float32, alaw, mulaw } {
         return switch (self) {
             .unsigned8 => .unsigned8,
             .signed8 => .signed8,
             .signed16_le, .signed16_be => .signed16,
+            .signed24_le, .signed24_be => .signed24,
+            .signed24_32_le, .signed24_32_be => .signed24_32,
             .signed32_le, .signed32_be => .signed32,
             .float32_le, .float32_be => .float32,
+            .alaw => .alaw,
+            .mulaw => .mulaw,
         };
     }
 };
+
+/// Caller-owned capacity for the SDL-style closest-format preference order.
+pub const FormatPreferences = struct {
+    values: [14]Format = undefined,
+    len: usize = 0,
+
+    pub fn slice(self: *const FormatPreferences) []const Format {
+        return self.values[0..self.len];
+    }
+
+    fn append(self: *FormatPreferences, format: Format) void {
+        for (self.values[0..self.len]) |old| if (old == format) return;
+        self.values[self.len] = format;
+        self.len += 1;
+    }
+};
+
+/// Returns the preferred representation followed by the closest device-facing
+/// fallbacks. The eight legacy formats retain SDL's exact ordering; 24-bit and
+/// G.711 representations follow after those choices.
+pub fn closest_formats(preferred: Format) FormatPreferences {
+    const little = builtin.target.cpu.arch.endian() == .little;
+    const native16: Format = if (little) .signed16_le else .signed16_be;
+    const swapped16: Format = if (little) .signed16_be else .signed16_le;
+    const native32: Format = if (little) .signed32_le else .signed32_be;
+    const swapped32: Format = if (little) .signed32_be else .signed32_le;
+    const native_float: Format = if (little) .float32_le else .float32_be;
+    const swapped_float: Format = if (little) .float32_be else .float32_le;
+    var result: FormatPreferences = .{};
+    result.append(preferred);
+    switch (preferred) {
+        .unsigned8 => {
+            result.append(native_float);
+            result.append(swapped_float);
+            result.append(.signed8);
+            result.append(native16);
+            result.append(swapped16);
+            result.append(native32);
+            result.append(swapped32);
+        },
+        .signed8 => {
+            result.append(native_float);
+            result.append(swapped_float);
+            result.append(.unsigned8);
+            result.append(native16);
+            result.append(swapped16);
+            result.append(native32);
+            result.append(swapped32);
+        },
+        .signed16_le, .signed16_be => if (preferred == native16) {
+            result.append(native_float);
+            result.append(swapped_float);
+            result.append(swapped16);
+            result.append(native32);
+            result.append(swapped32);
+            result.append(.unsigned8);
+            result.append(.signed8);
+        } else {
+            result.append(native_float);
+            result.append(swapped_float);
+            result.append(native16);
+            result.append(swapped32);
+            result.append(native32);
+            result.append(.unsigned8);
+            result.append(.signed8);
+        },
+        .signed32_le, .signed32_be => if (preferred == native32) {
+            result.append(native_float);
+            result.append(swapped_float);
+            result.append(swapped32);
+            result.append(native16);
+            result.append(swapped16);
+            result.append(.unsigned8);
+            result.append(.signed8);
+        } else {
+            result.append(native_float);
+            result.append(swapped_float);
+            result.append(native32);
+            result.append(swapped16);
+            result.append(native16);
+            result.append(.unsigned8);
+            result.append(.signed8);
+        },
+        .float32_le, .float32_be => if (preferred == native_float) {
+            result.append(swapped_float);
+            result.append(native32);
+            result.append(swapped32);
+            result.append(native16);
+            result.append(swapped16);
+            result.append(.unsigned8);
+            result.append(.signed8);
+        } else {
+            result.append(native_float);
+            result.append(swapped32);
+            result.append(native32);
+            result.append(swapped16);
+            result.append(native16);
+            result.append(.unsigned8);
+            result.append(.signed8);
+        },
+        else => {
+            result.append(native_float);
+            result.append(swapped_float);
+            result.append(native32);
+            result.append(swapped32);
+            result.append(native16);
+            result.append(swapped16);
+            result.append(.unsigned8);
+            result.append(.signed8);
+        },
+    }
+    const all = [_]Format{ .unsigned8, .signed8, .signed16_le, .signed16_be, .signed24_le, .signed24_be, .signed24_32_le, .signed24_32_be, .signed32_le, .signed32_be, .float32_le, .float32_be, .alaw, .mulaw };
+    for (all) |format| result.append(format);
+    return result;
+}
 
 /// Invalid buffer/specification errors are explicit; no partial sample is read.
 pub const Error = error{ InvalidLength, BufferTooSmall, InvalidChannels, InvalidChannelMap, InvalidSampleRate, InvalidGain, OverlappingBuffers, InsufficientPadding, Overflow };
@@ -199,7 +337,7 @@ pub fn mix_into(format: Format, destination: []u8, source: []const u8, gain: f32
         const input = source[i * width ..][0..width];
         const target = output[i * width ..][0..width];
         switch (format.encoding()) {
-            .float32 => {
+            .float32, .alaw, .mulaw => {
                 const sum = decode_sample(format, target) + decode_sample(format, input) * gain;
                 // Comparisons preserve NaN rather than std's numeric min/max
                 // operators selecting the finite endpoint instead.
@@ -225,8 +363,12 @@ fn decode_sample(format: Format, bytes: []const u8) f32 {
         .unsigned8 => @as(f32, @floatFromInt(@as(i16, bytes[0]) - 128)) * 0x1p-7,
         .signed8 => @as(f32, @floatFromInt(@as(i8, @bitCast(bytes[0])))) * 0x1p-7,
         .signed16 => @as(f32, @floatFromInt(std.mem.readInt(i16, bytes[0..2], format.byte_order()))) * 0x1p-15,
+        .signed24 => @as(f32, @floatFromInt(read_signed24(bytes, format.byte_order()))) * 0x1p-23,
+        .signed24_32 => @as(f32, @floatFromInt(read_signed24_32(bytes, format.byte_order()))) * 0x1p-23,
         .signed32 => @as(f32, @floatFromInt(std.mem.readInt(i32, bytes[0..4], format.byte_order()))) * 0x1p-31,
         .float32 => @bitCast(std.mem.readInt(u32, bytes[0..4], format.byte_order())),
+        .alaw => @as(f32, @floatFromInt(decode_alaw(bytes[0]))) * 0x1p-15,
+        .mulaw => @as(f32, @floatFromInt(decode_mulaw(bytes[0]))) * 0x1p-15,
     };
 }
 
@@ -235,8 +377,12 @@ fn encode_sample(format: Format, value: f32, bytes: []u8) void {
         .unsigned8 => bytes[0] = @intCast(@as(i16, quantize(i8, value)) + 128),
         .signed8 => bytes[0] = @bitCast(quantize(i8, value)),
         .signed16 => std.mem.writeInt(i16, bytes[0..2], quantize(i16, value), format.byte_order()),
+        .signed24 => write_signed24(bytes, quantize(i24, value), format.byte_order()),
+        .signed24_32 => std.mem.writeInt(i32, bytes[0..4], quantize(i24, value), format.byte_order()),
         .signed32 => std.mem.writeInt(i32, bytes[0..4], quantize(i32, value), format.byte_order()),
         .float32 => std.mem.writeInt(u32, bytes[0..4], @bitCast(value), format.byte_order()),
+        .alaw => bytes[0] = encode_alaw(quantize(i16, value)),
+        .mulaw => bytes[0] = encode_mulaw(quantize(i16, value)),
     }
 }
 
@@ -270,8 +416,11 @@ fn integer_sample(format: Format, bytes: []const u8) i64 {
         .unsigned8 => @as(i16, bytes[0]) - 128,
         .signed8 => @as(i8, @bitCast(bytes[0])),
         .signed16 => std.mem.readInt(i16, bytes[0..2], format.byte_order()),
+        .signed24 => read_signed24(bytes, format.byte_order()),
+        .signed24_32 => read_signed24_32(bytes, format.byte_order()),
         .signed32 => std.mem.readInt(i32, bytes[0..4], format.byte_order()),
         .float32 => unreachable,
+        .alaw, .mulaw => unreachable,
     };
 }
 
@@ -280,9 +429,70 @@ fn write_integer(format: Format, value: i64, bytes: []u8) void {
         .unsigned8 => bytes[0] = @intCast(std.math.clamp(value + 128, 0, 255)),
         .signed8 => bytes[0] = @bitCast(@as(i8, @intCast(std.math.clamp(value, -128, 127)))),
         .signed16 => std.mem.writeInt(i16, bytes[0..2], @intCast(std.math.clamp(value, -32768, 32767)), format.byte_order()),
+        .signed24 => write_signed24(bytes, @intCast(std.math.clamp(value, -8388608, 8388607)), format.byte_order()),
+        .signed24_32 => std.mem.writeInt(i32, bytes[0..4], @intCast(std.math.clamp(value, -8388608, 8388607)), format.byte_order()),
         .signed32 => std.mem.writeInt(i32, bytes[0..4], @intCast(std.math.clamp(value, std.math.minInt(i32), std.math.maxInt(i32))), format.byte_order()),
         .float32 => unreachable,
+        .alaw, .mulaw => unreachable,
     }
+}
+
+fn read_signed24(bytes: []const u8, endian: Endian) i32 {
+    const value = std.mem.readInt(u24, bytes[0..3], endian);
+    return @as(i32, @bitCast(@as(u32, value) << 8)) >> 8;
+}
+
+fn write_signed24(bytes: []u8, value: i24, endian: Endian) void {
+    std.mem.writeInt(u24, bytes[0..3], @bitCast(value), endian);
+}
+
+fn read_signed24_32(bytes: []const u8, endian: Endian) i32 {
+    const value = std.mem.readInt(i32, bytes[0..4], endian);
+    const low: u32 = @bitCast(value);
+    return @as(i32, @bitCast(low << 8)) >> 8;
+}
+
+fn decode_alaw(encoded: u8) i16 {
+    const value = encoded ^ 0x55;
+    var sample: i32 = @as(i32, value & 0x0f) << 4;
+    const segment = (value & 0x70) >> 4;
+    sample += 8;
+    if (segment != 0) sample = (sample + 0x100) << @as(u5, @intCast(segment - 1));
+    if ((value & 0x80) == 0) sample = -sample;
+    return @intCast(sample);
+}
+
+fn decode_mulaw(encoded: u8) i16 {
+    const value = ~encoded;
+    var sample: i32 = (@as(i32, value & 0x0f) << 3) + 0x84;
+    sample <<= @as(u5, @intCast((value & 0x70) >> 4));
+    sample = if ((value & 0x80) != 0) 0x84 - sample else sample - 0x84;
+    return @intCast(sample);
+}
+
+fn encode_alaw(sample: i16) u8 {
+    const endpoints = [_]i32{ 0xff, 0x1ff, 0x3ff, 0x7ff, 0xfff, 0x1fff, 0x3fff, 0x7fff };
+    var pcm: i32 = sample;
+    const mask: u8 = if (pcm >= 0) 0xd5 else 0x55;
+    if (pcm < 0) pcm = -pcm - 1;
+    var segment: usize = 0;
+    while (segment < endpoints.len and pcm > endpoints[segment]) : (segment += 1) {}
+    if (segment == endpoints.len) return 0x7f ^ mask;
+    const quantized: u8 = @intCast(if (segment == 0) (pcm >> 4) & 0x0f else (pcm >> @intCast(segment + 3)) & 0x0f);
+    return (@as(u8, @intCast(segment)) << 4 | quantized) ^ mask;
+}
+
+fn encode_mulaw(sample: i16) u8 {
+    const endpoints = [_]i32{ 0xff, 0x1ff, 0x3ff, 0x7ff, 0xfff, 0x1fff, 0x3fff, 0x7fff };
+    var pcm: i32 = sample;
+    const mask: u8 = if (pcm < 0) 0x7f else 0xff;
+    if (pcm < 0) pcm = -pcm;
+    pcm = @min(pcm, 32635) + 0x84;
+    var segment: usize = 0;
+    while (segment < endpoints.len and pcm > endpoints[segment]) : (segment += 1) {}
+    if (segment == endpoints.len) return 0x7f ^ mask;
+    const nibble: u8 = @intCast((pcm >> @intCast(segment + 3)) & 0x0f);
+    return (@as(u8, @intCast(segment)) << 4 | nibble) ^ mask;
 }
 
 // Compare distances instead of adding lengths to addresses, so overlap checks
@@ -544,7 +754,7 @@ pub fn convert_frames_into(comptime source_layout: Layout, comptime destination_
                 } else {
                     // Unsigned eight-bit silence is centered on 128; every
                     // other supported representation uses zero-valued bytes.
-                    @memset(output, if (options.destination_format == .unsigned8) 128 else 0);
+                    @memset(output, options.destination_format.silence_byte());
                 }
             }
         }
@@ -775,4 +985,27 @@ fn transform_channels(comptime source_layout: Layout, comptime destination_layou
         62 => .{ (input[0] * 0.541000009), (input[1] * 0.541000009), (input[2] * 0.541000009), input[3], (input[4] * 0.287999988) + (input[5] * 0.287999988), (input[4] * 0.458999991) + (input[6] * 0.541000009), (input[5] * 0.458999991) + (input[7] * 0.541000009) },
         else => unreachable, // Equal layouts are copied by the caller.
     };
+}
+
+test "24-bit PCM and G.711 formats round trip at their defined limits" {
+    var bytes24: [3]u8 = undefined;
+    encode_sample(.signed24_le, 1, &bytes24);
+    try std.testing.expectEqualSlices(u8, &.{ 0xff, 0xff, 0x7f }, &bytes24);
+    try std.testing.expectEqual(@as(i32, 8388607), read_signed24(&bytes24, .little));
+
+    var alaw: [1]u8 = undefined;
+    var mulaw: [1]u8 = undefined;
+    encode_sample(.alaw, 0, &alaw);
+    encode_sample(.mulaw, 0, &mulaw);
+    try std.testing.expectEqual(@as(u8, 0xd5), alaw[0]);
+    try std.testing.expectEqual(@as(u8, 0xff), mulaw[0]);
+    try std.testing.expectEqual(@as(f32, 0), decode_sample(.mulaw, &mulaw));
+}
+
+test "closest format order begins with the request and native float fallback" {
+    const preferences = closest_formats(.unsigned8);
+    const ordered = preferences.slice();
+    try std.testing.expectEqual(Format.unsigned8, ordered[0]);
+    try std.testing.expectEqual(if (builtin.target.cpu.arch.endian() == .little) Format.float32_le else Format.float32_be, ordered[1]);
+    try std.testing.expectEqual(@as(usize, 14), ordered.len);
 }

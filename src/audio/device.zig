@@ -43,6 +43,8 @@ pub const default_buffer_frames: usize = 2048;
 pub const Error = alsa.Error || logical.Error || error{
     /// No playback-capable endpoint was enumerated.
     NoDefaultEndpoint,
+    /// ALSA negotiated a channel count different from the typed layout.
+    ChannelMismatch,
 };
 
 /// Opening parameters. Format and rate are preferences; the driver may choose
@@ -80,6 +82,9 @@ pub fn Output(comptime layout: audio.Layout) type {
 
         allocator: std.mem.Allocator,
         name: [:0]u8,
+        follows_default: bool,
+        preferred_spec: audio.Spec,
+        requested_buffer_frames: usize,
         device: alsa.Device,
         frame_bytes: usize,
         /// Bound streams, gain, pause and mixing (scratch sized for the largest
@@ -100,16 +105,18 @@ pub fn Output(comptime layout: audio.Layout) type {
             errdefer allocator.free(name);
 
             if (options.buffer_frames == 0 or options.sample_rate == 0) return error.InvalidSampleRate;
-            const latency = @max(@as(u64, 1), @as(u64, options.buffer_frames) * 1_000_000 / options.sample_rate);
+            const preferred: audio.Spec = .{ .format = options.format, .channels = channels, .sample_rate = options.sample_rate };
+            const latency = try latency_microseconds(options.buffer_frames, options.sample_rate);
 
             var device = try alsa.Device.open(library, .{
                 .direction = .playback,
-                .spec = .{ .format = options.format, .channels = channels, .sample_rate = options.sample_rate },
+                .spec = preferred,
                 .name = name,
                 .non_blocking = true,
-                .latency_microseconds = std.math.cast(u32, latency) orelse return error.Overflow,
+                .latency_microseconds = latency,
             });
             errdefer device.deinit();
+            if (device.spec.channels != channels) return error.ChannelMismatch;
 
             const frame_bytes = try device.spec.frame_size();
             const scratch_frames = @max(device.buffer_frames, device.period_frames);
@@ -122,6 +129,9 @@ pub fn Output(comptime layout: audio.Layout) type {
             return .{
                 .allocator = allocator,
                 .name = name,
+                .follows_default = options.endpoint == null,
+                .preferred_spec = preferred,
+                .requested_buffer_frames = options.buffer_frames,
                 .device = device,
                 .frame_bytes = frame_bytes,
                 .mixer = mixer,
@@ -142,6 +152,56 @@ pub fn Output(comptime layout: audio.Layout) type {
         /// Endpoint name this output was opened on (owned by the output).
         pub fn endpoint_name(self: *const Self) []const u8 {
             return self.name;
+        }
+
+        /// True when this logical output was opened without an explicit
+        /// endpoint and should follow subsequent default-device notifications.
+        pub fn opened_as_default(self: *const Self) bool {
+            return self.follows_default;
+        }
+
+        /// Moves a default-opened output to the new ALSA endpoint reported by
+        /// `alsa_hotplug.Watcher`. The replacement is opened before the old
+        /// stream is closed. Bound streams retain queued input and convert to
+        /// the newly negotiated device spec at the migration boundary.
+        /// Returns false for an explicitly opened device or an absent default.
+        pub fn migrate_default(self: *Self, new_endpoint: ?[:0]const u8) Error!bool {
+            if (!self.follows_default) return false;
+            const endpoint = new_endpoint orelse return false;
+            if (std.mem.eql(u8, self.name, endpoint)) return false;
+
+            const name = try self.allocator.dupeSentinel(u8, endpoint, 0);
+            errdefer self.allocator.free(name);
+            var replacement = try alsa.Device.open(self.device.library, .{
+                .direction = .playback,
+                .spec = self.preferred_spec,
+                .name = name,
+                .non_blocking = true,
+                .latency_microseconds = try latency_microseconds(self.requested_buffer_frames, self.preferred_spec.sample_rate),
+            });
+            errdefer replacement.deinit();
+            if (replacement.spec.channels != channels) return error.ChannelMismatch;
+
+            const frame_bytes = try replacement.spec.frame_size();
+            const scratch_frames = @max(replacement.buffer_frames, replacement.period_frames);
+            const scratch_bytes = std.math.mul(usize, scratch_frames, frame_bytes) catch return error.Overflow;
+            const carry = try self.allocator.alloc(u8, scratch_bytes);
+            errdefer self.allocator.free(carry);
+            try self.mixer.reconfigure(replacement.spec, scratch_bytes);
+
+            var previous_device = self.device;
+            const previous_name = self.name;
+            const previous_carry = self.carry;
+            self.device = replacement;
+            self.name = name;
+            self.frame_bytes = frame_bytes;
+            self.carry = carry;
+            self.carry_frames = 0;
+            replacement = undefined;
+            previous_device.deinit();
+            self.allocator.free(previous_name);
+            self.allocator.free(previous_carry);
+            return true;
         }
 
         /// Committed format, channels and rate, as negotiated with the endpoint.
@@ -293,6 +353,9 @@ pub fn Input(comptime layout: audio.Layout) type {
 
         allocator: std.mem.Allocator,
         name: [:0]u8,
+        follows_default: bool,
+        preferred_spec: audio.Spec,
+        requested_buffer_frames: usize,
         device: alsa.Device,
         frame_bytes: usize,
         /// Bound destination streams and period scratch.
@@ -308,16 +371,18 @@ pub fn Input(comptime layout: audio.Layout) type {
             errdefer allocator.free(name);
 
             if (options.buffer_frames == 0 or options.sample_rate == 0) return error.InvalidSampleRate;
-            const latency = @max(@as(u64, 1), @as(u64, options.buffer_frames) * 1_000_000 / options.sample_rate);
+            const preferred: audio.Spec = .{ .format = options.format, .channels = channels, .sample_rate = options.sample_rate };
+            const latency = try latency_microseconds(options.buffer_frames, options.sample_rate);
 
             var device = try alsa.Device.open(library, .{
                 .direction = .capture,
-                .spec = .{ .format = options.format, .channels = channels, .sample_rate = options.sample_rate },
+                .spec = preferred,
                 .name = name,
                 .non_blocking = true,
-                .latency_microseconds = std.math.cast(u32, latency) orelse return error.Overflow,
+                .latency_microseconds = latency,
             });
             errdefer device.deinit();
+            if (device.spec.channels != channels) return error.ChannelMismatch;
 
             const frame_bytes = try device.spec.frame_size();
             const scratch_bytes = std.math.mul(usize, @max(device.buffer_frames, device.period_frames), frame_bytes) catch return error.Overflow;
@@ -327,6 +392,9 @@ pub fn Input(comptime layout: audio.Layout) type {
             return .{
                 .allocator = allocator,
                 .name = name,
+                .follows_default = options.endpoint == null,
+                .preferred_spec = preferred,
+                .requested_buffer_frames = options.buffer_frames,
                 .device = device,
                 .frame_bytes = frame_bytes,
                 .fanout = fanout,
@@ -344,6 +412,47 @@ pub fn Input(comptime layout: audio.Layout) type {
         /// Endpoint name this input was opened on (owned by the input).
         pub fn endpoint_name(self: *const Self) []const u8 {
             return self.name;
+        }
+
+        /// True when this capture input was opened without an explicit endpoint.
+        pub fn opened_as_default(self: *const Self) bool {
+            return self.follows_default;
+        }
+
+        /// Moves a default-opened input to the new ALSA endpoint reported by
+        /// `alsa_hotplug.Watcher`. Captured queues receive a normal source-spec
+        /// boundary when the replacement reports a different format or rate.
+        pub fn migrate_default(self: *Self, new_endpoint: ?[:0]const u8) Error!bool {
+            if (!self.follows_default) return false;
+            const endpoint = new_endpoint orelse return false;
+            if (std.mem.eql(u8, self.name, endpoint)) return false;
+
+            const name = try self.allocator.dupeSentinel(u8, endpoint, 0);
+            errdefer self.allocator.free(name);
+            var replacement = try alsa.Device.open(self.device.library, .{
+                .direction = .capture,
+                .spec = self.preferred_spec,
+                .name = name,
+                .non_blocking = true,
+                .latency_microseconds = try latency_microseconds(self.requested_buffer_frames, self.preferred_spec.sample_rate),
+            });
+            errdefer replacement.deinit();
+            if (replacement.spec.channels != channels) return error.ChannelMismatch;
+
+            const frame_bytes = try replacement.spec.frame_size();
+            const scratch_frames = @max(replacement.buffer_frames, replacement.period_frames);
+            const scratch_bytes = std.math.mul(usize, scratch_frames, frame_bytes) catch return error.Overflow;
+            try self.fanout.reconfigure(replacement.spec, scratch_bytes);
+
+            var previous_device = self.device;
+            const previous_name = self.name;
+            self.device = replacement;
+            self.name = name;
+            self.frame_bytes = frame_bytes;
+            replacement = undefined;
+            previous_device.deinit();
+            self.allocator.free(previous_name);
+            return true;
         }
 
         /// Committed format, channels and rate negotiated with ALSA.
@@ -413,6 +522,14 @@ pub fn Input(comptime layout: audio.Layout) type {
             }
         }
     };
+}
+
+fn latency_microseconds(frames: usize, sample_rate: u32) Error!u32 {
+    if (frames == 0 or sample_rate == 0) return error.InvalidSampleRate;
+    const frame_count = std.math.cast(u64, frames) orelse return error.Overflow;
+    const scaled = std.math.mul(u64, frame_count, 1_000_000) catch return error.Overflow;
+    const latency = @max(@as(u64, 1), scaled / sample_rate);
+    return std.math.cast(u32, latency) orelse error.Overflow;
 }
 
 fn default_capture_name(allocator: std.mem.Allocator, library: *alsa.Library) Error![:0]u8 {
