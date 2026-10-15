@@ -29,21 +29,20 @@ fn frame(app: *App, renderer: *common.Renderer, index: usize) !void {
 
     var captured = try renderer.read_pixels(null);
     defer captured.deinit();
+    // SDL indexes the bytes of packed RGBA8888 (A,B,G,R in memory on little
+    // endian); read_pixels returns byte-ordered rgba8, so name the channels.
+    std.debug.assert(captured.view.format == .rgba8);
     for (0..captured.view.height) |y| {
         const row = try captured.view.row(y);
         for (0..captured.view.width) |x| {
             const pixel = row[x * 4 ..][0..4];
-            const average: u8 = @intCast((@as(u16, pixel[1]) + pixel[2] + pixel[3]) / 3);
+            const r, const g, const b = .{ pixel[0], pixel[1], pixel[2] };
+            const average: u8 = @intCast((@as(u16, r) + g + b) / 3);
             if (average == 0) {
-                pixel[0] = 255;
-                pixel[1] = 0;
-                pixel[2] = 0;
-                pixel[3] = 255;
+                pixel.* = .{ 255, 0, 0, 255 }; // make pure black pixels red.
             } else {
-                const thresholded: u8 = if (average > 50) 255 else 0;
-                pixel[1] = thresholded;
-                pixel[2] = thresholded;
-                pixel[3] = thresholded;
+                const level: u8 = if (average > 50) 255 else 0; // everything else black or white.
+                pixel[0..3].* = .{ level, level, level };
             }
         }
     }
