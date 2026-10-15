@@ -19,3 +19,7 @@ then `zig fmt` the output.
 | `hint_names.py` | `src/core/hint_names.zig` | `hint_names.py .ref/SDL > src/core/hint_names.zig` |
 | `render_debug_font.py` | `src/render/debug_font_data.zig` | `render_debug_font.py .ref/SDL/src/render/SDL_render_debug_font.h` |
 | `planar_audio_assets.py` | `examples/assets/planar-left.u8`, `examples/assets/planar-right.u8` | `planar_audio_assets.py .ref/SDL/examples/audio/05-planar-data/planar-data.c` |
+
+`jpeg_fixtures.py` uses Pillow to generate the original baseline/progressive JPEG
+regression pair in `src/testdata/jpeg/`. The pair encodes the same coefficients;
+tests compare decoded pixels across progressive refinement block runs.

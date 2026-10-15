@@ -864,7 +864,9 @@ const Decoder = struct {
                     var value: i16 = 0;
                     if (s == 0) {
                         if (r < 15) {
-                            self.eob_run = @as(i32, 1) << @intCast(r);
+                            // The run includes this block; only subsequent blocks
+                            // remain after its refinement bits are consumed below.
+                            self.eob_run = (@as(i32, 1) << @intCast(r)) - 1;
                             if (r != 0) self.eob_run += @intCast(self.get_bits(@intCast(r)));
                             r = 64; // force end of block
                         }
@@ -1408,4 +1410,15 @@ fn resample_row(kernel: Resampler, out: []u8, near: []const u8, far: []const u8,
             return out[0 .. w * hs];
         },
     }
+}
+
+test "progressive JPEG refinement matches the baseline coefficients across blocks" {
+    const testing = std.testing;
+    var baseline = try decode(testing.allocator, @embedFile("../testdata/jpeg/baseline.jpg"), .rgba);
+    defer baseline.deinit();
+    var progressive = try decode(testing.allocator, @embedFile("../testdata/jpeg/progressive.jpg"), .rgba);
+    defer progressive.deinit();
+    try testing.expectEqual(baseline.width, progressive.width);
+    try testing.expectEqual(baseline.height, progressive.height);
+    try testing.expectEqualSlices(u8, baseline.data, progressive.data);
 }
