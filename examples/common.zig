@@ -145,9 +145,9 @@ fn render_interactive(comptime App: type, app: *App, init: std.process.Init, com
         }
 
         pub fn iterate(self: *@This(), context: *zdl.app.callbacks.Context) zdl.app.callbacks.Result {
-            if (@hasDecl(App, "before_frame")) App.before_frame(self.app, context.io) catch return .failure;
-            render_frame(self.app, self.renderer, self.frame_index) catch return .failure;
-            self.window.present(self.raster.view) catch return .failure;
+            if (@hasDecl(App, "before_frame")) App.before_frame(self.app, context.io) catch |err| return fail("before_frame", err);
+            render_frame(self.app, self.renderer, self.frame_index) catch |err| return fail("render", err);
+            self.window.present(self.raster.view) catch |err| return fail("present", err);
             self.frame_index += 1;
             return .@"continue";
         }
@@ -156,6 +156,11 @@ fn render_interactive(comptime App: type, app: *App, init: std.process.Init, com
     var callbacks: Callbacks = .{ .app = app, .renderer = &renderer, .window = window, .raster = &raster };
     const result = try zdl.app.callbacks.run(Callbacks, &callbacks, platform, init.io, .{ .pacing = .{ .rate_hz = 60 } });
     if (result == .failure) return error.RenderFailure;
+}
+
+fn fail(comptime step: []const u8, err: anyerror) zdl.app.callbacks.Result {
+    std.debug.print("{s} failed: {t}\n", .{ step, err });
+    return .failure;
 }
 
 const PixelStats = struct { varied: usize, checksum: u64 };

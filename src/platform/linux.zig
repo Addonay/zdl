@@ -2076,7 +2076,18 @@ pub const Window = struct {
         const r = try self.record();
         switch (r.native) {
             .x11 => |*window| try window.present(self.platform.allocator, view),
-            .wayland => |*window| try window.present(view),
+            // Both wl_shm buffers can still be held by the compositor; block on
+            // its events until one is released, as a throttled swap would.
+            .wayland => |*window| while (true) {
+                window.present(view) catch |err| switch (err) {
+                    error.NoFreeBuffer => {
+                        try window.dispatch(true);
+                        continue;
+                    },
+                    else => return err,
+                };
+                break;
+            },
             .offscreen => |*window| try window.present(view),
             .kmsdrm => try self.platform.kmsdrm.?.present(view),
             .wayland_popup => |popup| {
