@@ -285,6 +285,7 @@ const Functions = struct {
     proxy_add_object_listener: *const fn (*Proxy, *Hook, *const anyopaque, ?*anyopaque) callconv(.c) void,
     proxy_destroy: *const fn (*Proxy) callconv(.c) void,
     properties_new_string: *const fn ([*:0]const u8) callconv(.c) ?*Properties,
+    properties_free: *const fn (*Properties) callconv(.c) void,
     properties_set: *const fn (*Properties, [*:0]const u8, [*:0]const u8) callconv(.c) c_int,
     stream_new_simple: *const fn (*Loop, [*:0]const u8, ?*Properties, *const StreamEvents, ?*anyopaque) callconv(.c) ?*Stream,
     stream_destroy: *const fn (*Stream) callconv(.c) void,
@@ -464,12 +465,17 @@ pub const Library = struct {
     pub fn properties(self: *Library) Error!*Properties {
         return self.functions.properties_new_string("") orelse error.OutOfObjects;
     }
+    /// Frees properties that have not been transferred to a native object.
+    pub fn properties_free(self: *Library, props: *Properties) void {
+        self.functions.properties_free(props);
+    }
     /// Sets one property. Both strings are copied by PipeWire.
     pub fn properties_set(self: *Library, props: *Properties, key: [:0]const u8, value: [:0]const u8) Error!void {
         if (self.functions.properties_set(props, key.ptr, value.ptr) < 0) return error.Failed;
     }
 
-    /// Creates a stream on `loop`. Ownership of `props` passes to PipeWire.
+    /// Creates a stream on `loop`. Ownership of `props` passes to PipeWire,
+    /// including when creation fails; callers must not free it after this call.
     pub fn stream_new(self: *Library, loop: *Loop, name: [:0]const u8, props: *Properties, events: *const StreamEvents, data: ?*anyopaque) Error!*Stream {
         return self.functions.stream_new_simple(loop, name.ptr, props, events, data) orelse error.OutOfObjects;
     }
@@ -488,7 +494,8 @@ pub const Library = struct {
         if (self.functions.stream_set_active(stream_object, active) < 0) return error.Failed;
     }
     pub fn stream_time(self: *Library, stream_object: *Stream) Error!StreamTime {
-        var result: StreamTime = undefined;
+        // Older providers may fill only their supported prefix of pw_time.
+        var result: StreamTime = std.mem.zeroes(StreamTime);
         if (self.functions.stream_get_time_n(stream_object, &result, @sizeOf(StreamTime)) < 0) return error.Failed;
         return result;
     }
@@ -577,4 +584,358 @@ pub const stream_events: StreamEvents = .{ .state_changed = stream_state, .param
 test "property lookup on an empty dictionary" {
     const props: Props = .{ .raw = null };
     try std.testing.expect(props.get("node.name") == null);
+}
+
+// Test-only provider functions stay in this private binding so no C calling
+// convention leaks into stream/context APIs. Nothing here loads a real daemon.
+const StreamFixture = struct {
+    const Failure = enum { none, properties, loop, constructor, connect, negotiation };
+    var failure: Failure = .none;
+    var property_failure: usize = 0;
+    var property_sets: usize = 0;
+    var property_frees: usize = 0;
+    var property_transfers: usize = 0;
+    var locks: usize = 0;
+    var disconnects: usize = 0;
+    var destroys: usize = 0;
+    var signals: usize = 0;
+    var callback_data: ?*anyopaque = null;
+    var callbacks: ?*const StreamEvents = null;
+
+    fn reset(fail: Failure, property: usize) void {
+        failure = fail;
+        property_failure = property;
+        property_sets = 0;
+        property_frees = 0;
+        property_transfers = 0;
+        locks = 0;
+        disconnects = 0;
+        destroys = 0;
+        signals = 0;
+        callback_data = null;
+        callbacks = null;
+    }
+    fn lock(_: *ThreadLoop) callconv(.c) void {
+        std.debug.assert(locks == 0);
+        locks += 1;
+    }
+    fn unlock(_: *ThreadLoop) callconv(.c) void {
+        std.debug.assert(locks == 1);
+        locks -= 1;
+    }
+    fn signal(_: *ThreadLoop, _: bool) callconv(.c) void {
+        std.debug.assert(locks == 1);
+        signals += 1;
+    }
+    fn loop(_: *ThreadLoop) callconv(.c) ?*Loop {
+        return if (failure == .loop) null else @ptrFromInt(0x1000);
+    }
+    fn properties(_: [*:0]const u8) callconv(.c) ?*Properties {
+        return if (failure == .properties) null else @ptrFromInt(0x2000);
+    }
+    fn free_properties(_: *Properties) callconv(.c) void {
+        std.debug.assert(locks == 1 and property_transfers == 0);
+        property_frees += 1;
+    }
+    fn set_property(_: *Properties, _: [*:0]const u8, _: [*:0]const u8) callconv(.c) c_int {
+        std.debug.assert(locks == 1);
+        property_sets += 1;
+        return if (property_sets == property_failure) -12 else 1;
+    }
+    fn new_stream(_: *Loop, _: [*:0]const u8, _: ?*Properties, events: *const StreamEvents, data: ?*anyopaque) callconv(.c) ?*Stream {
+        std.debug.assert(locks == 1);
+        property_transfers += 1; // Native ownership includes constructor failure.
+        if (failure == .constructor) return null;
+        callbacks = events;
+        callback_data = data;
+        const state = stream.State.from_callback(data);
+        if (failure == .negotiation) state.failed = true else state.negotiated = state.requested;
+        return @ptrFromInt(0x3000);
+    }
+    fn connect(_: *Stream, _: c_int, _: u32, _: u32, _: ?[*]const *const anyopaque, _: u32) callconv(.c) c_int {
+        std.debug.assert(locks == 1);
+        return if (failure == .connect) -5 else 0;
+    }
+    fn disconnect(_: *Stream) callconv(.c) c_int {
+        std.debug.assert(locks == 1);
+        disconnects += 1;
+        return 0;
+    }
+    fn destroy(_: *Stream) callconv(.c) void {
+        std.debug.assert(locks == 1);
+        // A synchronous native teardown callback must still see live state/ring.
+        const state = stream.State.from_callback(callback_data);
+        state.ring[0] = 0xa5;
+        callbacks.?.state_changed(callback_data, stream_state_streaming, stream_state_error, null);
+        callback_data = null;
+        callbacks = null;
+        destroys += 1;
+    }
+    fn library() Library {
+        var result: Library = undefined; // Handle/unused functions are never read.
+        result.functions.thread_loop_lock = lock;
+        result.functions.thread_loop_unlock = unlock;
+        result.functions.thread_loop_signal = signal;
+        result.functions.thread_loop_get_loop = loop;
+        result.functions.properties_new_string = properties;
+        result.functions.properties_free = free_properties;
+        result.functions.properties_set = set_property;
+        result.functions.stream_new_simple = new_stream;
+        result.functions.stream_connect = connect;
+        result.functions.stream_disconnect = disconnect;
+        result.functions.stream_destroy = destroy;
+        return result;
+    }
+    fn exercise(allocator: std.mem.Allocator, fail: Failure, property: usize) !void {
+        reset(fail, property);
+        var native = library();
+        var shared: context.Shared = undefined;
+        shared.thread = @ptrFromInt(0x4000);
+        var connection: context.Connection = .{ .allocator = allocator, .library = &native, .shared = &shared };
+        const result = stream.Stream.open(allocator, &connection, .{
+            .direction = .playback,
+            .spec = .{ .format = .float32_le, .channels = 2, .sample_rate = 48000 },
+            .target = "test sink",
+        });
+        if (fail == .none and property == 0) {
+            var opened = try result;
+            try std.testing.expectEqual(@as(usize, 0), locks);
+            opened.deinit();
+        } else {
+            var unexpected = result catch |err| {
+                if (err == error.OutOfMemory) return err;
+                const expected: anyerror = if (property != 0 or fail == .connect)
+                    error.Failed
+                else if (fail == .negotiation) error.StreamFailed else error.OutOfObjects;
+                try std.testing.expectEqual(expected, err);
+                try check_cleanup(fail, property);
+                return;
+            };
+            unexpected.deinit();
+            return error.ExpectedFailure;
+        }
+        try check_cleanup(fail, property);
+    }
+    fn check_cleanup(fail: Failure, property: usize) !void {
+        try std.testing.expectEqual(@as(usize, 0), locks);
+        const transferred = property == 0 and fail != .properties and fail != .loop;
+        try std.testing.expectEqual(@as(usize, @intFromBool(transferred)), property_transfers);
+        try std.testing.expectEqual(@as(usize, @intFromBool(!transferred and fail != .properties)), property_frees);
+        const created = transferred and fail != .constructor;
+        try std.testing.expectEqual(@as(usize, @intFromBool(created)), disconnects);
+        try std.testing.expectEqual(@as(usize, @intFromBool(created)), destroys);
+        try std.testing.expectEqual(@as(usize, @intFromBool(created)), signals);
+        try std.testing.expect(callback_data == null and callbacks == null);
+    }
+};
+
+/// Internal test entry point, instantiated only by the libc-linked test root.
+pub fn test_stream_lifetime() !void {
+    for (1..7) |property| {
+        try StreamFixture.exercise(std.testing.allocator, .none, property);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, StreamFixture.exercise, .{ .none, property });
+    }
+    inline for (std.meta.tags(StreamFixture.Failure)) |failure| {
+        try StreamFixture.exercise(std.testing.allocator, failure, 0);
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, StreamFixture.exercise, .{ failure, 0 });
+    }
+}
+
+fn prefix_time(_: *Stream, result: *StreamTime, size: usize) callconv(.c) c_int {
+    std.debug.assert(size == @sizeOf(StreamTime));
+    // Model an older provider that only writes the original structure prefix.
+    result.now = 42;
+    result.rate = .{ .num = 1, .den = 48000 };
+    result.ticks = 100;
+    result.delay = 20;
+    result.queued = 7;
+    return 0;
+}
+
+/// Internal test entry point for size-negotiated provider results.
+pub fn test_time_prefix() !void {
+    var library: Library = undefined;
+    library.functions.stream_get_time_n = prefix_time;
+    const value = try library.stream_time(@ptrFromInt(0x1000));
+    try std.testing.expectEqual(@as(i64, 42), value.now);
+    try std.testing.expectEqual(@as(u64, 7), value.queued);
+    try std.testing.expectEqual(@as(u64, 0), value.buffered);
+    try std.testing.expectEqual(@as(u32, 0), value.queued_buffers);
+    try std.testing.expectEqual(@as(u32, 0), value.available_buffers);
+    try std.testing.expectEqual(@as(u64, 0), value.size);
+}
+
+/// Optional developer check against independently translated installed headers.
+/// This is deliberately instantiated only by src/pipewire_abi_check.zig: normal
+/// consumers never import C headers or require development packages.
+pub fn check_header_abi(comptime c: type) void {
+    check_record(StreamTime, c.struct_pw_time, .{.{ "available_buffers", "avail_buffers" }}, false);
+    check_record(Buffer, c.struct_pw_buffer, .{.{ "spa_buffer", "buffer" }}, true);
+    check_record(SpaBuffer, c.struct_spa_buffer, .{}, false);
+    check_record(SpaData, c.struct_spa_data, .{ .{ "kind", "type" }, .{ "map_offset", "mapoffset" }, .{ "max_size", "maxsize" } }, false);
+    check_record(SpaChunk, c.struct_spa_chunk, .{}, false);
+    check_record(RawDict, c.struct_spa_dict, .{}, false);
+    check_record(RawItem, c.struct_spa_dict_item, .{}, false);
+    check_record(CoreEvents, c.struct_pw_core_events, .{.{ "error_event", "error" }}, true);
+    check_record(RegistryEvents, c.struct_pw_registry_events, .{}, true);
+    check_record(RegistryMethods, c.struct_pw_registry_methods, .{}, true);
+    check_record(NodeMethods, c.struct_pw_node_methods, .{}, true);
+    check_record(RawLoop, c.struct_pw_loop, .{}, true);
+    check_record(LoopUtilsMethods, c.struct_spa_loop_utils_methods, .{}, true);
+    check_record(MetadataEvents, c.struct_pw_metadata_events, .{}, true);
+    check_record(NodeEvents, c.struct_pw_node_events, .{}, true);
+    check_record(StreamEvents, c.struct_pw_stream_events, .{}, true);
+    if (@sizeOf(Hook) != @sizeOf(c.struct_spa_hook) or @alignOf(Hook) != @alignOf(c.struct_spa_hook))
+        @compileError("PipeWire ABI mismatch: spa_hook storage");
+    if (@sizeOf(SpaInterface) != @sizeOf(c.struct_spa_interface) or @alignOf(SpaInterface) != @alignOf(c.struct_spa_interface) or
+        @offsetOf(SpaInterface, "kind") != @offsetOf(c.struct_spa_interface, "type") or
+        @offsetOf(SpaInterface, "version") != @offsetOf(c.struct_spa_interface, "version") or
+        @offsetOf(SpaInterface, "funcs") != @offsetOf(c.struct_spa_interface, "cb") + @offsetOf(c.struct_spa_callbacks, "funcs") or
+        @offsetOf(SpaInterface, "data") != @offsetOf(c.struct_spa_interface, "cb") + @offsetOf(c.struct_spa_callbacks, "data"))
+        @compileError("PipeWire ABI mismatch: spa_interface callbacks");
+    if (direction_input != c.PW_DIRECTION_INPUT or direction_output != c.PW_DIRECTION_OUTPUT or
+        stream_flag_autoconnect != c.PW_STREAM_FLAG_AUTOCONNECT or stream_flag_map_buffers != c.PW_STREAM_FLAG_MAP_BUFFERS or
+        stream_state_error != c.PW_STREAM_STATE_ERROR or stream_state_unconnected != c.PW_STREAM_STATE_UNCONNECTED or
+        stream_state_connecting != c.PW_STREAM_STATE_CONNECTING or stream_state_paused != c.PW_STREAM_STATE_PAUSED or
+        stream_state_streaming != c.PW_STREAM_STATE_STREAMING or version_registry != c.PW_VERSION_REGISTRY or
+        version_metadata != c.PW_VERSION_METADATA or version_node != c.PW_VERSION_NODE)
+        @compileError("PipeWire ABI mismatch: protocol constants");
+}
+
+fn check_record(comptime Native: type, comptime Foreign: type, comptime renames: anytype, comptime prefix: bool) void {
+    if (@alignOf(Native) != @alignOf(Foreign) or
+        (if (prefix) @sizeOf(Native) > @sizeOf(Foreign) else @sizeOf(Native) != @sizeOf(Foreign)))
+        @compileError("PipeWire ABI size/alignment mismatch: " ++ @typeName(Native));
+    for (@typeInfo(Native).@"struct".field_names) |name| {
+        const foreign_name = block: {
+            for (renames) |pair| {
+                if (std.mem.eql(u8, name, pair[0])) break :block pair[1];
+            }
+            break :block name;
+        };
+        if (@offsetOf(Native, name) != @offsetOf(Foreign, foreign_name) or
+            @sizeOf(@FieldType(Native, name)) != @sizeOf(@FieldType(Foreign, foreign_name)))
+            @compileError("PipeWire ABI field mismatch: " ++ @typeName(Native) ++ "." ++ name);
+    }
+}
+
+const ConnectionFixture = struct {
+    var fail_sync: bool = false;
+    var callback_state: ?*context.Shared = null;
+    var stopped: bool = false;
+    var locks: usize = 0;
+    var disconnects: usize = 0;
+    var methods: RegistryMethods = undefined;
+    var interface: SpaInterface = undefined;
+
+    fn thread_new(_: [*:0]const u8, _: ?*anyopaque) callconv(.c) ?*ThreadLoop {
+        return @ptrFromInt(0x1000);
+    }
+    fn thread_destroy(_: *ThreadLoop) callconv(.c) void {
+        std.debug.assert(stopped and disconnects == 1);
+    }
+    fn start(_: *ThreadLoop) callconv(.c) c_int {
+        return 0;
+    }
+    fn stop(_: *ThreadLoop) callconv(.c) void {
+        std.debug.assert(locks == 0 and !stopped);
+        stopped = true;
+    }
+    fn loop(_: *ThreadLoop) callconv(.c) ?*Loop {
+        return @ptrFromInt(0x2000);
+    }
+    fn lock(_: *ThreadLoop) callconv(.c) void {
+        std.debug.assert(locks == 0);
+        locks = 1;
+    }
+    fn unlock(_: *ThreadLoop) callconv(.c) void {
+        std.debug.assert(locks == 1);
+        locks = 0;
+    }
+    fn signal(_: *ThreadLoop, _: bool) callconv(.c) void {
+        std.debug.assert(locks == 1);
+    }
+    fn new_context(_: *Loop, _: ?*Properties, _: usize) callconv(.c) ?*Context {
+        return @ptrFromInt(0x3000);
+    }
+    fn destroy_context(_: *Context) callconv(.c) void {
+        std.debug.assert(stopped and disconnects == 1);
+    }
+    fn connect(_: *Context, _: ?*Properties, _: usize) callconv(.c) ?*Core {
+        return @ptrFromInt(0x4000);
+    }
+    fn disconnect(_: *Core) callconv(.c) c_int {
+        std.debug.assert(stopped and locks == 0);
+        // Native destruction can still inspect callback state. Storage must be
+        // retired only after native objects/listeners are disconnected.
+        const shared = callback_state.?;
+        if (shared.default_sink) |name| std.debug.assert(std.mem.eql(u8, name, "fixture sink"));
+        disconnects += 1;
+        callback_state = null;
+        return 0;
+    }
+    fn registry(_: *Core, _: u32, _: usize) callconv(.c) ?*Registry {
+        return @ptrCast(&interface);
+    }
+    fn core_listener(_: *Core, _: *Hook, _: *const CoreEvents, data: ?*anyopaque) callconv(.c) c_int {
+        callback_state = context.Shared.from_callback(data);
+        return 0;
+    }
+    fn registry_listener(_: ?*anyopaque, _: *Hook, _: *const RegistryEvents, _: ?*anyopaque) callconv(.c) c_int {
+        return 0;
+    }
+    fn sync(_: *Core, _: u32, sequence: c_int) callconv(.c) c_int {
+        const shared = callback_state.?;
+        shared.on_metadata(0, "default.audio.sink", "{\"name\":\"fixture sink\"}");
+        shared.on_done(0, sequence);
+        return if (fail_sync) -5 else sequence;
+    }
+    fn exercise(allocator: std.mem.Allocator, fail: bool) !void {
+        fail_sync = fail;
+        callback_state = null;
+        stopped = false;
+        locks = 0;
+        disconnects = 0;
+        methods = undefined;
+        methods.add_listener = registry_listener;
+        interface = .{ .kind = null, .version = 0, .funcs = &methods, .data = null };
+        var loader: context.Library = undefined;
+        const functions = &loader.native.functions;
+        functions.thread_loop_new = thread_new;
+        functions.thread_loop_destroy = thread_destroy;
+        functions.thread_loop_start = start;
+        functions.thread_loop_stop = stop;
+        functions.thread_loop_get_loop = loop;
+        functions.thread_loop_lock = lock;
+        functions.thread_loop_unlock = unlock;
+        functions.thread_loop_signal = signal;
+        functions.context_new = new_context;
+        functions.context_destroy = destroy_context;
+        functions.context_connect = connect;
+        functions.core_disconnect = disconnect;
+        functions.core_get_registry = registry;
+        functions.core_add_listener = core_listener;
+        functions.core_sync = sync;
+        const result = context.Connection.open(allocator, &loader, .{});
+        if (fail) {
+            var unexpected = result catch |err| {
+                if (err == error.OutOfMemory) return err;
+                try std.testing.expectEqual(error.Failed, err);
+                try std.testing.expect(stopped and locks == 0 and disconnects == 1 and callback_state == null);
+                return;
+            };
+            unexpected.deinit();
+            return error.ExpectedFailure;
+        }
+        var connection = try result;
+        connection.deinit();
+        try std.testing.expect(stopped and locks == 0 and disconnects == 1 and callback_state == null);
+    }
+};
+
+/// Internal test entry point for native-object-before-callback-storage teardown.
+pub fn test_connection_lifetime() !void {
+    try ConnectionFixture.exercise(std.testing.allocator, true);
+    try ConnectionFixture.exercise(std.testing.allocator, false);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, ConnectionFixture.exercise, .{false});
 }

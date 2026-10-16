@@ -359,3 +359,58 @@ controllers and GPU presentation are not covered by those runs.
 The previously reproduced `Platform.open` duplicate destroy is fixed. Its
 invalid-driver and allocation-failure regression runs in a separate libc-linked
 test application, so exported core/image modules still do not require libc.
+
+## Architecture foundation slice
+
+`docs/foundation-status.md` records the first WP-00/WP-01 implementation slice.
+The event queue now uses lazy-head FIFO removal and stable single-pass range,
+flush and window-supersession compaction. Callback-driven `cut_pending` retains
+its sequential removal/length semantics. Borrowed payload ownership, filters,
+watchers, enablement, lifecycle dispatch and live-event capacity are unchanged.
+Ordered-model, steady-pressure, reentrancy and allocation-failure fixtures cover
+the migration; an isolated FIFO benchmark records before/after work separately
+from full event-pump or GUI cost.
+
+`check-foundation` and `tools/audit_foundation.py` add real runtime-input consumer
+and ELF dependency baselines for geometry/native PNG/audio and libc-backed
+platform use. The image consumer now calls its APIs rather than only naming
+their declarations. These checks start the source/ABI inventory; they do not
+establish complete ABI coverage or a completed GUI framework.
+
+PipeWire setup now frees untransferred property bags and retires native
+connection objects before releasing shared callback storage on failed opens.
+`pw_time` results initialize extension fields before size-negotiated native
+writes. Hardware-free tests exercise property/native/Zig-allocation failures and
+synchronous teardown callbacks in a separate libc-linked root. The optional
+`tools/audit_pipewire_abi.py` compares handwritten layouts and selected constants
+against installed headers; this checked the local 1.6.9 headers, not historical
+runtime versions or live server behavior. See the foundation status for evidence.
+
+The new `zdl.ui.Scene` is a model-only architecture foundation, not an SDL parity
+claim or a promoted copy of the example widget toolkit. It reconciles full scoped
+keys into domain/generation handles, stages/copies declaration data, publishes
+immutable retained snapshots and repairs transactional focus/capture references.
+Failed allocation/validation leaves the prior scene intact; close invalidates
+pending publication without allocation. See `docs/ui-scenes.md` for the complete
+lease/thread/limit contract and the foundation ledger for measured boundaries.
+
+`zdl.text.Document` adds the application-owned editing model from the architecture
+roadmap: revision-checked UTF-8 batches, immutable snapshots, directional/affinity
+selections and bounded semantic undo/redo. It uses the shared core owner-domain
+issuer and has no UI or native-provider import. Document edits remain committed
+when a later scene update fails; old scene snapshots retain old document versions.
+This is not SDL parity or a complete Unicode editor/IME implementation; see the
+text document guide and foundation ledger for implemented and pending gates.
+
+`zdl.ui.document_actions` connects the roadmap's semantic delivery queue to the
+application-owned document registry. Exact live scene/document revisions gate
+text/selection execution; receipts finalize before returning an owning result.
+It adds document behavior, not native callbacks, widget/focus policy or SDL API
+parity. A failed UI refresh must not replay an accepted document command.
+
+`zdl.paint` adds the architecture roadmap's owned recording layer: solid paths,
+rectangles, clips, affine state, layers and retained immutable raster leases. It
+is libc-free and independent of widget lifetimes. It does not replace or claim
+parity with existing immediate renderers, nor implement native/GPU replay, text,
+gradients or filters yet. See the [paint packet guide](paint-packets.md) for color,
+resource, failure and thread ownership boundaries.

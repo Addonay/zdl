@@ -309,7 +309,13 @@ pub const Connection = struct {
     pub fn open(allocator: std.mem.Allocator, loader: *Library, options: Options) Error!Connection {
         const library = &loader.native;
         const shared = try allocator.create(Shared);
-        errdefer allocator.destroy(shared);
+        var shared_initialized = false;
+        // Registered before native-object cleanup: failed opens must retire
+        // listeners/objects before releasing anything their callbacks can read.
+        errdefer {
+            if (shared_initialized) shared.release();
+            allocator.destroy(shared);
+        }
 
         var name_buffer: [64]u8 = undefined;
         const text = std.fmt.bufPrint(name_buffer[0 .. name_buffer.len - 1], "zdl-pipewire-{s}", .{options.application_name}) catch return error.Overflow;
@@ -333,13 +339,16 @@ pub const Connection = struct {
             .core = core,
             .registry = registry,
         };
+        shared_initialized = true;
+        var started = false;
+        errdefer {
+            if (started) library.thread_loop_stop(loop_thread);
+            if (shared.metadata_proxy) |proxy| library.proxy_destroy(proxy);
+        }
         try library.core_add_listener(core, &shared.core_hook, &binding.core_events, shared);
         try library.registry_add_listener(registry, &shared.registry_hook, &binding.registry_events, shared);
         try library.thread_loop_start(loop_thread);
-        errdefer {
-            library.thread_loop_stop(loop_thread);
-            shared.release();
-        }
+        started = true;
 
         library.lock(loop_thread);
         defer library.unlock(loop_thread);
@@ -355,8 +364,9 @@ pub const Connection = struct {
         return .{ .allocator = allocator, .library = library, .shared = shared };
     }
 
-    /// Stops the loop, drops proxies and frees the connection. Destroy all
-    /// streams first; the loop runs again only for the stop/join step.
+    /// Stops/joins the loop without its lock held, drops native objects, then
+    /// frees callback storage. Destroy all streams and finish other calls first;
+    /// callers must serialize deinit with all access to this connection.
     pub fn deinit(self: *Connection) void {
         const shared = self.shared;
         self.library.thread_loop_stop(shared.thread);

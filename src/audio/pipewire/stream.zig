@@ -241,9 +241,16 @@ pub const Stream = struct {
 
         connection.lock();
         defer connection.unlock();
-        const properties = try library.properties();
-        try set_properties(library, properties, options, requested.sample_rate);
-        const object = try library.stream_new(try library.loop_of(thread), options.name, properties, &binding.stream_events, state);
+        const object = block: {
+            const properties = try library.properties();
+            var transferred = false;
+            defer if (!transferred) library.properties_free(properties);
+            try set_properties(library, properties, options, requested.sample_rate);
+            const loop = try library.loop_of(thread);
+            // The native constructor consumes properties even on failure.
+            transferred = true;
+            break :block try library.stream_new(loop, options.name, properties, &binding.stream_events, state);
+        };
         state.object = object;
         errdefer {
             library.stream_disconnect(object);
@@ -269,7 +276,9 @@ pub const Stream = struct {
         return .{ .allocator = allocator, .connection = connection, .state = state };
     }
 
-    /// Disconnects and frees the stream. Takes the connection lock itself.
+    /// Disconnects/destroys under the connection lock, then frees callback state.
+    /// Takes the lock itself; the caller must finish other calls before deinit.
+    /// RT_PROCESS is not enabled, so process callbacks use this same loop lock.
     pub fn deinit(self: *Stream) void {
         const state = self.state;
         const library = state.library;

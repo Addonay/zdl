@@ -1,0 +1,24 @@
+{
+  "commit": "d6112faa78b5750a3817b927b7d48bb562634304",
+  "package": "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr",
+  "recorded_archive_sha256": "6e45f0e6f5ac9b2076a66ef7863fb51ac86ba1cf28bf175a617f61aa7682de6d",
+  "files": {
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/LICENSE": "9625ff1feb740ee8385b36ecc88c47e39dc92a36fdcd166b6b726796ef6e125a",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/README.md": "99ef48fe55a4a04fb0b7af72e2c2c5e42ac001f1d28c6ef340867626b9cc704c",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/build.zig": "b9ed43901c0c34eba55e290cbcb499ec310e735a9032cd1936481bd727180960",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/build.zig.zon": "ff777408bad8010fa466c95825c4545801bc24be0d7875d790110d68a7c1d889",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/Context.zig": "9a3f362478c513b20b496d4495ecc0ddaabb346cf16c49cb68122767cc10db6d",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/config.zig": "f47ca84e3a032c87b50bb28dee524ae211da3ffbdd99d70b2f3c19f4924fedfe",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/debug.zig": "3c8ed7e81329729b505b73c1f79f57898ec22f90b0d971794b048a946f503702",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/hash.zig": "905e9b1394067f44d34f61f7212d2dd09a488347b4f867bbd0c16c29bcd1996f",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/interaction.zig": "00b9363b91fdb6c78249279cda24e8cfc79d9b6b3eee06371715de192673d6d5",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/internal.zig": "4dba59de54426fb1f1c31cf2251ed439289a1b4eb7ebc1d2db474c6298920e96",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/layout.zig": "9a4477aa281c84913d6f347685cba54ba213a970389ce4616806ad38de76858b",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/memory.zig": "8501fd63c0a47798bb727ef7382dd62afcc6bf5d5d5020c9f45626f9e6b094ca",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/render.zig": "6a282063b300bdd2c9188c3b0d505cd9af84c864f0782d8ecac250207f562bbd",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/root.zig": "4251ed28c4170748de3c6bf1faf0e549a9975ef734c6d3aaa52053800833d4ce",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/text.zig": "f5b6a44190d1953ef8bf3d7966ca84799bd4773883dc97970d3fb7e0ee60840d",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/transition.zig": "b3dabddff65a13d75a896ac86032fc110f39ebb9c9893d63d8dbe0c170851988",
+    "zlay-0.1.0-TRqBosOgAwBpF1ZBaJs8oQu4kRrM5dAPdfPMOGdTRRGr/src/types.zig": "3984c1293724fb469a8bbcb413afb8b90d7cd79509fdeb321ae73596476b6fb0"
+  }
+}

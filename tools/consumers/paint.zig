@@ -1,0 +1,46 @@
+//! Runtime-sized retained paint consumer; no renderer, libc or optional provider.
+const std = @import("std");
+const zdl = @import("zdl");
+const paint = zdl.paint;
+pub fn main(init: std.process.Init) !void {
+    std.debug.print("mode={s}\n", .{@tagName(@import("builtin").mode)});
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    defer args.deinit();
+    _ = args.next();
+    const count = if (args.next()) |value| try std.fmt.parseInt(usize, value, 10) else 97;
+    if (count == 0 or count > 1000) return error.InvalidCount;
+    var recorder = try paint.Recorder.init(init.gpa, .{});
+    defer recorder.deinit();
+    try recorder.save();
+    try recorder.concat(.{ .x0 = 10, .y0 = 20 });
+    try recorder.clip_rect(.{ .x = 0, .y = 0, .width = 640, .height = 480 });
+    try recorder.begin_layer(0.5);
+    const path: [3]paint.Segment = .{ .{ .move = .{ .x = 0, .y = 0 } }, .{ .line = .{ .x = 1, .y = 1 } }, .close };
+    try recorder.fill_path(&path, .nonzero, .{ .r = 1, .g = 0, .b = 0 });
+    try recorder.stroke_path(&path, .{}, .{ .r = 0, .g = 1, .b = 0 });
+    var bytes: [4]u8 = .{ @intCast(count % 256), 30, 60, 128 };
+    var image = try paint.Image.copy(init.gpa, try zdl.surface.View.init(&bytes, 1, 1, 4, .rgba8, null), 4);
+    defer image.deinit();
+    @memset(&bytes, 0);
+    try recorder.draw_image(&image, .{ .x = 0, .y = 0, .width = 1, .height = 1 }, .{ .x = 1, .y = 1, .width = 10, .height = 10 }, .nearest);
+    image.deinit();
+    for (0..count) |i| try recorder.fill_rounded_rect(.{ .rect = .{ .x = @floatFromInt(i), .y = 0, .width = 20, .height = 10 }, .radius = 3 }, .{ .r = 0.5, .g = 0.25, .b = 1 });
+    var gradient = try paint.Gradient.init(init.gpa, .{ .linear = .{ .start = .{ .x = 0, .y = 0 }, .end = .{ .x = @floatFromInt(count), .y = 0 } } }, &.{ .{ .offset = 0, .color = .{ .r = 1, .g = 0, .b = 0 } }, .{ .offset = 1, .color = .{ .r = 0, .g = 0, .b = 1, .a = 0 } } }, .{});
+    defer gradient.deinit();
+    const sample = try (try gradient.view()).sample(0.5);
+    if (sample.r != 0.5 or sample.b != 0 or sample.a != 0.5) return error.WrongInterpolation;
+    try recorder.fill_rect_gradient(.{ .x = 0, .y = 0, .width = 10, .height = 10 }, &gradient);
+    try recorder.fill_rect_gradient(.{ .x = 20, .y = 0, .width = 10, .height = 10 }, &gradient);
+    gradient.deinit();
+    try recorder.end_layer();
+    try recorder.restore();
+    var packet = try recorder.finish();
+    defer packet.deinit();
+    var owned = try packet.clone();
+    defer owned.deinit();
+    packet.deinit();
+    const commands = try owned.commands();
+    if (commands.len != count + 11 or !(try owned.metadata()).full_redraw) return error.WrongPacket;
+    if (commands[6].image.image.rgba[0] != @as(u8, @intCast(count % 256))) return error.LostImage;
+    std.debug.print("paint rectangles={d} commands={d}\n", .{ count, commands.len });
+}

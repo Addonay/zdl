@@ -52,9 +52,16 @@ pub const Library = struct {
     /// Loads libasound.so.2. Needs libc in the consuming root module for std's
     /// dynamic loader. Any loader or symbol failure is `error.Unavailable`.
     pub fn open() error{Unavailable}!Library {
+        return open_path("libasound.so.2");
+    }
+
+    /// Internal loader seam for deterministic provider fixtures. Production
+    /// callers use open(); this path is not exposed by the public audio API.
+    /// Every required symbol must resolve before ownership is published.
+    pub fn open_path(path: []const u8) error{Unavailable}!Library {
         if (builtin.target.os.tag != .linux) @compileError("ALSA is a Linux backend");
         if (!builtin.link_libc) @compileError("ALSA loading requires application root_module.link_libc = true");
-        var handle = std.DynLib.open("libasound.so.2") catch return error.Unavailable;
+        var handle = std.DynLib.open(path) catch return error.Unavailable;
         errdefer handle.close();
         var functions: Functions = undefined;
         const info = @typeInfo(Functions).@"struct";

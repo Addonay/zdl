@@ -12,6 +12,13 @@
 //! `std.Random`, `std.sort`, `std.mem`, `std.ascii`, `std.Io` and std containers
 //! directly. zdl adds domain behavior rather than another naming layer for them.
 
+/// Experimental model-only retained scenes, checked identities and atomic updates.
+pub const ui = @import("ui/ui.zig");
+/// Application-owned revisioned UTF-8 documents, snapshots and bounded undo/redo.
+pub const text = @import("text/text.zig");
+/// Owned backend-neutral paint packets and immutable raster leases.
+pub const paint = @import("paint/paint.zig");
+
 /// Fixed-size identifiers with checked parsing and allocation-free formatting.
 pub const Guid = @import("core/guid.zig").Guid;
 /// An explicitly owned, optional human-readable diagnostic alongside Zig errors.

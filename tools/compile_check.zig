@@ -60,7 +60,7 @@ pub fn main() !void {
     @import("checks/app.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/upower.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/render_gpu.zig").check();
-    @import("checks/image.zig").check();
+    try @import("checks/image.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/gpu3.zig").check();
     try @import("checks/convert.zig").check();
     if (@import("builtin").target.os.tag == .linux) try @import("checks/wayland4.zig").check();

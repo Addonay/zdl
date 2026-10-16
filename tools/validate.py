@@ -22,6 +22,12 @@ def main():
     parser.add_argument('--zig', default='/home/addo/.zvm/master/zig')
     parser.add_argument('--output', type=Path, default=ROOT / '.cache' / 'validation')
     parser.add_argument('--runs-only', action='store_true', help='Reuse build artifacts; still invoke every zig build run-* target')
+    parser.add_argument('--pipewire-headers', action='store_true', help='Also run the optional installed-header PipeWire ABI audit (development headers required)')
+    parser.add_argument('--paragraph-spike', action='store_true', help='Also run the opt-in Linux Pango/Cairo feasibility experiment (runtime libraries/fonts required)')
+    parser.add_argument('--editor-spike', action='store_true', help='Also run the optional offscreen Pango/document editor integration')
+    parser.add_argument('--layout-spike', action='store_true', help='Also run the exact cached-zlay adapter/paragraph feasibility audit')
+    parser.add_argument('--paint-spike', action='store_true', help='Also run optional runtime-loaded Cairo paint replay fixtures')
+    parser.add_argument('--paint-text-spike', action='store_true', help='Also run optional Pango raster-to-paint ownership/alpha integration')
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -76,6 +82,42 @@ def main():
         for name, cwd, suffix in checks:
             if not run(name, [args.zig, *suffix, '--summary', 'all'], cwd):
                 return 1
+            if name == 'library-debug-check':
+                if not run('foundation-audit', [sys.executable, '-u', str(ROOT / 'tools/audit_foundation.py'),
+                                               '--zig', args.zig, '--output', str(output / 'foundation.json')], ROOT):
+                    return 1
+                if not run('state-type-checks', [sys.executable, '-u', str(ROOT / 'tools/check_state_types.py'),
+                                                 '--zig', args.zig, '--output', str(output / 'state-types/report.json')], ROOT):
+                    return 1
+                if args.pipewire_headers:
+                    if not run('pipewire-header-abi', [sys.executable, '-u', str(ROOT / 'tools/audit_pipewire_abi.py'),
+                                                     '--zig', args.zig, '--output', str(output / 'pipewire-abi.json')], ROOT):
+                        return 1
+
+    if args.paragraph_spike and not args.runs_only:
+        if not run('paragraph-spike', [sys.executable, '-u', str(ROOT / 'tools/audit_paragraph_spike.py'),
+                                       '--zig', args.zig, '--output', str(output / 'paragraph/report.json')], ROOT):
+            return 1
+
+    if args.editor_spike and not args.runs_only:
+        if not run('editor-spike', [sys.executable, '-u', str(ROOT / 'tools/audit_editor_spike.py'),
+                                    '--zig', args.zig, '--output', str(output / 'editor/report.json')], ROOT):
+            return 1
+
+    if args.layout_spike and not args.runs_only:
+        if not run('layout-spike', [sys.executable, '-u', str(ROOT / 'tools/audit_layout_spike.py'),
+                                    '--zig', args.zig, '--output', str(output / 'layout/report.json')], ROOT):
+            return 1
+
+    if args.paint_spike and not args.runs_only:
+        if not run('paint-spike', [sys.executable, '-u', str(ROOT / 'tools/audit_paint_spike.py'),
+                                   '--zig', args.zig, '--output', str(output / 'paint')], ROOT):
+            return 1
+
+    if args.paint_text_spike and not args.runs_only:
+        if not run('paint-text-spike', [sys.executable, '-u', str(ROOT / 'tools/audit_paint_text_spike.py'),
+                                        '--zig', args.zig, '--output', str(output / 'paint-text')], ROOT):
+            return 1
 
     build = (ROOT / 'examples' / 'build.zig').read_text()
     examples = re.findall(r'\.\{ \.name = "([^"]+)", \.path = "([^"]+)" \}', build)

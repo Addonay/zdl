@@ -24,6 +24,10 @@
 //! - Producers in this library return events rather than pushing them, so the
 //!   enablement check is applied by `push`. This drops a disabled type on the
 //!   way in, which is the observable effect of SDL_SetEventEnabled.
+//! - Full-range FIFO reads have amortized O(1) removal per event. Range removal
+//!   is stable O(n); cut_pending keeps its callback-visible sequential behavior.
+//! - The pending-event cap counts live events, not consumed backing slots. Storage
+//!   retains capacity and may have a consumed prefix; it is not a byte-budget API.
 //! - User event codes come from the queue's own counter, so they are unique
 //!   within one queue only (`register_user_events`).
 const std = @import("std");
@@ -67,8 +71,10 @@ pub fn Queue(comptime Context: type) type {
 
         allocator: std.mem.Allocator,
         options: Options,
-        /// Pending events in FIFO order: index 0 is the oldest.
+        /// Backing storage. Only items[head..] are pending; the consumed prefix
+        /// is reclaimed lazily. Callers use peek/get, not this internal storage.
         pending: std.ArrayList(event.Event) = .empty,
+        head: usize = 0,
         filter: ?Filter = null,
         watchers: std.ArrayList(Registered) = .empty,
         disabled: std.AutoHashMapUnmanaged(u32, void) = .empty,
@@ -102,12 +108,13 @@ pub fn Queue(comptime Context: type) type {
 
         /// Number of pending events.
         pub fn len(self: *const Self) usize {
-            return self.pending.items.len;
+            return self.pending.items.len - self.head;
         }
 
         /// Discards every pending event (SDL_FlushEvents over the full range).
         pub fn clear(self: *Self) void {
             self.pending.clearRetainingCapacity();
+            self.head = 0;
         }
 
         /// Adds an event (SDL_PushEvent). Returns true when it was queued, and false
@@ -117,7 +124,11 @@ pub fn Queue(comptime Context: type) type {
         pub fn push(self: *Self, ev: event.Event) PushError!bool {
             if (self.is_disabled(ev.code())) return false;
             if (!self.dispatch(&ev)) return false;
-            if (self.pending.items.len >= self.options.max_events) return error.QueueFull;
+            if (self.len() >= self.options.max_events) return error.QueueFull;
+            // Compact only after consuming at least as many entries as remain.
+            // Compacting on every full tail would make alternating pop/push
+            // quadratic again. Otherwise ArrayList growth supplies amortized slack.
+            if (self.head != 0 and self.head >= self.len()) self.compact_pending();
             try self.pending.append(self.allocator, ev);
             return true;
         }
@@ -183,19 +194,20 @@ pub fn Queue(comptime Context: type) type {
                 else => return self.push(ev),
             };
             const code = ev.code();
-            var index: usize = 0;
-            while (index < self.pending.items.len) {
-                const other = self.pending.items[index];
+            const active = self.pending.items[self.head..];
+            var kept: usize = 0;
+            for (active) |other| {
                 const same = switch (other) {
                     .window => |w| other.code() == code and w.window_id == window.window_id,
                     else => false,
                 };
-                if (same) {
-                    _ = self.pending.orderedRemove(index);
-                } else {
-                    index += 1;
+                if (!same) {
+                    active[kept] = other;
+                    kept += 1;
                 }
             }
+            self.pending.items.len = self.head + kept;
+            if (kept == 0) self.clear();
             return self.push(ev);
         }
 
@@ -204,7 +216,7 @@ pub fn Queue(comptime Context: type) type {
         /// Returns the number copied.
         pub fn peek(self: *const Self, out: []event.Event, min_code: u32, max_code: u32) usize {
             var copied: usize = 0;
-            for (self.pending.items) |ev| {
+            for (self.pending.items[self.head..]) |ev| {
                 if (copied == out.len) break;
                 if (in_range(ev.code(), min_code, max_code)) {
                     out[copied] = ev;
@@ -214,27 +226,40 @@ pub fn Queue(comptime Context: type) type {
             return copied;
         }
 
-        /// As `peek`, but removes the copied events from the queue.
+        /// As `peek`, but removes the copied events from the queue. A full-code
+        /// FIFO read advances a head index without shifting survivors. Other
+        /// ranges compact survivors once. `out` must not alias backing storage.
         pub fn get(self: *Self, out: []event.Event, min_code: u32, max_code: u32) usize {
+            if (out.len == 0 or min_code > max_code) return 0;
+            const active = self.pending.items[self.head..];
+            if (min_code == 0 and max_code == std.math.maxInt(u32)) {
+                const count = @min(out.len, active.len);
+                @memcpy(out[0..count], active[0..count]);
+                self.head += count;
+                if (self.head == self.pending.items.len) self.clear();
+                return count;
+            }
+            // Stable one-pass range extraction: survivors retain FIFO order.
             var copied: usize = 0;
-            var index: usize = 0;
-            while (index < self.pending.items.len and copied < out.len) {
-                const ev = self.pending.items[index];
-                if (in_range(ev.code(), min_code, max_code)) {
+            var kept: usize = 0;
+            for (active) |ev| {
+                if (copied < out.len and in_range(ev.code(), min_code, max_code)) {
                     out[copied] = ev;
                     copied += 1;
-                    _ = self.pending.orderedRemove(index);
                 } else {
-                    index += 1;
+                    active[kept] = ev;
+                    kept += 1;
                 }
             }
+            self.pending.items.len = self.head + kept;
+            if (kept == 0) self.clear();
             return copied;
         }
 
         /// Number of pending events in the range, without copying them.
         pub fn count_in_range(self: *const Self, min_code: u32, max_code: u32) usize {
             var total: usize = 0;
-            for (self.pending.items) |ev| {
+            for (self.pending.items[self.head..]) |ev| {
                 if (in_range(ev.code(), min_code, max_code)) total += 1;
             }
             return total;
@@ -248,14 +273,18 @@ pub fn Queue(comptime Context: type) type {
         /// Removes pending events in the range without returning them
         /// (SDL_FlushEvents).
         pub fn flush(self: *Self, min_code: u32, max_code: u32) void {
-            var index: usize = 0;
-            while (index < self.pending.items.len) {
-                if (in_range(self.pending.items[index].code(), min_code, max_code)) {
-                    _ = self.pending.orderedRemove(index);
-                } else {
-                    index += 1;
+            if (min_code > max_code) return;
+            if (min_code == 0 and max_code == std.math.maxInt(u32)) return self.clear();
+            const active = self.pending.items[self.head..];
+            var kept: usize = 0;
+            for (active) |ev| {
+                if (!in_range(ev.code(), min_code, max_code)) {
+                    active[kept] = ev;
+                    kept += 1;
                 }
             }
+            self.pending.items.len = self.head + kept;
+            if (kept == 0) self.clear();
         }
 
         /// Installs a filter and removes pending events it rejects, as
@@ -266,9 +295,13 @@ pub fn Queue(comptime Context: type) type {
         }
 
         /// Removes pending events the filter rejects, without installing it
-        /// (SDL_FilterEvents).
+        /// (SDL_FilterEvents). Callbacks may inspect queue state but must not
+        /// mutate pending events during this traversal. Each rejection is visible
+        /// to the next callback, including through len/count/peek.
         pub fn cut_pending(self: *Self, filter: Filter) void {
-            var index: usize = 0;
+            // Preserve callback-visible removal order and queue length. Unlike
+            // plain range filtering, this operation calls application code.
+            var index = self.head;
             while (index < self.pending.items.len) {
                 if (!filter.accept(filter.context, &self.pending.items[index])) {
                     _ = self.pending.orderedRemove(index);
@@ -276,6 +309,7 @@ pub fn Queue(comptime Context: type) type {
                     index += 1;
                 }
             }
+            if (self.head == self.pending.items.len) self.clear();
         }
 
         /// Adds a watcher. Watchers run in the order they were added.
@@ -328,6 +362,13 @@ pub fn Queue(comptime Context: type) type {
             if (end - 1 > event.user_code_last) return null;
             self.next_user_code = end;
             return first;
+        }
+
+        fn compact_pending(self: *Self) void {
+            const count = self.len();
+            std.mem.copyForwards(event.Event, self.pending.items[0..count], self.pending.items[self.head..]);
+            self.pending.items.len = count;
+            self.head = 0;
         }
 
         fn is_disabled(self: *const Self, code: u32) bool {

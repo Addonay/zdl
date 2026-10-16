@@ -1,0 +1,45 @@
+//! Finite visual fixture sheet; no window, widget callbacks or display server.
+const std = @import("std");
+const zdl = @import("zdl");
+const p = zdl.paint;
+const replay = @import("replay.zig");
+pub fn main(init: std.process.Init) !void {
+    var args = std.process.Args.Iterator.init(init.minimal.args);
+    defer args.deinit();
+    _ = args.next();
+    const destination = args.next() orelse return error.MissingOutput;
+    var library = try replay.Library.open("libcairo.so.2");
+    defer library.deinit();
+    var recorder = try p.Recorder.init(init.gpa, .{});
+    defer recorder.deinit();
+    try recorder.fill_rect(.{ .x = 0, .y = 0, .width = 480, .height = 260 }, .{ .r = 0.05, .g = 0.07, .b = 0.11 });
+    const cyan: p.Color = .{ .r = 0.1, .g = 0.8, .b = 0.9 };
+    try recorder.save();
+    try recorder.clip_rounded_rect(.{ .rect = .{ .x = 20, .y = 20, .width = 140, .height = 100 }, .radius = 24 });
+    var gradient = try p.Gradient.init(init.gpa, .{ .linear = .{ .start = .{ .x = 20, .y = 20 }, .end = .{ .x = 160, .y = 20 } } }, &.{ .{ .offset = 0, .color = cyan }, .{ .offset = 1, .color = .{ .r = 0.5, .g = 0.2, .b = 1 } } }, .{});
+    defer gradient.deinit();
+    try recorder.fill_rect_gradient(.{ .x = 20, .y = 20, .width = 140, .height = 100 }, &gradient);
+    try recorder.fill_rect(.{ .x = 90, .y = 20, .width = 70, .height = 100 }, .{ .r = 0.3, .g = 0.4, .b = 1 });
+    try recorder.restore();
+    try recorder.begin_layer(0.6);
+    try recorder.fill_rounded_rect(.{ .rect = .{ .x = 180, .y = 20, .width = 90, .height = 90 }, .radius = 16 }, .{ .r = 1, .g = 0.5, .b = 0.1 });
+    try recorder.fill_rounded_rect(.{ .rect = .{ .x = 220, .y = 40, .width = 90, .height = 90 }, .radius = 16 }, .{ .r = 1, .g = 0.5, .b = 0.1 });
+    try recorder.end_layer();
+    var pixels: [16]u8 = .{ 255, 0, 80, 255, 0, 100, 255, 128, 255, 255, 255, 255, 0, 0, 0, 0 };
+    var raster = try p.Image.copy(init.gpa, try zdl.surface.View.init(&pixels, 2, 2, 8, .rgba8, null), 16);
+    defer raster.deinit();
+    try recorder.draw_image(&raster, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, .{ .x = 340, .y = 20, .width = 100, .height = 100 }, .nearest);
+    try recorder.draw_image(&raster, .{ .x = 0, .y = 0, .width = 2, .height = 2 }, .{ .x = 340, .y = 140, .width = 100, .height = 100 }, .linear);
+    var glow = try p.Gradient.init(init.gpa, .{ .radial = .{ .start = .{ .center = .{ .x = 160, .y = 190 }, .radius = 0 }, .end = .{ .center = .{ .x = 160, .y = 190 }, .radius = 90 } } }, &.{ .{ .offset = 0, .color = .{ .r = 1, .g = 0.3, .b = 0.1, .a = 0.8 } }, .{ .offset = 1, .color = .{ .r = 0, .g = 0, .b = 1, .a = 0 } } }, .{});
+    defer glow.deinit();
+    try recorder.fill_rect_gradient(.{ .x = 20, .y = 140, .width = 290, .height = 100 }, &glow);
+    try recorder.stroke_path(&.{ .{ .move = .{ .x = 24, .y = 220 } }, .{ .quadratic = .{ .control = .{ .x = 80, .y = 120 }, .to = .{ .x = 160, .y = 210 } } }, .{ .cubic = .{ .first = .{ .x = 210, .y = 270 }, .second = .{ .x = 260, .y = 100 }, .to = .{ .x = 310, .y = 190 } } } }, .{ .width = 7, .cap = .round, .join = .round }, cyan);
+    var packet = try recorder.finish();
+    defer packet.deinit();
+    raster.deinit();
+    recorder.deinit();
+    var image = try replay.render(&library, init.gpa, &packet, 480, 260, .{});
+    defer image.deinit();
+    try image.write_png(destination);
+    std.debug.print("{{\"mode\":\"{s}\",\"cairo\":\"{s}\",\"width\":480,\"height\":260,\"commands\":{d}}}\n", .{ @tagName(@import("builtin").mode), std.mem.span(library.f.cairo_version_string()), (try packet.commands()).len });
+}

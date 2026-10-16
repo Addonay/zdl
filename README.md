@@ -87,3 +87,74 @@ shadcn dashboard reference with zlay, Geist, FreeType/HarfBuzz and SVG icons.
 playback pipeline. Both use inlined controls and native window drag/resize on
 Linux. These applications are under active refinement; exact visual/interaction
 parity and Windows/macOS chrome support are not claimed.
+
+## Architecture foundation checks
+
+`zig build check-foundation` compiles and links small geometry-only, native PNG,
+native audio-stream and libc-linked offscreen-platform consumers. It never runs
+the compile-only backend consumer. `python3 tools/audit_foundation.py` builds the
+profiles with explicit Zig master, runs these safe consumers and records ELF
+linkage, artifact hashes and a deliberately syntactic source inventory under
+`.cache/foundation`. The first three profiles must have no ELF dynamic section
+or library sonames; the platform profile intentionally links libc.
+
+`python3 tools/validate.py` includes this audit alongside the native/example/run
+matrix. [Foundation implementation status](docs/foundation-status.md) separates
+completed first-slice checks from the remaining ABI, lifecycle and GUI work.
+
+With PipeWire/SPA development headers installed, `python3 tools/audit_pipewire_abi.py`
+performs an optional native-header layout/constant check. Use
+`python3 tools/validate.py --pipewire-headers` to include it in the full matrix.
+Normal consumers and `zig build test-providers` do not require those headers.
+
+
+The disposable [Pango/Cairo paragraph experiment](tools/spikes/paragraph/README.md)
+is opt-in through `python3 tools/audit_paragraph_spike.py` or
+`tools/validate.py --paragraph-spike`. It tests a provider-consistent CPU bitmap
+route without adding a public text API or dependencies to ordinary consumers.
+
+The experimental [retained scene foundation](docs/ui-scenes.md) is available as
+`zdl.ui.Scene`: checked identities, keyed updates and retained immutable model
+snapshots, with no libc or text-provider dependency. It does not yet implement
+layout, widgets, input dispatch or accessibility.
+
+Typed retained state uses `zdl.ui.with_states` with compile-time named ownership
+policies. Values publish atomically with the scene and remain immutable across
+retained snapshots. See [typed state contracts](docs/ui-scenes.md#typed-retained-state-channels)
+and run `python3 tools/check_state_types.py` for compile-time API boundary fixtures.
+The full validator includes these compile-positive/negative checks automatically.
+
+[`zdl.text.Document`](docs/text-documents.md) provides application-owned UTF-8
+edit transactions, retained snapshots and bounded grouped undo/redo without UI or
+native-library dependencies. It is a document model, not yet an editable widget.
+
+[`zdl.text.Registry`](docs/document-registrations.md) provides checked live routing
+to application-owned documents. Delayed actions carry registration/revision
+metadata, while immutable snapshots retain text independently of the live borrow.
+
+The optional [editable paragraph experiment](docs/experiments/editor-paragraph.md)
+connects document/registry editing to Pango hit testing, selection and CPU painting.
+Run `python3 tools/audit_editor_spike.py` for offscreen Debug/ReleaseSafe evidence;
+use `--editor-spike` to include it in the validator. Native input remains a
+separate gate and is not certified by scripted offscreen output.
+
+[`zdl.ui.with_semantics`](docs/ui-semantics.md) publishes semantic intent atomically
+with retained scenes and validates owner-thread actions against current logical
+identity, availability and document revisions. It is a semantic model, not yet a
+native accessibility bridge.
+
+The optional [pinned layout adapter experiment](docs/experiments/layout-zlay.md)
+checks geometry/measurement/ownership against the examples' exact zlay source.
+Run `python3 tools/audit_layout_spike.py`, or add `--layout-spike` to the full
+validator. This does not add zlay to ordinary library consumers.
+
+[`zdl.ui.action_queue`](docs/ui-actions.md) owns queued semantic payloads and tracks
+one final receipt per accepted ticket. It is owner-thread delivery/backpressure,
+not automatic widget execution or a thread-safe native callback queue.
+[`zdl.ui.document_actions.dispatch`](docs/ui-actions.md#executing-document-commands)
+executes queued semantic text/selection commands through the live scene and
+registered document, returning an owning result for a separately retried refresh.
+
+[`zdl.paint`](docs/paint-packets.md) records owned paint packets and immutable raster
+leases. This is a recording foundation; native replay and renderer conformance
+remain under development.
