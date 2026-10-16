@@ -1,6 +1,6 @@
 .{
     .name = .zdl,
-    .version = "0.0.0",
+    .version = "0.3.0",
     .fingerprint = 0xe3b2b744d5c4b693,
     .minimum_zig_version = "0.18.0-dev.246+05671ced9",
     .dependencies = .{},
